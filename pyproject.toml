@@ -1,0 +1,58 @@
+[project]
+name = "mcp-pystub"
+version = "0.1.0"
+description = "Python exe ビルド時にスタブ置換可能なパッケージを自動検出する MCP サーバー / Auto-detect stubbable packages for Python exe builds"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.10"
+authors = [
+    { name = "KoyoYeager" },
+]
+keywords = ["mcp", "python", "exe", "pyinstaller", "nuitka", "stub", "optimization", "ast"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Build Tools",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+dependencies = [
+    "mcp>=1.0.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/KoyoYeager/mcp-pystub"
+Repository = "https://github.com/KoyoYeager/mcp-pystub"
+Issues = "https://github.com/KoyoYeager/mcp-pystub/issues"
+
+[project.scripts]
+mcp-pystub = "src.server:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "src/",
+    "tests/",
+    "README.md",
+    "LICENSE",
+    "pyproject.toml",
+]
+exclude = [
+    "**/__pycache__",
+    "**/*.pyc",
+    ".pytest_cache",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
