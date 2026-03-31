@@ -1,3 +1,5 @@
+<!-- mcp-name: io.github.koyoyeager/pystub -->
+
 # mcp-pystub
 
 Python exe ビルド（PyInstaller / Nuitka / cx_Freeze）時にスタブ置換可能なパッケージを自動検出し、最小スタブコードを生成する MCP サーバー。
