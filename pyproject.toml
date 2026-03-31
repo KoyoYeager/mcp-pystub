@@ -1,6 +1,6 @@
 [project]
 name = "mcp-pystub"
-version = "0.1.0"
+version = "0.1.1"
 description = "Python exe ビルド時にスタブ置換可能なパッケージを自動検出する MCP サーバー / Auto-detect stubbable packages for Python exe builds"
 readme = "README.md"
 license = { text = "MIT" }

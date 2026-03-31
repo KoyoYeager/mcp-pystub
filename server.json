@@ -1,0 +1,20 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.KoyoYeager/pystub",
+  "description": "Auto-detect stubbable packages for Python exe builds and generate minimal stub code",
+  "repository": {
+    "url": "https://github.com/KoyoYeager/mcp-pystub",
+    "source": "github"
+  },
+  "version": "0.1.1",
+  "packages": [
+    {
+      "registryType": "pypi",
+      "identifier": "mcp-pystub",
+      "version": "0.1.1",
+      "transport": {
+        "type": "stdio"
+      }
+    }
+  ]
+}

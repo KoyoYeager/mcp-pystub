@@ -1,4 +1,4 @@
-<!-- mcp-name: io.github.koyoyeager/pystub -->
+<!-- mcp-name: io.github.KoyoYeager/pystub -->
 
 # mcp-pystub
 
