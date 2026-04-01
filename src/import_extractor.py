@@ -210,6 +210,11 @@ def extract_imports(file_path: str) -> tuple[list[ImportInfo], list[str]]:
         return [], [f"構文エラー: {file_path}:{e.lineno}: {e.msg}"]
 
     visitor = _ImportVisitor(source_file=str(path.resolve()))
-    visitor.visit(tree)
+    try:
+        visitor.visit(tree)
+    except RecursionError:
+        return visitor.imports, visitor.warnings + [
+            f"{file_path}: AST が深すぎるため一部の解析をスキップしました"
+        ]
 
     return visitor.imports, visitor.warnings

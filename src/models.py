@@ -76,6 +76,24 @@ class GatewayFunction:
 
 
 @dataclass
+class SubmoduleStubHint:
+    """C拡張パッケージ等を間接排除するためのサブモジュールスタブ提案。
+
+    例: PySide6(C拡張) ← asammdf.gui が import
+        プロジェクトは asammdf.gui の機能を使用していない
+        → asammdf/gui/ をスタブ化すれば PySide6 を排除可能
+    """
+
+    target_package: str = ""      # 排除したいパッケージ (e.g., "PySide6")
+    parent_package: str = ""      # サブモジュールが属するパッケージ (e.g., "asammdf")
+    submodule: str = ""           # スタブ化するサブモジュール (e.g., "asammdf.gui")
+    submodule_path: str = ""      # ファイルパス
+    imported_symbols: list[str] = field(default_factory=list)  # 親が re-export するシンボル
+    estimated_savings_mb: float = 0.0
+    reason: str = ""
+
+
+@dataclass
 class PackageAnalysis:
     """単一パッケージの分析結果"""
 
@@ -88,6 +106,7 @@ class PackageAnalysis:
     import_depth: int = 0
     gateway_functions: list[GatewayFunction] = field(default_factory=list)
     estimated_size_mb: float = 0.0
+    submodule_stubs: list[SubmoduleStubHint] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
 
 

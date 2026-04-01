@@ -11,8 +11,9 @@ from collections import defaultdict
 from pathlib import Path
 
 from src.import_graph import build_import_graph
-from src.models import ImportGraph
+from src.models import ImportGraph, SubmoduleStubHint
 from src.module_resolver import ModuleResolver
+from src.usage_analyzer import analyze_packages
 
 
 def generate_stubs(
@@ -75,6 +76,9 @@ def generate_stubs(
     stub_size = sum(len(code.encode("utf-8")) for code in files.values())
     original_files = _count_original_files(pkg_root)
 
+    # ビルド手順を生成
+    build_instructions = _generate_build_instructions(package_name, pkg_root)
+
     return {
         "package": package_name,
         "files": files,
@@ -84,6 +88,7 @@ def generate_stubs(
         "original_file_count": original_files,
         "stub_file_count": len(files),
         "stub_total_bytes": stub_size,
+        "build_instructions": build_instructions,
     }
 
 
@@ -198,6 +203,16 @@ def _generate_stub_files(
         if mod.startswith(f"{package_name}.") or mod == package_name:
             modules_needing_stubs.add(mod)
 
+    # 内部 import で参照されるシンボルを収集し、対象モジュールのスタブにも追加
+    # canmatrix/__init__.py が from canmatrix.canmatrix import Frame する場合、
+    # canmatrix/canmatrix.py のスタブにも Frame が必要
+    for mod_name in list(modules_needing_stubs):
+        file_path = pkg_modules.get(mod_name)
+        if file_path and Path(file_path).is_file() and Path(file_path).suffix == ".py":
+            _propagate_internal_symbols(
+                file_path, package_name, referenced_symbols
+            )
+
     # 各モジュールのスタブ生成
     for mod_name in sorted(modules_needing_stubs):
         rel_path = _module_to_path(mod_name, package_name, pkg_root)
@@ -230,6 +245,14 @@ def _generate_stub_files(
 
     for init_path in sorted(dirs_needing_init):
         files[init_path] = '"""Auto-generated stub"""\n'
+
+    # __version__ を元パッケージから取得してスタブに追加
+    # matplotlib 等がバージョンチェックするため必要
+    init_key = f"{package_name}/__init__.py"
+    if init_key in files:
+        version = _get_package_version(package_name, pkg_root)
+        if version:
+            files[init_key] = files[init_key] + f'\n__version__ = "{version}"\n'
 
     return files
 
@@ -354,6 +377,66 @@ def _extract_internal_imports(file_path: str, package_name: str) -> list[str]:
     return imports
 
 
+def _propagate_internal_symbols(
+    file_path: str, package_name: str,
+    referenced_symbols: dict[str, list[str]],
+) -> None:
+    """内部 import で参照されるシンボルを対象モジュールの referenced_symbols に追加。
+
+    canmatrix/__init__.py の `from canmatrix.canmatrix import Frame, Signal` を解析し、
+    canmatrix.canmatrix の referenced_symbols に Frame, Signal を追加する。
+    """
+    try:
+        source = Path(file_path).read_text(encoding="utf-8", errors="replace")
+        tree = ast.parse(source, filename=file_path)
+    except (OSError, SyntaxError):
+        return
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom):
+            module = node.module or ""
+            level = node.level or 0
+
+            # 相対 import or パッケージ内の絶対 import
+            if level > 0 or module.startswith(f"{package_name}."):
+                # 絶対モジュール名を算出
+                if level > 0:
+                    # 相対 import → 絶対名に変換
+                    parts = Path(file_path).resolve().parts
+                    for i, p in enumerate(parts):
+                        if p == package_name:
+                            base_parts = list(parts[i:])
+                            break
+                    else:
+                        continue
+                    # __init__.py の場合はディレクトリ名まで
+                    if base_parts[-1] == "__init__.py":
+                        base_parts = base_parts[:-1]
+                    elif base_parts[-1].endswith(".py"):
+                        base_parts[-1] = base_parts[-1][:-3]
+                    # level 分上に戻る
+                    base_parts = base_parts[:max(1, len(base_parts) - level + 1)]
+                    if module:
+                        target_module = ".".join(base_parts) + "." + module
+                    else:
+                        target_module = ".".join(base_parts)
+                else:
+                    target_module = module
+
+                # シンボルを追加
+                if node.names:
+                    for alias in node.names:
+                        name = alias.name
+                        if name == "*":
+                            continue
+                        if target_module not in referenced_symbols:
+                            referenced_symbols[target_module] = []
+                        if name not in referenced_symbols[target_module]:
+                            referenced_symbols[target_module] = (
+                                referenced_symbols[target_module] + [name]
+                            )
+
+
 def _collect_all_symbols(
     referenced: dict[str, list[str]]
 ) -> list[str]:
@@ -364,6 +447,42 @@ def _collect_all_symbols(
             if s not in all_syms:
                 all_syms = all_syms + [s]
     return all_syms
+
+
+def _get_pip_name(package_name: str) -> str:
+    """import 名から pip パッケージ名を推定する。"""
+    try:
+        import importlib.metadata
+        # packages_distributions() で import名→pip名のマッピングを取得
+        mapping = importlib.metadata.packages_distributions()
+        if package_name in mapping:
+            return mapping[package_name][0]
+    except Exception:
+        pass
+    return package_name
+
+
+def _get_package_version(package_name: str, pkg_root: Path) -> str | None:
+    """元パッケージの __version__ を取得する。"""
+    try:
+        import importlib.metadata
+        return importlib.metadata.version(package_name)
+    except Exception:
+        pass
+    # __version__.py や _version.py を探す
+    for vf in ["__version__.py", "_version.py"]:
+        vpath = pkg_root / vf
+        if vpath.is_file():
+            try:
+                source = vpath.read_text(encoding="utf-8", errors="replace")
+                for line in source.split("\n"):
+                    if "__version__" in line and "=" in line:
+                        # __version__ = "1.2.3" のようなパターン
+                        val = line.split("=", 1)[1].strip().strip("'\"")
+                        return val
+            except OSError:
+                pass
+    return None
 
 
 def _count_original_files(pkg_root: Path) -> int:
@@ -378,3 +497,334 @@ def _count_original_files(pkg_root: Path) -> int:
     except OSError:
         pass
     return count
+
+
+def _generate_build_instructions(package_name: str, pkg_root: Path) -> dict:
+    """スタブ適用・復元のためのビルド手順を生成する。
+
+    復元失敗を防ぐため、バックアップ・バージョン固定・検証ステップを含む。
+
+    Returns:
+        {
+            "install_commands": [str],    # スタブ適用コマンド
+            "uninstall_commands": [str],  # 元に戻すコマンド
+            "backup_commands": [str],     # バックアップコマンド
+            "verify_commands": [str],     # 復元検証コマンド
+            "hook_disable": [str],        # PyInstaller フック無効化パス
+            "notes": [str],
+        }
+    """
+    pip_name = _get_pip_name(package_name)
+    version = _get_package_version(package_name, pkg_root)
+
+    # site-packages パスを取得するコマンド
+    sp_cmd = 'python -c "import site; print(site.getsitepackages()[0])"'
+
+    # バックアップ（復元失敗防止の最重要ステップ）
+    backup_cmds = [
+        f"# === 必ず最初にバックアップ ===",
+        f"cp -r $({sp_cmd})/{package_name} $({sp_cmd})/{package_name}.bak",
+    ]
+
+    install_cmds = [
+        f"pip uninstall -y {pip_name}",
+        f"# スタブを site-packages にコピー:",
+        f"cp -r _stubs/{package_name}/ $({sp_cmd})/{package_name}/",
+    ]
+
+    # 復元: バックアップ優先、フォールバックで pip
+    uninstall_cmds = [
+        f"# === 方法1: バックアップから復元（推奨・高速・確実） ===",
+        f"rm -rf $({sp_cmd})/{package_name}",
+        f"mv $({sp_cmd})/{package_name}.bak $({sp_cmd})/{package_name}",
+        f"",
+        f"# === 方法2: pip で再インストール（バックアップ消失時のフォールバック） ===",
+    ]
+    if version:
+        uninstall_cmds = uninstall_cmds + [
+            f"pip install --force-reinstall {pip_name}=={version}",
+        ]
+    else:
+        uninstall_cmds = uninstall_cmds + [
+            f"pip install --force-reinstall {pip_name}",
+        ]
+
+    # 復元検証
+    verify_cmds = [
+        f'python -c "import {package_name}; print(\'{package_name} OK\')"',
+    ]
+    if version:
+        verify_cmds = verify_cmds + [
+            f'python -c "import {package_name}; assert {package_name}.__version__ == \'{version}\', '
+            f'f\'version mismatch: {{{package_name}.__version__}}\'"',
+        ]
+
+    # PyInstaller フック候補を検索
+    hook_patterns: list[str] = []
+    if pkg_root.parent:
+        pyinstaller_hooks = pkg_root.parent / "PyInstaller" / "hooks"
+        if pyinstaller_hooks.is_dir():
+            for hook in pyinstaller_hooks.glob(f"hook-{package_name}*.py"):
+                hook_patterns = hook_patterns + [str(hook.name)]
+
+        for d in pkg_root.parent.glob(f"__pyinstaller_hooks_*{package_name}*"):
+            hook_patterns = hook_patterns + [str(d.name)]
+
+    hook_cmds: list[str] = []
+    if hook_patterns:
+        hook_cmds = [f"# リネームして無効化: {h} → {h}.disabled" for h in hook_patterns]
+    else:
+        hook_cmds = [f"# hook-{package_name}*.py があれば .disabled にリネーム"]
+
+    notes = [
+        "必ず backup_commands を最初に実行すること（復元失敗防止）",
+        "ビルド後は uninstall_commands → verify_commands の順で復元・検証",
+        "PyInstaller フックがスタブと衝突する場合は hook_disable でフック無効化",
+    ]
+
+    return {
+        "backup_commands": backup_cmds,
+        "install_commands": install_cmds,
+        "uninstall_commands": uninstall_cmds,
+        "verify_commands": verify_cmds,
+        "hook_disable": hook_cmds,
+        "notes": notes,
+    }
+
+
+def generate_submodule_stubs(
+    entry_point: str,
+    parent_package: str,
+    submodule: str,
+    python_path: str = "",
+    max_depth: int = 10,
+) -> dict:
+    """サブモジュール単位のスタブを生成する。
+
+    C拡張パッケージ（PySide6等）を直接スタブ化できない場合に、
+    そのパッケージを import しているサブモジュール（asammdf.gui等）を
+    スタブ化することで間接的に排除する。
+
+    Args:
+        entry_point: プロジェクトのエントリーポイント
+        parent_package: サブモジュールが属するパッケージ (e.g., "asammdf")
+        submodule: スタブ化するサブモジュール (e.g., "asammdf.gui")
+        python_path: site-packages パス
+        max_depth: import グラフの最大探索深度
+
+    Returns:
+        {
+            "parent_package": str,
+            "submodule": str,
+            "files": {relative_path: code_content},
+            "eliminated_packages": [str],
+            "build_instructions": {...},
+        }
+    """
+    entry = Path(entry_point).resolve()
+    if not entry.is_file():
+        return {"error": f"エントリーポイントが見つかりません: {entry_point}"}
+
+    project_root = _detect_project_root(entry)
+    resolver = ModuleResolver(
+        project_root=str(project_root),
+        python_path=python_path,
+    )
+
+    # import グラフ構築
+    graph = build_import_graph(
+        entry_point=str(entry),
+        project_root=str(project_root),
+        resolver=resolver,
+        max_depth=max_depth,
+    )
+
+    # パッケージの実際のファイル位置を特定
+    pkg_root = _find_package_root(parent_package, resolver)
+    if not pkg_root or pkg_root.is_file():
+        return {"error": f"パッケージ '{parent_package}' が見つかりません"}
+
+    # サブモジュールのパスを特定
+    submod_parts = submodule.split(".")
+    if len(submod_parts) < 2 or submod_parts[0] != parent_package:
+        return {"error": f"サブモジュール '{submodule}' は '{parent_package}' に属していません"}
+
+    sub_rel = "/".join(submod_parts[1:])
+    submod_dir = pkg_root / sub_rel
+    submod_file = pkg_root / f"{sub_rel}.py"
+
+    if submod_dir.is_dir():
+        submod_path = submod_dir
+        is_package = True
+    elif submod_file.is_file():
+        submod_path = submod_file
+        is_package = False
+    else:
+        return {"error": f"サブモジュール '{submodule}' のファイルが見つかりません"}
+
+    # サブモジュールが import しているパッケージ（排除対象）を特定
+    eliminated: list[str] = []
+    for edge in graph.edges:
+        if edge.from_module == submodule or edge.from_module.startswith(f"{submodule}."):
+            target = graph.nodes.get(edge.to_module)
+            if (
+                target
+                and target.classification == "third_party"
+                and target.top_level_package != parent_package
+            ):
+                if target.top_level_package not in eliminated:
+                    eliminated = eliminated + [target.top_level_package]
+
+    # 親パッケージがサブモジュールから import するシンボルを収集
+    symbols_to_export: list[str] = []
+    for edge in graph.edges:
+        if edge.to_module == submodule or edge.to_module.startswith(f"{submodule}."):
+            from_node = graph.nodes.get(edge.from_module)
+            if (
+                from_node
+                and from_node.top_level_package == parent_package
+                and edge.from_module != submodule
+                and not edge.from_module.startswith(f"{submodule}.")
+            ):
+                for name in edge.import_info.names_imported:
+                    if name not in symbols_to_export and name != "*":
+                        symbols_to_export = symbols_to_export + [name]
+
+    # スタブファイル生成
+    files: dict[str, str] = {}
+
+    if is_package:
+        # __init__.py のスタブ
+        init_code = _generate_stub_code(symbols_to_export, submodule)
+        rel_init = f"{parent_package}/{sub_rel}/__init__.py"
+        files[rel_init] = init_code
+    else:
+        code = _generate_stub_code(symbols_to_export, submodule)
+        files[f"{parent_package}/{sub_rel}.py"] = code
+
+    # サイズ計算
+    original_size = 0
+    if submod_path.is_dir():
+        for f in submod_path.rglob("*"):
+            if f.is_file():
+                try:
+                    original_size += f.stat().st_size
+                except OSError:
+                    pass
+    elif submod_path.is_file():
+        try:
+            original_size = submod_path.stat().st_size
+        except OSError:
+            pass
+
+    stub_size = sum(len(code.encode("utf-8")) for code in files.values())
+
+    # ビルド手順
+    build_instructions = _generate_submodule_build_instructions(
+        parent_package, submodule, submod_path, pkg_root, resolver
+    )
+
+    return {
+        "parent_package": parent_package,
+        "submodule": submodule,
+        "files": files,
+        "eliminated_packages": sorted(eliminated),
+        "original_size_bytes": original_size,
+        "stub_size_bytes": stub_size,
+        "symbols_exported": symbols_to_export,
+        "build_instructions": build_instructions,
+    }
+
+
+def _generate_submodule_build_instructions(
+    parent_package: str,
+    submodule: str,
+    submod_path: Path,
+    pkg_root: Path,
+    resolver: ModuleResolver,
+) -> dict:
+    """サブモジュールスタブの適用・復元手順を生成する。
+
+    復元失敗を絶対に起こさないため:
+    1. バックアップは必須（ディレクトリごとコピー）
+    2. 復元はバックアップから mv（pip 不要で高速・確実）
+    3. フォールバック: pip install --force-reinstall（バージョン固定）
+    4. 検証コマンドで復元成功を確認
+    """
+    pip_name = _get_pip_name(parent_package)
+    version = _get_package_version(parent_package, pkg_root)
+
+    sp_cmd = 'python -c "import site; print(site.getsitepackages()[0])"'
+
+    # サブモジュールの相対パス
+    sub_rel = submodule.replace(".", "/")
+    is_dir = submod_path.is_dir()
+
+    if is_dir:
+        target = f"$({sp_cmd})/{sub_rel}"
+        backup_target = f"$({sp_cmd})/{sub_rel}.bak"
+    else:
+        target = f"$({sp_cmd})/{sub_rel}.py"
+        backup_target = f"$({sp_cmd})/{sub_rel}.py.bak"
+
+    backup_cmds = [
+        f"# === 必ず最初にバックアップ（復元失敗防止） ===",
+        f"cp -r {target} {backup_target}",
+    ]
+
+    install_cmds = [
+        f"# サブモジュールをスタブに置換:",
+    ]
+    if is_dir:
+        install_cmds = install_cmds + [
+            f"rm -rf {target}",
+            f"cp -r _stubs/{sub_rel}/ {target}/",
+        ]
+    else:
+        install_cmds = install_cmds + [
+            f"cp _stubs/{sub_rel}.py {target}",
+        ]
+
+    uninstall_cmds = [
+        f"# === 方法1: バックアップから復元（推奨・高速・確実） ===",
+    ]
+    if is_dir:
+        uninstall_cmds = uninstall_cmds + [
+            f"rm -rf {target}",
+            f"mv {backup_target} {target}",
+        ]
+    else:
+        uninstall_cmds = uninstall_cmds + [
+            f"mv {backup_target} {target}",
+        ]
+
+    uninstall_cmds = uninstall_cmds + [
+        f"",
+        f"# === 方法2: pip で親パッケージごと再インストール（バックアップ消失時） ===",
+    ]
+    if version:
+        uninstall_cmds = uninstall_cmds + [
+            f"pip install --force-reinstall {pip_name}=={version}",
+        ]
+    else:
+        uninstall_cmds = uninstall_cmds + [
+            f"pip install --force-reinstall {pip_name}",
+        ]
+
+    verify_cmds = [
+        f'python -c "import {parent_package}; print(\'{parent_package} OK\')"',
+        f'python -c "import {submodule}; print(\'{submodule} OK\')"',
+    ]
+
+    return {
+        "backup_commands": backup_cmds,
+        "install_commands": install_cmds,
+        "uninstall_commands": uninstall_cmds,
+        "verify_commands": verify_cmds,
+        "notes": [
+            "必ず backup_commands を最初に実行すること（復元失敗防止の最重要ステップ）",
+            "バックアップからの復元は pip 不要で高速・確実",
+            "ビルド後は uninstall_commands → verify_commands の順で復元・検証",
+            f"親パッケージ ({parent_package}) の他の機能には影響しない",
+        ],
+    }

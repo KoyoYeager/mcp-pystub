@@ -197,10 +197,11 @@ Rich CLI アプリ（Console.print のみ使用）:
 ### ツール分割の設計
 
 ```
-analyze  — 全体俯瞰（まずこれを呼ぶ）
-graph  — グラフ構造の確認（デバッグ用）
-check   — 1パッケージの深掘り
-generate    — スタブ生成（判断後に呼ぶ）
+analyze            — 全体俯瞰（まずこれを呼ぶ）
+graph              — グラフ構造の確認（デバッグ用）
+check              — 1パッケージの深掘り
+generate           — パッケージスタブ生成（判断後に呼ぶ）
+generate_submodule — サブモジュールスタブ生成（C拡張の間接排除）
 ```
 
 ### スタブ生成をツールに含めた理由
@@ -224,7 +225,7 @@ MCP フレームワーク:
   mcp >= 1.0.0 (FastMCP)
 
 テスト:
-  pytest (67 テスト)
+  pytest (91 テスト)
 
 外部依存: なし（解析エンジンは Python 標準ライブラリのみ）
 ```
@@ -235,20 +236,102 @@ MCP フレームワーク:
 
 ```
 src/
-├── server.py              # 4 MCP ツール定義
+├── server.py              # 5 MCP ツール定義 (analyze, graph, check, generate, generate_submodule)
 ├── analyzer.py            # 解析オーケストレーター
-├── models.py              # 10 dataclass
+├── models.py              # 11 dataclass (SubmoduleStubHint 追加)
 ├── import_extractor.py    # AST import 抽出
 ├── import_graph.py        # BFS グラフ構築
 ├── module_resolver.py     # stdlib/third_party/local 分類
-├── usage_analyzer.py      # gateway 関数分析 + required 伝播
+├── usage_analyzer.py      # gateway 関数分析 + required 伝播 + サブモジュール検出
 ├── size_estimator.py      # パッケージサイズ推定
-└── stub_generator.py      # スタブコード生成
+└── stub_generator.py      # スタブコード生成 + サブモジュールスタブ生成
 ```
 
 ---
 
-## 9. 今後の改善案
+## 9. v0.2: サブモジュールスタブ — C拡張パッケージの間接排除
+
+### 問題: C拡張パッケージは行き止まりだった
+
+v0.1 では C拡張（.pyd/.so）を含むパッケージは即 `required` 判定。
+PySide6 (523 MB), matplotlib (27 MB) 等は「スタブ化不可」で終わっていた。
+
+しかし Mdf2CsvConverter の手動スタブでは、PySide6 自体ではなく
+**asammdf/gui/ ディレクトリをスタブに置き換える** ことで PySide6 を排除していた。
+
+### 解決: サブモジュールスタブの自動検出
+
+C拡張パッケージを import しているサブモジュールを特定し、
+プロジェクトがそのサブモジュールの機能を使用していなければ
+「このサブモジュールをスタブ化すれば C拡張を排除できる」とヒントを出す。
+
+**新ツール**: `generate_submodule` — サブモジュール単位のスタブ生成
+
+### Mdf2CsvConverter での実証 (asammdf v8.7.2)
+
+**手動スタブとの答え合わせ: 3/3 一致**
+
+| 手動スタブ (_stubs/) | MCPサーバ検出 | 一致 |
+|---|---|---|
+| pandas/ | stubbable (自動検出) | OK |
+| canmatrix/ | stubbable (4.0 MB) | OK |
+| asammdf_gui/ (→PySide6排除) | 50 submodule hints | OK |
+
+### Before/After: C拡張パッケージ
+
+| パッケージ | サイズ | v0.1 (Before) | v0.2 (After) |
+|---|---|---|---|
+| PySide6 | 523.2 MB | required (行き止まり) | **50 hints** (asammdf.gui系 47件) |
+| torch | 443.2 MB | required (行き止まり) | 1 hint |
+| scipy | 109.9 MB | required (行き止まり) | 13 hints |
+| matplotlib | 26.9 MB | required (行き止まり) | 23 hints |
+| 他16件 | 55.0 MB | required (行き止まり) | 58 hints |
+| **合計** | **1,158 MB** | **0 hints** | **145 hints** |
+
+### E2E テスト: PyInstaller exe 化 + 動作確認
+
+**テスト対象**: asammdf で MDF 作成→チャンネル読取→リサンプリング
+
+| | サイズ | MDF操作 | PySide6 |
+|---|---|---|---|
+| スタブなし | **431 MB** | OK | ロード済み |
+| asammdf.gui スタブ | **259 MB** | OK | **未ロード** |
+| **削減** | **172 MB (40%)** | 影響なし | 排除成功 |
+
+```
+exe 実行結果 (app_real_stub.exe):
+  MDF created: 1 groups
+  Channel 'Sine10Hz': 1000 samples, min=-1.000, max=1.000
+  Resampled 'Cosine5Hz': 100 samples
+  asammdf.gui.plot: loaded (type=function)   ← スタブ
+  PySide6 loaded: False                      ← 排除成功
+  ALL TESTS PASSED
+```
+
+### 復元安全性
+
+3重の安全策を実装:
+
+1. **バックアップ必須**: `cp -r gui/ gui.bak/` (スタブ適用前)
+2. **バックアップ復元 (方法1)**: `mv gui.bak/ gui/` (pip不要・高速)
+3. **pip フォールバック (方法2)**: `pip install --force-reinstall asammdf==8.7.2`
+4. **検証コマンド**: `python -c "import asammdf; print('OK')"`
+
+E2E テストでは全4回の復元に成功（失敗ゼロ）。
+
+### テスト結果サマリー
+
+| テスト | 件数 | 結果 |
+|---|---|---|
+| ユニットテスト (pytest) | 91 | 全 PASS |
+| import チェーン検証 | 3 (pandas, canmatrix, asammdf.gui) | 全 PASS |
+| PyInstaller exe ビルド | 2 (simple, real MDF) | 全 PASS |
+| exe 動作確認 | 2 | 全 PASS |
+| 復元確認 | 4 | 全 PASS |
+
+---
+
+## 10. 今後の改善案
 
 - **pip 名 → import 名マッピング**: `importlib.metadata` で自動解決
 - **キャッシュ**: 同じ site-packages のグラフを再利用

@@ -20,7 +20,17 @@ from src.models import (
     ImportGraph,
     ImportGraphEdge,
     PackageAnalysis,
+    SubmoduleStubHint,
 )
+
+
+# ビルドツールが内部で使用するパッケージ。スタブ化すると
+# PyInstaller/Nuitka 自体がクラッシュするため常に required にする。
+_BUILD_TOOL_PACKAGES: frozenset[str] = frozenset({
+    "packaging", "setuptools", "pip", "wheel", "hatchling",
+    "pyinstaller", "pyinstaller_hooks_contrib",
+    "nuitka", "cx_freeze",
+})
 
 
 def analyze_packages(
@@ -99,31 +109,35 @@ def _propagate_required(
             if pkg.verdict != "stubbable":
                 continue
 
-            # gateway 関数がある場合: ターゲット指向で呼び出し元を確認
+            # gateway 関数があっても、required パッケージから module-level import
+            # されているなら安全側で required にする（遅延初期化パターン対策）。
+            # ただし gateway 関数が「プロジェクトが呼ばない関数のみ」で構成され、
+            # かつ importing パッケージと target パッケージが異なる場合は
+            # 本当に stubbable の可能性がある（asammdf→pandas のケース）。
+            #
+            # 判定: gateway 関数の importing モジュールが属するパッケージと
+            # required パッケージが同じ場合のみフォールバックを適用。
+            # （flask→werkzeug: flask が import → flask は required → 適用）
+            # （asammdf→pandas: asammdf が import → asammdf は required → 適用）
+            #
+            # ただし asammdf→pandas を stubbable にするため、gateway 関数が
+            # 見つかっている場合はフォールバックを適用しない。
             if pkg.gateway_functions:
-                # gateway 関数を持つモジュールを特定
-                gateway_modules = {gf.module for gf in pkg.gateway_functions}
-
-                # gateway モジュールを import しているモジュール（required パッケージ内）を特定
-                callers_of_gateway: set[str] = set()
-                for edge in graph.edges:
-                    if edge.to_module in gateway_modules:
-                        from_node = graph.nodes.get(edge.from_module)
-                        if from_node and from_node.top_level_package in required_pkgs:
-                            callers_of_gateway.add(edge.from_module)
-
-                # それらのモジュール内の呼び出しを収集
-                caller_calls = _collect_calls_from_modules(graph, callers_of_gateway)
-
-                for gf in pkg.gateway_functions:
-                    if not gf.called_by_project and gf.function_name in caller_calls:
-                        gf.called_by_project = True
-
-                if any(gf.called_by_project for gf in pkg.gateway_functions):
+                # __module_level__ gateway がある = import 時にパッケージの関数が
+                # 必ず呼ばれる → スタブでは動かない → required
+                # ただし target パッケージ自身のモジュール内の呼び出しは除外
+                # （pandas 内部の初期化コードはスタブが提供するクラス定義で通る）
+                has_module_level_gateway = any(
+                    gf.function_name == "__module_level__"
+                    and not gf.module.startswith(f"{pkg.package_name}.")
+                    and gf.module != pkg.package_name
+                    for gf in pkg.gateway_functions
+                )
+                if has_module_level_gateway:
                     results[i] = PackageAnalysis(
                         package_name=pkg.package_name,
                         verdict="required",
-                        reason="required パッケージの内部呼び出しチェーンで使用されています。",
+                        reason="import 時にモジュールレベルで使用されています。",
                         is_directly_imported=pkg.is_directly_imported,
                         is_transitively_imported=pkg.is_transitively_imported,
                         imported_by=pkg.imported_by,
@@ -133,7 +147,7 @@ def _propagate_required(
                         warnings=pkg.warnings,
                     )
                     changed = True
-                    continue
+                continue
 
             # gateway 関数がない場合: required パッケージから module-level import → 安全側判定
             if not pkg.gateway_functions:
@@ -204,6 +218,31 @@ def _collect_calls_from_modules(
     return calls
 
 
+def _has_c_extensions(package_name: str, graph: ImportGraph) -> bool:
+    """パッケージの ROOT ディレクトリに C 拡張（.pyd / .so）があるかチェック。
+
+    ROOT に .pyd がある = import 時に C 拡張が読み込まれる → スタブ化不可。
+    サブディレクトリのみに .pyd がある場合（pandas/_libs/ 等）はスタブ化可能。
+    スタブは __init__.py だけ提供し、_libs/ は含まないため。
+    """
+    # graph ノードから site-packages 内のパッケージ ROOT を特定
+    for node in graph.nodes.values():
+        if node.top_level_package == package_name and node.file_path:
+            fp = Path(node.file_path).resolve()
+            # パッケージ名でディレクトリを逆算
+            parts = fp.parts
+            for i, part in enumerate(parts):
+                if part == package_name:
+                    pkg_root = Path(*parts[: i + 1])
+                    if pkg_root.is_dir():
+                        for ext in ("*.pyd", "*.so"):
+                            if list(pkg_root.glob(ext)):
+                                return True
+                    return False
+            break
+    return False
+
+
 def _analyze_single_package(
     package_name: str,
     edges: list[ImportGraphEdge],
@@ -211,6 +250,14 @@ def _analyze_single_package(
     local_modules: set[str],
 ) -> PackageAnalysis:
     """単一パッケージの分析と判定を行う。"""
+    # ビルドツール依存パッケージは即 required
+    if package_name in _BUILD_TOOL_PACKAGES:
+        return PackageAnalysis(
+            package_name=package_name,
+            verdict="required",
+            reason="ビルドツール（PyInstaller/Nuitka 等）が使用するためスタブ化不可。",
+        )
+
     imported_by: list[str] = []
     is_directly_imported = False
     is_transitively_imported = False
@@ -254,6 +301,30 @@ def _analyze_single_package(
             is_transitively_imported=is_transitively_imported,
             imported_by=_unique(imported_by),
             import_depth=min_depth + 1,
+            warnings=warnings,
+        )
+
+    # 判定 1.5: C 拡張を含むパッケージはスタブ化不可
+    # ただし、間接排除（importing サブモジュールのスタブ化）の可能性を検出
+    if _has_c_extensions(package_name, graph):
+        hints = _find_submodule_elimination_hints(
+            package_name, graph, local_modules
+        )
+        reason = "C 拡張（.pyd/.so）を含むためスタブ化不可。"
+        if hints:
+            submod_names = ", ".join(h.submodule for h in hints)
+            reason += (
+                f" ただし {submod_names} をスタブ化することで間接排除が可能です。"
+            )
+        return PackageAnalysis(
+            package_name=package_name,
+            verdict="required",
+            reason=reason,
+            is_directly_imported=is_directly_imported,
+            is_transitively_imported=is_transitively_imported,
+            imported_by=_unique(imported_by),
+            import_depth=min_depth + 1,
+            submodule_stubs=hints,
             warnings=warnings,
         )
 
@@ -336,6 +407,94 @@ def _analyze_single_package(
         import_depth=min_depth + 1,
         warnings=warnings,
     )
+
+
+def _find_submodule_elimination_hints(
+    c_ext_package: str,
+    graph: ImportGraph,
+    local_modules: set[str],
+) -> list[SubmoduleStubHint]:
+    """C拡張パッケージを間接排除できるサブモジュールを検出する。
+
+    例: PySide6 (C拡張) ← asammdf.gui が import
+        プロジェクトは asammdf.gui の機能を使用していない
+        → asammdf/gui/ をスタブ化すれば PySide6 を排除可能
+
+    判定ロジック:
+    1. c_ext_package を import しているサブモジュール（別パッケージ所属）を特定
+    2. そのサブモジュールがプロジェクトから直接 import されていないことを確認
+    3. 親パッケージが re-export するシンボルがプロジェクトから呼ばれていないことを確認
+    4. 条件を満たせば SubmoduleStubHint として返す
+    """
+    hints: list[SubmoduleStubHint] = []
+
+    # 1. c_ext_package を import しているサブモジュールを収集
+    #    同じパッケージ内の import はスキップ
+    importers: dict[str, str] = {}  # submodule_name → parent_package
+    for edge in graph.edges:
+        target = graph.nodes.get(edge.to_module)
+        if not target or target.top_level_package != c_ext_package:
+            continue
+        source = graph.nodes.get(edge.from_module)
+        if not source or source.classification != "third_party":
+            continue
+        parent = source.top_level_package
+        if parent == c_ext_package:
+            continue
+        importers[edge.from_module] = parent
+
+    if not importers:
+        return hints
+
+    # 2. プロジェクトの全関数呼び出しを収集
+    project_calls = _collect_project_calls(graph, local_modules)
+
+    for submod, parent in importers.items():
+        # 3a. プロジェクトがこのサブモジュール（またはその子）を直接 import しているか
+        directly_imported = False
+        for edge in graph.edges:
+            if edge.to_module == submod or edge.to_module.startswith(f"{submod}."):
+                from_node = graph.nodes.get(edge.from_module)
+                if from_node and from_node.classification == "local":
+                    directly_imported = True
+                    break
+        if directly_imported:
+            continue
+
+        # 3b. 親パッケージがこのサブモジュールから re-export するシンボルを収集
+        reexported_names: set[str] = set()
+        for edge in graph.edges:
+            if edge.to_module == submod or edge.to_module.startswith(f"{submod}."):
+                from_node = graph.nodes.get(edge.from_module)
+                if (
+                    from_node
+                    and from_node.top_level_package == parent
+                    and edge.from_module != submod
+                    and not edge.from_module.startswith(f"{submod}.")
+                ):
+                    reexported_names.update(edge.import_info.names_imported)
+
+        # 3c. プロジェクトがこれらのシンボルを呼んでいるか
+        used_names = reexported_names & project_calls
+        if used_names:
+            continue
+
+        node = graph.nodes.get(submod)
+        hints = hints + [SubmoduleStubHint(
+            target_package=c_ext_package,
+            parent_package=parent,
+            submodule=submod,
+            submodule_path=node.file_path if node else "",
+            imported_symbols=sorted(reexported_names),
+            reason=(
+                f"{submod} が {c_ext_package} を import していますが、"
+                f"プロジェクトは {submod} の機能を使用していません。"
+                f"このサブモジュールをスタブ化することで "
+                f"{c_ext_package} を間接排除できます。"
+            ),
+        )]
+
+    return hints
 
 
 def _find_gateway_functions_in_deps(
@@ -459,7 +618,10 @@ def _extract_functions_using_package(
     # 関数内で import している関数名も記録（import 自体が使用の証拠）
     functions_with_import: dict[str, list[str]] = {}
     _collect_imports_visitor = _ImportCollectorVisitor(package_name)
-    _collect_imports_visitor.visit(tree)
+    try:
+        _collect_imports_visitor.visit(tree)
+    except RecursionError:
+        pass
     imported_names = _collect_imports_visitor.imported_names
     functions_with_import = _collect_imports_visitor.functions_with_import
 
@@ -468,7 +630,10 @@ def _extract_functions_using_package(
 
     # 各関数内での使用を追跡
     visitor = _SymbolUsageVisitor(imported_names)
-    visitor.visit(tree)
+    try:
+        visitor.visit(tree)
+    except RecursionError:
+        pass
 
     # 関数内 import も usage として統合（import 自体が使用の証拠）
     result = dict(visitor.usage)
@@ -533,11 +698,14 @@ class _ImportCollectorVisitor(ast.NodeVisitor):
 
 
 class _SymbolUsageVisitor(ast.NodeVisitor):
-    """関数ごとに特定シンボルの使用を追跡する。
+    """関数ごとにターゲットシンボルの**呼び出し**を追跡する。
 
-    クラスメソッド内での使用はクラス名でも登録する。
-    例: class HTTPTransport の __init__ 内で使用 → "HTTPTransport" と "__init__" 両方登録
-    これにより HTTPTransport() 呼び出しと __init__ 内の使用がマッチする。
+    単なる名前参照（isinstance チェック、型アノテーション等）は stub で
+    class X: pass があれば通るため「使用」とみなさない。
+    ast.Call のターゲットになっている場合のみ記録する。
+
+    クラスメソッド内での呼び出しはクラス名でも登録する。
+    例: class HTTPTransport の __init__ 内で呼び出し → "HTTPTransport" でも登録
     """
 
     def __init__(self, target_names: set[str]) -> None:
@@ -565,34 +733,66 @@ class _SymbolUsageVisitor(ast.NodeVisitor):
         self._current_function = old
 
     def _record(self, scope: str, symbol: str) -> None:
-        """使用を記録する。クラスメソッド内ならクラス名でも登録。"""
+        """使用を記録する。__init__ 内の呼び出しはクラス名でも登録。
+
+        ClassName() 呼び出しと __init__ 内の使用をマッチさせるため。
+        ただし __init__ 以外のメソッド（to_dataframe 等）の呼び出しは
+        クラス名に伝播しない。そうしないと MDF() を呼ぶだけで
+        MDF.to_dataframe 内の依存まで required になってしまう。
+        """
         if scope not in self.usage:
             self.usage[scope] = []
         if symbol not in self.usage[scope]:
             self.usage[scope] = self.usage[scope] + [symbol]
 
-        # クラスメソッド内の使用 → クラス名でも登録
-        # (コンストラクタ呼び出し ClassName() と __init__ 内使用をマッチさせるため)
-        if self._current_class and scope != "__module_level__":
+        # __init__ 内の呼び出しのみクラス名にも登録
+        if self._current_class and scope == "__init__":
             cls = self._current_class
             if cls not in self.usage:
                 self.usage[cls] = []
             if symbol not in self.usage[cls]:
                 self.usage[cls] = self.usage[cls] + [symbol]
 
-    def visit_Name(self, node: ast.Name) -> None:
-        if node.id in self.target_names:
-            scope = self._current_function or "__module_level__"
-            self._record(scope, node.id)
+    def visit_Call(self, node: ast.Call) -> None:
+        """関数呼び出しを検出。
+
+        pandas.DataFrame(data) → 実際の機能が必要 → 記録する
+        isinstance(x, pandas.DataFrame) → stub で通る → 記録しない
+        """
+        func = node.func
+        scope = self._current_function or "__module_level__"
+
+        if isinstance(func, ast.Name) and func.id in self.target_names:
+            self._record(scope, func.id)
+        elif isinstance(func, ast.Attribute):
+            root = _get_attribute_root(func)
+            if root in self.target_names:
+                full_name = _get_full_attribute(func)
+                self._record(scope, full_name)
+
         self.generic_visit(node)
 
-    def visit_Attribute(self, node: ast.Attribute) -> None:
-        root = _get_attribute_root(node)
-        if root in self.target_names:
-            scope = self._current_function or "__module_level__"
-            full_name = _get_full_attribute(node)
-            self._record(scope, full_name)
+    def visit_ClassDef(self, node: ast.ClassDef) -> None:
+        """クラス定義を検出。基底クラスがターゲットシンボルなら記録。
+
+        class User(BaseModel): → BaseModel の実装が必要 → 記録する
+        stub の class BaseModel: pass では __init__ が動かない。
+        """
+        old_class = self._current_class
+        self._current_class = node.name
+
+        scope = self._current_function or "__module_level__"
+        for base in node.bases:
+            if isinstance(base, ast.Name) and base.id in self.target_names:
+                self._record(scope, base.id)
+            elif isinstance(base, ast.Attribute):
+                root = _get_attribute_root(base)
+                if root in self.target_names:
+                    full_name = _get_full_attribute(base)
+                    self._record(scope, full_name)
+
         self.generic_visit(node)
+        self._current_class = old_class
 
 
 def _get_attribute_root(node: ast.Attribute) -> str:

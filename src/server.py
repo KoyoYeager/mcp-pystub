@@ -8,7 +8,7 @@ from __future__ import annotations
 from mcp.server.fastmcp import FastMCP
 
 from src.analyzer import analyze, check_usage, inspect_graph
-from src.stub_generator import generate_stubs
+from src.stub_generator import generate_stubs, generate_submodule_stubs
 
 mcp = FastMCP("pystub")
 
@@ -108,6 +108,41 @@ def generate(
         stub_total_bytes: スタブの合計サイズ
     """
     return generate_stubs(entry_point, package_name, python_path)
+
+
+@mcp.tool()
+def generate_submodule(
+    entry_point: str,
+    parent_package: str,
+    submodule: str,
+    python_path: str = "",
+) -> dict:
+    """C拡張パッケージを間接排除するためのサブモジュールスタブを生成します。
+
+    PySide6 のような C拡張パッケージは直接スタブ化できませんが、
+    そのパッケージを import しているサブモジュール（例: asammdf.gui）を
+    スタブ化することで間接的に排除できます。
+
+    analyze ツールの結果に含まれる submodule_stub_hints の情報を元に
+    このツールを使用してください。
+
+    復元失敗を防ぐため、バックアップ・バージョン固定・検証ステップを
+    含むビルド手順を生成します。
+
+    Args:
+        entry_point: プロジェクトのエントリーポイントファイルパス
+        parent_package: サブモジュールが属するパッケージ名（例: "asammdf"）
+        submodule: スタブ化するサブモジュール（例: "asammdf.gui"）
+        python_path: site-packages パス（空の場合は現在の環境を自動検出）
+
+    Returns:
+        files: {相対パス: コード内容} の辞書
+        eliminated_packages: 排除されるパッケージ一覧
+        build_instructions: バックアップ・適用・復元・検証の手順
+    """
+    return generate_submodule_stubs(
+        entry_point, parent_package, submodule, python_path
+    )
 
 
 def main() -> None:

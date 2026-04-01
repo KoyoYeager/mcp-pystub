@@ -79,7 +79,17 @@ def analyze(
         warnings=graph.warnings,
         analysis_time_ms=elapsed_ms,
     )
-    return asdict(result)
+    result_dict = asdict(result)
+
+    # サブモジュールスタブのヒントを集約して表示しやすくする
+    all_hints = []
+    for pkg in required:
+        for hint in pkg.submodule_stubs:
+            all_hints = all_hints + [asdict(hint)]
+    if all_hints:
+        result_dict["submodule_stub_hints"] = all_hints
+
+    return result_dict
 
 
 def inspect_graph(
