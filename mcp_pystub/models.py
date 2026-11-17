@@ -22,6 +22,7 @@ class ImportInfo:
     import_type: str = "import"  # "import" | "from_import" | "star_import"
     relative_level: int = 0
     source_file: str = ""
+    is_type_checking: bool = False  # if TYPE_CHECKING: 内（実行時には import されない）
 
 
 @dataclass
@@ -63,6 +64,9 @@ class ImportGraph:
     entry_point: str = ""
     project_root: str = ""
     warnings: list[str] = field(default_factory=list)
+    parse_errors: list[str] = field(default_factory=list)  # 構文解析できなかったファイル
+    truncated: list[str] = field(default_factory=list)  # max_depth で打ち切ったモジュール
+    entry_module: str = ""
 
 
 @dataclass

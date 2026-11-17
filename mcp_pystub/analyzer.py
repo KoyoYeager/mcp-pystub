@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import time
+from collections import deque
 from dataclasses import asdict
 from pathlib import Path
 
@@ -241,55 +242,45 @@ def _detect_project_root(entry: Path) -> Path:
 
 
 def _build_import_chains(
-    graph: ImportGraph, target_package: str
+    graph: ImportGraph, target_package: str, max_paths: int = 5
 ) -> list[list[str]]:
-    """エントリーポイントからターゲットパッケージまでの import チェーンを構築する。"""
-    # ターゲットパッケージのノードを見つける
+    """エントリーポイントからターゲットパッケージまでの import チェーン（最短経路）を返す。
+
+    訪問済み集合つきの BFS（O(V+E)）。循環の多いグラフでも指数時間にならない。
+    """
     target_nodes = {
         name
         for name, node in graph.nodes.items()
         if node.top_level_package == target_package
     }
-
     if not target_nodes:
         return []
 
-    # エッジから逆方向の隣接リストを構築
-    reverse_adj: dict[str, list[str]] = {}
+    adj: dict[str, list[str]] = {}
     for edge in graph.edges:
-        if edge.to_module not in reverse_adj:
-            reverse_adj[edge.to_module] = []
-        reverse_adj[edge.to_module] = reverse_adj[edge.to_module] + [edge.from_module]
+        adj.setdefault(edge.from_module, []).append(edge.to_module)
 
-    # エントリーポイントモジュールを特定
-    entry_modules = {
-        name for name, node in graph.nodes.items() if node.depth == 0
-    }
+    entry_modules = [name for name, node in graph.nodes.items() if node.depth == 0]
+    parent: dict[str, str | None] = {}
+    queue: deque[str] = deque()
+    for e in entry_modules:
+        parent[e] = None
+        queue.append(e)
+    found: list[str] = []
+    while queue and len(found) < max_paths:
+        cur = queue.popleft()
+        if cur in target_nodes:
+            found.append(cur)
+            continue  # ターゲットの内部は辿らない
+        for nxt in adj.get(cur, []):
+            if nxt not in parent:
+                parent[nxt] = cur
+                queue.append(nxt)
 
-    # DFS で全パスを探索
     chains: list[list[str]] = []
-    for target in target_nodes:
-        _find_paths(target, entry_modules, reverse_adj, [target], chains, max_paths=5)
-
+    for t in found:
+        path = [t]
+        while parent.get(path[-1]) is not None:
+            path.append(parent[path[-1]])  # type: ignore[arg-type]
+        chains.append(list(reversed(path)))
     return chains
-
-
-def _find_paths(
-    current: str,
-    targets: set[str],
-    reverse_adj: dict[str, list[str]],
-    path: list[str],
-    results: list[list[str]],
-    max_paths: int = 5,
-) -> None:
-    """逆方向にパスを探索する。"""
-    if len(results) >= max_paths:
-        return
-
-    if current in targets:
-        results.append(list(reversed(path)))
-        return
-
-    for prev in reverse_adj.get(current, []):
-        if prev not in path:  # 循環防止
-            _find_paths(prev, targets, reverse_adj, path + [prev], results, max_paths)
