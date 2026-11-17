@@ -1216,7 +1216,9 @@ def build_conditions(sem: Semantics, uses: list, prefix: str) -> dict | None:
             reason += f"（ほか {len(low_reasons) - 1} 件）"
     elif any(g.get("estimated_routes") for g in conds):
         reason = "推定の経路があります。verify(run_entry=True) で確かめてください"
-    assert confidence != "high" or not any(g.get("route_from_project") for g in conds)
+    if confidence == "high" and any(g.get("route_from_project") for g in conds):
+        # 規則は 8c0a487 で凍結（第 7 回の判断）。high でも確定した経路が出ることがある（表示だけ。判定は変えない）
+        reason = "プロジェクトから入口へ入る経路があります（high は規則による参考の表示です）。verify で確かめてください"
     shown = conds[:MAX_CONDITIONS]
     for g in shown:
         if g["may_be_swallowed"]:
