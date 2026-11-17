@@ -1095,7 +1095,7 @@ def build_conditions(sem: Semantics, uses: list, prefix: str) -> dict | None:
         g = groups.setdefault((ekey, tag), {
             "entry": _api_name(sem, ekey),
             "entry_location": f"{ekey[0]}:{ekey[1]}" + (f" 行 {eev.lineno}" if tag == "branch" and getattr(eev, "lineno", 0) else ""),
-            "why_unproven": _TAG_TEXT.get(tag, tag),
+            "why_conditional": _TAG_TEXT.get(tag, tag),
             "dispatch_name": (getattr(eev, "name", "") if tag == "name" else ""),
             "called_from": _api_name(sem, caller) if caller is not None else "",
             "uses": [],
@@ -1131,7 +1131,7 @@ def build_conditions(sem: Semantics, uses: list, prefix: str) -> dict | None:
         merged.update({
             "entry": f"{prefix} 以下を import・使用しない",
             "entry_location": f"{prefix}（中の入口 {len(inner)} 件をまとめたもの）",
-            "why_unproven": "スタブにするサブモジュール自身の中の入口",
+            "why_conditional": "スタブにするサブモジュール自身の中の入口",
             "dispatch_name": "", "inner_entries": len(inner),
             "uses": sorted({u for g in inner for u in g["uses"]})[:5],
             "may_be_swallowed": any(g["may_be_swallowed"] for g in inner),

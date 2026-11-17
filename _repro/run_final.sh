@@ -3,7 +3,7 @@
 cd "$(dirname "$0")/.."
 export UV_LINK_MODE=copy UV_CACHE_DIR=C:/tmp/pystub-e2e/uvcache
 O=${FINAL_OUT:-/c/tmp/pystub-e2e/after_final}
-case "$O" in */after_final|*/after_final/v2) ;; *) echo "bad out $O"; exit 1;; esac
+case "$O" in */after_final|*/after_final/v2|*/after_final2) ;; *) echo "bad out $O"; exit 1;; esac
 mkdir -p $O
 wait_mem() { while [ "$(powershell -Command "[int]((Get-CimInstance Win32_OperatingSystem).FreePhysicalMemory/1024)" | tr -d '\r')" -lt 4096 ]; do sleep 30; done; }
 step() { [ -f "$O/.done_$1" ]; }

@@ -50,6 +50,7 @@ _LOUD_HEADER = """# mcp-pystub stub (conditional): {module}
 class PystubConditionalStubError(RuntimeError):
     pass
 _PYSTUB_NOTE = {note!r}
+_PYSTUB_CLOSED = {closed!r}  # True: 静的解析の候補のスタブ（元に無い属性は AttributeError）
 def _raise(n):
     # 既定: 標準エラーに原因を書いて終了コード 70 で即終了（except で握りつぶせない）。
     # MCP_PYSTUB_STRICT=0 のときだけ例外を投げる
@@ -146,11 +147,16 @@ class _M(type):
         if c.__dict__.get("_pystub_ph"):
             _raise("hash(" + c.__name__ + ")")  # 値の代わり: 辞書・集合の検索で黙って変わらないように
         return type.__hash__(c)
-def _g(n, t=False, strict=False):
-    # t=True: 元はクラス・関数・モジュール（上の (1)。属性は分からないので全て値の代わり）。t=False: 値の代わり (2)
+def _g(n, t=False, strict=False, known=None):
+    # t=True: 元はクラス・関数・モジュール（上の (1)）。t=False: 値の代わり (2)
+    # known: 元のクラスの名前の一覧（元に無い名前は AttributeError）。分からない時、静的解析の候補のスタブ（_PYSTUB_CLOSED）
+    # では全ての名前を AttributeError に、条件付きのスタブでは全ての名前を値の代わり（使えば止まる）にする
     # strict: 元が普通のクラスでない（Enum 等）
-    return _M(n, (), {{"_pystub_known": None if t else (), "_pystub_truthy": t, "_pystub_ph": not t,
-                       "_pystub_strict": strict}})
+    if t:
+        k = known if known is not None else (() if _PYSTUB_CLOSED else None)
+    else:
+        k = ()
+    return _M(n, (), {{"_pystub_known": k, "_pystub_truthy": t, "_pystub_ph": not t, "_pystub_strict": strict}})
 """
 
 _NET_KNOWN = """_PYSTUB_KNOWN = {known}
@@ -163,10 +169,11 @@ def __getattr__(n):
 # 条件付き: 名前の種類（元がクラス・関数・モジュールなら値の代わりにしない）
 _NET_KNOWN_LOUD = """_PYSTUB_KNOWN = {known}
 _PYSTUB_KINDS = {kinds}
+_PYSTUB_MEMBERS = {members}
 def __getattr__(n):
     if n in _PYSTUB_KNOWN and n[:2] != "__":
         k = _PYSTUB_KINDS.get(n)
-        v = globals()[n] = _g(n, k in ("c", "f", "m", "s"), k == "s")  # 同じ名前は同じオブジェクト（同一性・hash）
+        v = globals()[n] = _g(n, k in ("c", "f", "m", "s"), k == "s", _PYSTUB_MEMBERS.get(n))  # 同じ名前は同じオブジェクト
         return v
     raise AttributeError(n)
 """
@@ -269,12 +276,13 @@ def collect_accesses(sem: Semantics, prefix: str, exclude: tuple[str, ...] = ())
 
 
 class _StubBuilder:
-    def __init__(self, sem: Semantics, prefix: str, version: str | None, loud_note: str = "") -> None:
+    def __init__(self, sem: Semantics, prefix: str, version: str | None, loud_note: str = "", closed: bool = False) -> None:
         self.sem = sem
         self.p: Program = sem.program
         self.prefix = prefix
         self.version = version
         self.loud_note = loud_note  # 条件付き候補: 呼ばれたら出す説明
+        self.closed = closed  # 静的解析の候補のスタブ: 元に無い属性は AttributeError（遅れて作るクラスの代わりも）
         self.modules: dict[str, ModuleAccess] = {}
 
     def need(self, module: str, name: str | None = None, sub: tuple[str, ...] = ()) -> None:
@@ -371,6 +379,7 @@ class _StubBuilder:
         known = self._known_names(info)
         if known is not None and self.loud_note:
             kinds = {}
+            members: dict = {}
             for nm in sorted(known):
                 if nm in self._emitted:
                     continue
@@ -381,12 +390,17 @@ class _StubBuilder:
                     r0, k0 = None, ""
                 if k0 == "class":
                     kinds[nm] = "c" if self.p.class_is_plain(r0.module, r0.target) else "s"
+                    if self.closed:
+                        cinfo = self.p.get(r0.module)
+                        cci = cinfo.classes.get(r0.target) if cinfo is not None else None
+                        if cinfo is not None and cci is not None:
+                            members[nm] = frozenset(sorted(self._class_known(cinfo, cci)))
                 elif k0 in ("function", "module", "external_module"):
                     kinds[nm] = "f" if k0 == "function" else "m"
-            net = _NET_KNOWN_LOUD.format(known=repr(frozenset(sorted(known))), kinds=repr(kinds))
+            net = _NET_KNOWN_LOUD.format(known=repr(frozenset(sorted(known))), kinds=repr(kinds), members=repr(members))
         else:
             net = _NET_ALL if known is None else _NET_KNOWN.format(known=repr(frozenset(sorted(known))))
-        header = _LOUD_HEADER.format(module=module, note=self.loud_note) if self.loud_note else \
+        header = _LOUD_HEADER.format(module=module, note=self.loud_note, closed=self.closed) if self.loud_note else \
             _HEADER.format(module=module)
         return "\n".join([header, net] + defs + tail)
 
@@ -840,7 +854,7 @@ def generate_stubs(
     # P 自体がスタブになれば読み込まれないので生成しない
     extra: list[str] = []
     note, conditional_info = _conditional_note(graph, sem, package_name, is_package=True)
-    builder = _StubBuilder(sem, package_name, version, loud_note=note)
+    builder = _StubBuilder(sem, package_name, version, loud_note=note, closed=conditional_info is None)
     if main.is_file() and not is_extension_file(main) and "." not in package_name:
         # 単一ファイルモジュール
         code_by_mod = builder.build(accesses, [])
@@ -862,7 +876,8 @@ def generate_stubs(
             for i in range(1, len(parts) - 1):
                 init = "/".join(parts[:i]) + "/__init__.py"
                 if init not in files:
-                    files[init] = (_LOUD_HEADER.format(module=".".join(parts[:i]), note=note) + _NET_ALL) if note \
+                    files[init] = (_LOUD_HEADER.format(module=".".join(parts[:i]), note=note, closed=conditional_info is None)
+                                   + _NET_ALL) if note \
                         else _HEADER.format(module=".".join(parts[:i]))
         if note and conditional_info is not None:
             # 条件付き・記録からの候補のスタブ: 元にある全てのサブモジュールと公開名を import できるようにし、使った時点で
@@ -953,11 +968,11 @@ def _all_submodule_stubs(pkg_dir: Path, package_name: str, have: dict, note: str
         if rel in have or rel in out:
             continue
         mod = ".".join(rel_parts[:-1] + ((stem,) if stem != "__init__" else ()))
-        out[rel] = _LOUD_HEADER.format(module=mod, note=note) + _NET_ALL
+        out[rel] = _LOUD_HEADER.format(module=mod, note=note, closed=False) + _NET_ALL
         for i in range(len(package_name.split(".")) + 1, len(rel_parts)):
             init = "/".join(rel_parts[:i]) + "/__init__.py"
             if init not in have and init not in out:
-                out[init] = _LOUD_HEADER.format(module=".".join(rel_parts[:i]), note=note) + _NET_ALL
+                out[init] = _LOUD_HEADER.format(module=".".join(rel_parts[:i]), note=note, closed=False) + _NET_ALL
     return out
 
 
@@ -1277,7 +1292,7 @@ def generate_submodule_stubs(
     accesses = collect_accesses(sem, submodule)
     extra: list[str] = []
     note, conditional_info = _conditional_note(graph, sem, submodule, is_package=False)
-    builder = _StubBuilder(sem, submodule, None, loud_note=note)
+    builder = _StubBuilder(sem, submodule, None, loud_note=note, closed=conditional_info is None)
     code_by_mod = builder.build(accesses, extra)
     files: dict[str, str] = {}
     for m, c in code_by_mod.items():

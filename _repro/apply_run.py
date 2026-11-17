@@ -12,7 +12,7 @@ from mcp_pystub.stub_generator import generate_stubs, generate_submodule_stubs  
 
 BASH = r"C:\Program Files\Git\bin\bash.exe"
 out = Path(sys.argv[1])
-assert "after_final" in str(out), out
+assert "after_final" in str(out), out  # after_final / after_final2
 out.mkdir(parents=True, exist_ok=True)
 
 

@@ -246,10 +246,10 @@ def run(name, entry2=False):
     R["only"], R["extra"] = only, extra
     R["summary"] = A.get("summary")
     R["conditional"] = [{k: x.get(k) for k in ("package_name", "estimated_savings_mb", "conditions_total", "conditional_because", "confidence")}
-                        | {"conditions": [{k: g.get(k) for k in ("entry", "public_api", "entry_location", "why_unproven", "uses", "may_be_swallowed", "project_uses_count")}
+                        | {"conditions": [{k: g.get(k) for k in ("entry", "public_api", "entry_location", "why_conditional", "uses", "may_be_swallowed", "project_uses_count")}
                                           for g in x.get("conditions", [])]} for x in A.get("conditional", [])]
     R["conditional_hints"] = [{k: h.get(k) for k in ("submodule", "parent_package", "target_package", "estimated_savings_mb", "conditions_total", "confidence")}
-                              | {"conditions": [{k: g.get(k) for k in ("entry", "public_api", "entry_location", "why_unproven", "uses", "may_be_swallowed", "project_uses_count")}
+                              | {"conditions": [{k: g.get(k) for k in ("entry", "public_api", "entry_location", "why_conditional", "uses", "may_be_swallowed", "project_uses_count")}
                                                 for g in h.get("conditions", [])]} for h in cond_hint_list]
     save()
     if not (stub_pkgs or nof or hints or cond_pkgs or cond_hints):

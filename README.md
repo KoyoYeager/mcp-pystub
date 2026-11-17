@@ -66,7 +66,7 @@ stubbable には混ざりません。各候補に、推定の削減量・条件�
 原因を exe のあるフォルダ（書けなければ一時フォルダ）の `pystub_stop.log` に書きます。`MCP_PYSTUB_STRICT=0` を付けた時だけ
 `PystubConditionalStubError` を投げる動作になります（呼び出し元の `except Exception` 等で握りつぶされうる箇所は条件の
 `may_be_swallowed` に出ます）。**止まらない操作**: スタブのクラスそのものの `==`・hash・真偽・repr は元のクラスと同じ動作で、元に無い属性は
-`AttributeError` になります（isinstance の判定も止まりません）。この止まり方は、stubbable・サブモジュールのヒントを含む全てのスタブで同じです（仕上げの回で統一。nofollow はビルドから外すだけ）。stubbable・サブモジュールのヒントのスタブは、静的解析で参照が見つかったモジュールだけを持つので、それ以外のサブモジュールの import は `ModuleNotFoundError` になります（止まらずに例外になる。条件付き・記録からの候補のスタブは全てのサブモジュールを持ち、使った時点で止まる）。配布物がビルド時のフック探索の入口（entry_points の `pyinstaller40`）を宣言していれば、その関数は空のリストを返します（PyInstaller のビルドが止まらないように）。
+`AttributeError` になります（isinstance の判定も止まりません）。この止まり方は、stubbable・サブモジュールのヒントを含む全てのスタブで同じです（仕上げの回で統一。nofollow はビルドから外すだけ）。stubbable・サブモジュールのヒントのスタブは、静的解析で参照が見つかったモジュールだけを持つので、それ以外のサブモジュールの import は `ModuleNotFoundError` になります（止まらずに例外になる。条件付き・記録からの候補のスタブは全てのサブモジュールを持ち、使った時点で止まる）。記録からの候補のスタブ（静的解析では required）は、元にある値でも AttributeError になることがあります（例: 01_tqdm の `PIL.Image.NEAREST`。静的解析で参照が見つからなかった名前は持たないため）。条件付きのスタブのクラス（例: fontTools の `TTFont`）は、元に無い属性を聞いても AttributeError にならず、終了コード 70 で止まることがあります（属性の一覧を持たないクラスの代わりのため）。配布物がビルド時のフック探索の入口（entry_points の `pyinstaller40`）を宣言していれば、その関数は空のリストを返します（PyInstaller のビルドが止まらないように）。
 
 **制限**: 子プロセス（multiprocessing・concurrent.futures・subprocess）の中で止まった場合、親が終了コードや例外として
 受け取って処理を続けることがあります。即終了なので、書き込み途中のファイルが残り、`atexit` / `finally` は実行されません。
@@ -309,7 +309,7 @@ mcp-pystub
     ],
     "conditional_submodule_hints": [
       {"submodule": "asammdf.gui", "target_package": "PySide6", "estimated_savings_mb": 646.7, "confidence": "high",
-       "conditions": [{"entry": "asammdf.gui 以下を import・使用しない", "why_unproven": "スタブにするサブモジュール自身の中の入口"}, ...],
+       "conditions": [{"entry": "asammdf.gui 以下を import・使用しない", "why_conditional": "スタブにするサブモジュール自身の中の入口"}, ...],
        "how_to_check": "verify(..., packages=[], submodules=['asammdf.gui=>PySide6'], nofollow=[], run_entry=True, record=True)"},
       {"submodule": "asammdf.gui", "target_package": "lxml", "estimated_savings_mb": 8.5, "confidence": "low", ...}
     ],
@@ -424,7 +424,7 @@ MIT
 - 全てのスタブ（stubbable・サブモジュールのヒントを含む）を、使われたら原因を出して終了コード 70 で止まる形にそろえた
   （nofollow はビルドから外すだけ）
 - 出力キーの改名（未公開のため）: summary の `proven_savings_mb` → `static_candidate_size_mb`、
-  conditional の `unproven_because` → `conditional_because`
+  conditional の `unproven_because` → `conditional_because`、conditions の `why_unproven` → `why_conditional`
 - パッケージ名を `src` から `mcp_pystub` に変えた（`python -m mcp_pystub.trace` など）
 - 判定を 3 層に分けた: 静的解析（候補を出すだけ。保証ではない）・動的解析（`verify`、実行の記録）・実行時（止まるスタブ、終了コード 70）
 - 追加: `verify` ツール（import だけの確認が既定。`run_entry=True`・`record=True`・`trace_files`・`entry_args`・`cwd`・`timeout`）、

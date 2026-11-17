@@ -89,13 +89,13 @@ def cscenario(name, sp_files, proj_files, entries=("main.py",), levels=("proven"
     for p in res.get("conditional", []):
         print(f"   COND      {p['package_name']} conf={p['confidence']} total={p['conditions_total']}")
         for c in p["conditions"]:
-            print(f"        entry={c['entry']} why={c['why_unproven'][:20]} uses={c['uses']} swallow={c['may_be_swallowed']} proj_uses={c['project_uses_count']} api={c.get('public_api')}")
+            print(f"        entry={c['entry']} why={c['why_conditional'][:20]} uses={c['uses']} swallow={c['may_be_swallowed']} proj_uses={c['project_uses_count']} api={c.get('public_api')}")
     for h in res.get("submodule_stub_hints", []):
         print(f"   HINT      {h['submodule']} -X {h['target_package']}")
     for h in res.get("conditional_submodule_hints", []):
         print(f"   CHINT     {h['submodule']} -X {h['target_package']} conf={h['confidence']} total={h['conditions_total']}")
         for c in h["conditions"]:
-            print(f"        entry={c['entry']} why={c['why_unproven'][:20]} uses={c['uses']} swallow={c['may_be_swallowed']} proj_uses={c['project_uses_count']}")
+            print(f"        entry={c['entry']} why={c['why_conditional'][:20]} uses={c['uses']} swallow={c['may_be_swallowed']} proj_uses={c['project_uses_count']}")
     findings = []
     origs = {}
     for e in entries:
