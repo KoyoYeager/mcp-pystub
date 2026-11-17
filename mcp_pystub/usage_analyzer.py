@@ -558,16 +558,6 @@ def _analyze_single_package(
     usage = prefix_usage(sem, package_name)
     gateways = _gateways(usage.uses, sem.reach.reached)
 
-    reg = _registers_at_import(sem, package_name)
-    if reg:
-        return PackageAnalysis(
-            verdict="required",
-            reason=f"{package_name} の import 時に {reg} がデコレータで登録されます（登録は import の副作用で、"
-            "スタブにすると登録されなくなるため安全側判定: 第 7 回）。",
-            gateway_functions=gateways,
-            **common,
-        )
-
     side = _import_side_effect(sem, package_name)
     if side:
         return PackageAnalysis(
@@ -702,24 +692,6 @@ def _analyze_single_package(
 # ---------------------------------------------------------------------------
 # サブモジュールによる間接排除（仕様 6 節）
 # ---------------------------------------------------------------------------
-
-
-def _registers_at_import(sem: Semantics, package_name: str) -> str:
-    """package_name の到達済みのモジュール本体（クラス本体を含む）が、関数・クラスを登録の仕組み（入れ物に入れる・
-    逃げ出すデコレータ）で登録するなら、その名前。"""
-    prog = sem.program
-    for (m, q) in sem.reach.reached:
-        if q != "<module>" or not under(m, package_name):
-            continue
-        unit = prog.units.get((m, q))
-        if unit is None:
-            continue
-        if unit.registry_escaped:
-            return f"{m}.{sorted(unit.registry_escaped)[0]}"
-        for ev in unit.events:
-            if ev.kind == "class_escape":
-                return f"{m}.{ev.target}"
-    return ""
 
 
 def _import_side_effect(sem: Semantics, package_name: str) -> str:

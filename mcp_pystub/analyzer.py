@@ -156,8 +156,11 @@ def _analyze(entry_point: str, python_path: str, max_depth: int, include_small_c
     result_dict["verify_status"] = "未実施"
     result_dict = {"summary": _summary(result_dict, str(entry), python_path, required), **result_dict}
     result_dict["next_steps"] = [
-        "適用前に verify(entry_point, python_path, packages=[...], submodules=[...], nofollow=[...], run_entry=True) で、"
-        "解析したエントリーが変わらないことを確かめてください（保証の最後の拠り所は verify と実ビルドの実行確認です）。",
+        "手順 1: verify(entry_point, python_path, packages=[...], submodules=[...], nofollow=[...]) で、スタブに差し替えて "
+        "import できることを確かめてください（既定は import だけ。import だけの確認でも、各モジュールの直下のコード（import 時に実行されるコード）は動きます。エントリーの `if __name__ == \"__main__\":` の中は動きません。）。",
+        "手順 2: スタブを適用してビルドし、普段のやり方で exe を試してください（スタブに触れたら原因を出して終了コード 70 で止まります）。",
+        "任意: エントリーを動かしても安全な時（副作用が無い・試験用の引数や入力がある）だけ、run_entry=True や実行の記録"
+        "（python -m mcp_pystub.trace）でより強く確かめられます。",
         "この結果は静的解析による候補です（実行の保証ではありません）。",
         "適用前に verify ツールで、スタブ（とサブモジュールのヒント・nofollow）に差し替えた状態の import を"
         "対象環境の python で確かめてください（verify は site-packages を書き換えません）。",
@@ -368,7 +371,7 @@ def _cond_text(conds: list[dict], total: int, complete: bool = True) -> tuple[st
 
 
 def _summary(rd: dict, entry: str, python_path: str, required: list) -> dict:
-    """結果の先頭に置く要約: 証明済み・条件付き（high）の削減見込みと、次の手順。"""
+    """結果の先頭に置く要約: 使用が見つからなかった候補・条件付き（high）の削減見込みと、次の手順。"""
     proven_mb = sum(p.get("estimated_size_mb", 0.0) for p in rd["stubbable"]) + \
         sum(p.get("estimated_size_mb", 0.0) for p in rd["nofollow"])
     size_of = {a.package_name: a.estimated_size_mb for a in required}
@@ -376,9 +379,9 @@ def _summary(rd: dict, entry: str, python_path: str, required: list) -> dict:
     proven_mb += sum(size_of.get(t, 0.0) for t in proven_targets)
     recs: list[str] = []
     for p in rd["stubbable"]:
-        recs.append(f"{p['package_name']} をスタブ化できます（証明済み、約 {p['estimated_size_mb']:.1f} MB）")
+        recs.append(f"{p['package_name']} をスタブ化できます（静的解析で使用が見つからなかった候補、約 {p['estimated_size_mb']:.1f} MB）")
     for h in rd.get("submodule_stub_hints", []):
-        recs.append(f"{h['submodule']} をスタブ化すると {h['target_package']} を排除できます（証明済み）")
+        recs.append(f"{h['submodule']} をスタブ化すると {h['target_package']} を排除できます（静的解析で使用が見つからなかった候補）")
     high_mb = 0.0
     high_n = 0
     seen_targets: set[str] = set()
@@ -406,13 +409,16 @@ def _summary(rd: dict, entry: str, python_path: str, required: list) -> dict:
     cond_recs.sort(key=lambda x: (0 if x[0] == "high" else 1, x[1]))
     py = f", python_path={python_path!r}" if python_path else ""
     steps = [
-        f"1. 適用前に必ず verify({entry!r}{py}, packages=[...], submodules=['<サブモジュール>=><排除する C 拡張>'], "
-        "run_entry=True) で、解析したエントリーが変わらないことを確かめる（証明済み・条件付きとも静的解析による提案です）",
+        f"1. verify({entry!r}{py}, packages=[...], submodules=['<サブモジュール>=><排除する C 拡張>']) で、スタブに差し替えて"
+        "import できることを確かめる（既定は import だけで、エントリー本体は動かさない。" + "import だけの確認でも、各モジュールの直下のコード（import 時に実行されるコード）は動きます。エントリーの `if __name__ == \"__main__\":` の中は動きません。" + "）",
+        "2. スタブを適用してビルドし、普段のやり方で exe を試す（スタブに触れる経路を通ったら原因を出して終了コード 70 で止まる）",
+        "（任意）エントリーを動かしても安全な時（副作用が無い・試験用の引数や入力がある）だけ、verify(..., run_entry=True) や"
+        "実行の記録（python -m mcp_pystub.trace）でより強く確かめられる",
         "2. 推奨の上から選ぶ。[high] = プロジェクトが、入口に届く公開関数を 1 つも呼んでいない（入口の列挙が完了し、入口へ"
         "入る辺が登録・間接呼び出しの仕組みでない）。[low] = プロジェクトが入口に届く公開関数を呼んでいる・経路が間接的"
         "（条件を破る入力では終了コード 70 で止まる。理由は confidence_reason）",
-        f"3. サブモジュールなら generate_submodule({entry!r}, <親>, <サブモジュール>{py})、パッケージなら generate(...) でスタブを作る",
-        "4. build_instructions の手順で適用 → ビルド → 実行結果を元と比べる → 手順どおり復元",
+        f"スタブの作り方: サブモジュールなら generate_submodule({entry!r}, <親>, <サブモジュール>{py})、パッケージなら generate(...)。"
+        "適用・復元は build_instructions の手順で",
     ]
     return {
         "proven_savings_mb": round(proven_mb, 1),
@@ -421,7 +427,7 @@ def _summary(rd: dict, entry: str, python_path: str, required: list) -> dict:
         "recommendations": [r for _, _, r in cond_recs if r.startswith("[high]")] + recs + [
             r for _, _, r in cond_recs if not r.startswith("[high]")],
         "next_steps": steps,
-        "note": "[high] / [low] は条件付き候補（安全の証明ではありません）。stubbable / submodule_stub_hints だけが証明済みです。",
+        "note": "stubbable / submodule_stub_hints は静的解析で使用が見つからなかった候補、[high] / [low] は条件付きの候補です。どちらも保証ではありません。実際に外せるかは verify(run_entry=True)（と実行の記録）で確かめます。",
         "size_note": "MB はインストール済みのファイルの大きさ（__pycache__ を除く）で、exe の削減量ではありません"
                      "（PyInstaller が同梱する範囲・圧縮で変わります）。",
     }

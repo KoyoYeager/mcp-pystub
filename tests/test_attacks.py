@@ -115,3 +115,32 @@ def test_overlap_reverse_order(tmp_path):
     assert "[after restore] lost=[] changed=[] bak_exists=False" in out, out
     vc = [l for l in out.splitlines() if l.startswith("   python -c")]
     assert vc and all(" -> 0 " in l for l in vc), vc
+
+
+# 第 7 回: 静的解析が当てることでなく、verify(run_entry=True) が原因の項目を passed に入れないことで守る。
+# 適用すると解析したエントリーが変わるシナリオで、verify が通した組を適用してもエントリーが変わらないこと（VCHECK ok）。
+# 件数を固定する（シナリオが消えたら失敗）
+VCHECK_COUNTS = {"n1.py": (11, 10), "f1.py": (20, 14), "e1.py": (14, 6), "e4.py": (3, 3), "f3.py": (7, 1)}
+
+
+@pytest.mark.parametrize("script", sorted(VCHECK_COUNTS))
+def test_verify_rejects_what_breaks_the_entry(script, tmp_path, monkeypatch):
+    monkeypatch.setenv("PYSTUB_VERIFY_CHECK", "1")
+    out = _run(script, tmp_path)
+    results = [l for l in out.splitlines() if l.startswith("RESULT ")]
+    checks = [l for l in out.splitlines() if l.startswith("VCHECK ")]
+    n_res, n_chk = VCHECK_COUNTS[script]
+    assert len(results) == n_res, (len(results), n_res)
+    assert len(checks) == n_chk, (len(checks), n_chk)
+    bad = [l for l in checks if " BAD " in l]
+    assert not bad, bad
+
+
+@pytest.mark.skipif(not Path(r"C:\\tmp\\pystub-e2e\\check_round6\\real_acc\\venv").exists(), reason="Y7-real の venv がありません")
+def test_verify_rejects_real_pandas_accessor_plugin():
+    """Y7-real: pandas の公式拡張 API で accessor を登録するだけのプラグイン。verify(run_entry=True) が通さない"""
+    from mcp_pystub.verifier import verify
+    R = Path(r"C:\\tmp\\pystub-e2e\\check_round6\\real_acc")
+    v = verify(str(R / "proj/entry.py"), python_path=str(R / "venv/Lib/site-packages"), packages=["geoacc"],
+               submodules=[], nofollow=[], run_entry=True)
+    assert "geoacc" not in v["passed"]["packages"], v

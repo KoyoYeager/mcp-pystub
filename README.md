@@ -16,7 +16,7 @@ When building Python apps into executables, heavy packages imported at module le
 
 ### 実証データ / Verified Results
 
-> **再測定中**: 下の数値は判定を 2 段（証明済み / 条件付き）に分ける前のものです。差し替え予定です。
+> **再測定中**: 下の数値は判定を 2 段（使用が見つからなかった候補 / 条件付き）に分ける前のものです。差し替え予定です。
 
 **asammdf プロジェクト — PyInstaller exe ビルド（E2E 動作確認済み）:**
 
@@ -52,13 +52,13 @@ submodule hints:    asammdf.gui → PySide6 (523 MB) 排除可能 — 50 hints �
 
 判定は 2 段に分かれます（仕様: [docs/STUB_SAFETY_SPEC.md](docs/STUB_SAFETY_SPEC.md) の 1〜6 節と 9 節）。
 
-**証明済み** — 「エントリーから到達しうる全ての実行で元と同じ」と静的に示せたものだけ:
+**静的解析で使用が見つからなかった候補** — エントリーから到達しうるコードに、スタブで動作が変わる使用が見つからなかったもの（保証ではありません。実際に外せるかは下の 3 層の役割を参照）:
 
 | 判定 / Verdict | 意味 / Meaning |
 |---|---|
 | **stubbable** | スタブ化可能（全ての実行で元と同じ） / Proven safe to stub |
 | **nofollow** | 単純に保護された import だけで参照も無い。除外可能 / Proven safe to exclude |
-| `submodule_stub_hints` | C 拡張を import 閉包から外す、証明済みのサブモジュールの組 / Proven submodule stubs |
+| `submodule_stub_hints` | C 拡張を import 閉包から外す、使用が見つからなかったサブモジュールの組 / Submodule stub candidates |
 | **required** | スタブ化不可（確実に実行される使用がある、または区別できない） / Cannot stub |
 
 **条件付き**（`conditional` / `conditional_submodule_hints`） — 安全は示せないが、列挙した機能を使わないなら外せる候補。
@@ -95,7 +95,7 @@ low でも、解析したエントリーで変わらないことは `verify(...,
 作業フォルダ `cwd`（既定はエントリーのあるフォルダ）で実行するので、引数や入力ファイルが要るエントリーでは `entry_args` /
 `cwd` を指定してください。基準（スタブなし）の実行が失敗した時は何も通さず `baseline_failed` に理由を返します。
 
-`analyze` の結果の先頭には `summary`（証明済みの推定削減 MB・conditional(high) の MB と件数・推奨の一覧・次の手順）が
+`analyze` の結果の先頭には `summary`（使用が見つからなかった候補の推定削減 MB・conditional(high) の MB と件数・推奨の一覧・次の手順）が
 付きます。1 MB 未満の条件付き候補は既定で省き（`conditional_omitted_small` に件数）、`include_small_conditional=True`
 で全件を出します。推定サイズ（`estimated_size_mb` / `estimated_savings_mb`）は**インストール済みのファイルの大きさ**で、
 exe の削減量ではありません（実際の削減は PyInstaller の同梱範囲と圧縮で変わります）。
@@ -127,9 +127,26 @@ exe の削減量ではありません（実際の削減は PyInstaller の同梱
 - **ランタイムの条件分岐**: `if sys.version_info < (3, 11)` 等の実行環境で決まる分岐は、両方の枝を「確実に実行される」
   側に倒します（安全側。削減を取りこぼすことがあります）
 
+### 3 層の役割と保証 / Three layers
+
+| 層 | 役割 | 保証 |
+|---|---|---|
+| 静的解析（`analyze`） | 候補を出し、サイズ順に並べ、理由（使われ方・条件・confidence）を説明する | 保証しない（提案） |
+| 動的解析（`verify(run_entry=True)` と実行の記録） | エントリーを実際に動かし、候補が実行されたか（記録）と、スタブに差し替えても動作が変わらないか（verify）を確かめる | **動かした入力では動作が変わらない** |
+| 実行時（止まるスタブ） | 動かしていない経路でスタブに触れたら、原因を出して終了コード 70 で止まる（条件付きのスタブ） | 黙って結果が変わらない（下の制限を除く） |
+
+**確認の手順**: (1) `verify`（既定は import だけ。エントリー本体は動かさない。ただし各モジュールの直下のコード（import 時の
+コード）は動き、エントリーの `if __name__ == "__main__":` の中は動かない）→ (2) スタブを適用してビルドし、普段のやり方で exe を
+試す（スタブに触れたら原因を出して終了コード 70 で止まる）→（任意）エントリーを動かしても安全な時だけ `run_entry=True` や
+実行の記録でより強く確かめる。
+
+> **警告**: `run_entry=True` と実行の記録は、対象のプログラムを実際に実行します。ファイルの書き込み・削除、通信、機器の操作などの
+> 副作用が起きえます。AI エージェントは、利用者が明示的に求めた時だけ指定してください。GUI や常駐型のプログラムは終了しないので
+> timeout で打ち切られます。
+
 ### 安全性の設計方針 / Safety Policy
 
-証明済み（stubbable / nofollow / submodule_stub_hints）・条件付きとも、**静的解析による提案**です
+使用が見つからなかった候補（stubbable / nofollow / submodule_stub_hints）・条件付きとも、**静的解析による提案**です
 （[仕様](docs/STUB_SAFETY_SPEC.md) 5 節の前提のもと）。**適用前に `verify(..., run_entry=True)` で、解析したエントリーが
 変わらないことを確かめてください**。保証の最後の拠り所は verify と、ビルド後の実行結果の比較です。判定に迷う場合は
 required（安全側）に倒し、逆方向の誤判定（本当は stubbable なのに required）は許容します。

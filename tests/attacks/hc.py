@@ -128,4 +128,27 @@ def cscenario(name, sp_files, proj_files, entries=("main.py",), levels=("proven"
                 findings.append((lv, e, kind))
     RESULTS.append((name, findings))
     print(f"RESULT {name} {findings}", flush=True)
+    if os.environ.get("PYSTUB_VERIFY_CHECK") == "1" and any(e == entries[0] for _lv, e, _k in findings):
+        _verify_check(name, root, sp, proj, ep, res, origs[entries[0]])
     return res
+
+
+def _verify_check(name, root, sp, proj, ep, res, orig):
+    """第 7 回: 適用すると解析したエントリーが変わる場面で、verify(run_entry=True) が通した組を適用しても
+    エントリーが変わらないこと（= verify が原因の項目を passed に入れないこと）を確かめる。"""
+    from mcp_pystub.verifier import verify
+    pk = [p["package_name"] for p in res["stubbable"]] + [p["package_name"] for p in res.get("conditional", [])]
+    subs = [f"{h['submodule']}=>{h['target_package']}" for h in
+            res.get("submodule_stub_hints", []) + res.get("conditional_submodule_hints", [])]
+    nof = [p["package_name"] for p in res["nofollow"]]
+    v = verify(ep, python_path=str(sp), packages=pk, submodules=subs, nofollow=nof, run_entry=True)
+    passed = {"stubbable": [{"package_name": x} for x in v["passed"]["packages"]], "nofollow":
+              [{"package_name": x} for x in v["passed"]["nofollow"]],
+              "submodule_stub_hints": [{"submodule": x.split("=>")[0], "target_package": x.split("=>")[1]}
+                                       for x in v["passed"]["submodules"] if "=>" in x], "conditional": [],
+              "conditional_submodule_hints": []}
+    site, applied = build_site(root, sp, ep, passed, "proven")
+    rc, o, er = run_py([str(proj), str(site)], ep)
+    ok = (rc, o) == (orig[0], orig[1])
+    print(f"VCHECK {name} {'ok' if ok else 'BAD'} items={pk + subs + nof} passed={v['passed']} "
+          f"rejected={[x['item'] for x in v['rejected']]} baseline_failed={bool(v.get('baseline_failed'))}", flush=True)
