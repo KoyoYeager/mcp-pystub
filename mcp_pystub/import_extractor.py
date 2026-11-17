@@ -8,7 +8,7 @@ from __future__ import annotations
 import ast
 from pathlib import Path
 
-from src.models import ImportInfo
+from mcp_pystub.models import ImportInfo
 
 
 class _ImportVisitor(ast.NodeVisitor):

@@ -17,12 +17,12 @@ from pathlib import Path
 
 import pytest
 
-from src.analyzer import analyze, check_usage
-from src.import_graph import build_import_graph
-from src.module_resolver import ModuleResolver
-from src.server import generate_submodule
-from src.stub_generator import generate_submodule_stubs
-from src.usage_analyzer import analyze_packages
+from mcp_pystub.analyzer import analyze, check_usage
+from mcp_pystub.import_graph import build_import_graph
+from mcp_pystub.module_resolver import ModuleResolver
+from mcp_pystub.server import generate_submodule
+from mcp_pystub.stub_generator import generate_submodule_stubs
+from mcp_pystub.usage_analyzer import analyze_packages
 
 FIXTURES = Path(__file__).parent / "fixtures"
 GUI_ENTRY = str(FIXTURES / "gui_project" / "main.py")
@@ -243,7 +243,7 @@ class TestRestorationSafety:
 
     def test_full_package_build_instructions_have_backup(self):
         """パッケージスタブの手順にもバックアップが含まれる"""
-        from src.stub_generator import generate_stubs
+        from mcp_pystub.stub_generator import generate_stubs
         result = generate_stubs(
             str(FIXTURES / "simple_project" / "main.py"),
             "pandas",

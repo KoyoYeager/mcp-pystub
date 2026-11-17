@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from src.stub_generator import generate_stubs
+from mcp_pystub.stub_generator import generate_stubs
 
 FIXTURES = Path(__file__).parent / "fixtures"
 ENTRY = str(FIXTURES / "simple_project" / "main.py")
@@ -51,6 +51,6 @@ class TestGenerateStubs:
 
 class TestStubFromServer:
     def test_server_tool(self):
-        from src.server import generate
+        from mcp_pystub.server import generate
         result = generate(ENTRY, "pandas", python_path=SP)
         assert isinstance(result, dict)

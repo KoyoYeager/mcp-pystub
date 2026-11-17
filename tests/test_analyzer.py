@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from src.analyzer import analyze, inspect_graph, check_usage
+from mcp_pystub.analyzer import analyze, inspect_graph, check_usage
 
 FIXTURES = Path(__file__).parent / "fixtures"
 ENTRY = str(FIXTURES / "simple_project" / "main.py")

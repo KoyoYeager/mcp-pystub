@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from src.size_estimator import estimate_package_size
+from mcp_pystub.size_estimator import estimate_package_size
 
 FIXTURES = Path(__file__).parent / "fixtures"
 

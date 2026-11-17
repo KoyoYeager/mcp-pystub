@@ -10,7 +10,7 @@ import os
 import sys
 from pathlib import Path
 
-from src.models import ModuleResolution
+from mcp_pystub.models import ModuleResolution
 
 # Python 3.10+ で利用可能
 _STDLIB_MODULES: frozenset[str] = getattr(sys, "stdlib_module_names", frozenset())

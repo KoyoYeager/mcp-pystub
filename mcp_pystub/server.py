@@ -7,8 +7,8 @@ from __future__ import annotations
 
 from mcp.server.fastmcp import FastMCP
 
-from src.analyzer import analyze, check_usage, inspect_graph
-from src.stub_generator import generate_stubs, generate_submodule_stubs
+from mcp_pystub.analyzer import analyze, check_usage, inspect_graph
+from mcp_pystub.stub_generator import generate_stubs, generate_submodule_stubs
 
 mcp = FastMCP("pystub")
 
@@ -35,7 +35,7 @@ def analyze(
     Returns:
         stubbable / nofollow / required に分類されたパッケージ一覧
     """
-    from src.analyzer import analyze as _analyze
+    from mcp_pystub.analyzer import analyze as _analyze
     return _analyze(entry_point, python_path, max_depth)
 
 

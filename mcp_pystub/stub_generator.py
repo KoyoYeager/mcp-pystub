@@ -10,10 +10,10 @@ import ast
 from collections import defaultdict
 from pathlib import Path
 
-from src.import_graph import build_import_graph
-from src.models import ImportGraph, SubmoduleStubHint
-from src.module_resolver import ModuleResolver
-from src.usage_analyzer import analyze_packages
+from mcp_pystub.import_graph import build_import_graph
+from mcp_pystub.models import ImportGraph, SubmoduleStubHint
+from mcp_pystub.module_resolver import ModuleResolver
+from mcp_pystub.usage_analyzer import analyze_packages
 
 
 def generate_stubs(

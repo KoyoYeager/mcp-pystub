@@ -6,9 +6,9 @@ from pathlib import Path
 
 import pytest
 
-from src.import_graph import build_import_graph
-from src.module_resolver import ModuleResolver
-from src.usage_analyzer import analyze_packages
+from mcp_pystub.import_graph import build_import_graph
+from mcp_pystub.module_resolver import ModuleResolver
+from mcp_pystub.usage_analyzer import analyze_packages
 
 FIXTURES = Path(__file__).parent / "fixtures"
 

@@ -9,11 +9,11 @@ import time
 from dataclasses import asdict
 from pathlib import Path
 
-from src.import_graph import build_import_graph
-from src.models import AnalysisResult, ImportGraph, PackageAnalysis
-from src.module_resolver import ModuleResolver
-from src.size_estimator import estimate_package_size
-from src.usage_analyzer import analyze_packages
+from mcp_pystub.import_graph import build_import_graph
+from mcp_pystub.models import AnalysisResult, ImportGraph, PackageAnalysis
+from mcp_pystub.module_resolver import ModuleResolver
+from mcp_pystub.size_estimator import estimate_package_size
+from mcp_pystub.usage_analyzer import analyze_packages
 
 
 def analyze(

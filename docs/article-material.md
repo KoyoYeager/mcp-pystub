@@ -235,7 +235,7 @@ MCP フレームワーク:
 ## 8. ファイル構成
 
 ```
-src/
+mcp_pystub/
 ├── server.py              # 5 MCP ツール定義 (analyze, graph, check, generate, generate_submodule)
 ├── analyzer.py            # 解析オーケストレーター
 ├── models.py              # 11 dataclass (SubmoduleStubHint 追加)

@@ -15,7 +15,7 @@ import ast
 from collections import defaultdict
 from pathlib import Path
 
-from src.models import (
+from mcp_pystub.models import (
     GatewayFunction,
     ImportGraph,
     ImportGraphEdge,

@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from src.import_extractor import extract_imports
+from mcp_pystub.import_extractor import extract_imports
 
 
 def _write_temp(code: str) -> str:

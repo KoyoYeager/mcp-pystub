@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from src.module_resolver import ModuleResolver
+from mcp_pystub.module_resolver import ModuleResolver
 
 
 @pytest.fixture

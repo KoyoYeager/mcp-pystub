@@ -8,9 +8,9 @@ from __future__ import annotations
 from collections import deque
 from pathlib import Path
 
-from src.import_extractor import extract_imports
-from src.models import ImportGraph, ImportGraphEdge, ImportGraphNode
-from src.module_resolver import ModuleResolver
+from mcp_pystub.import_extractor import extract_imports
+from mcp_pystub.models import ImportGraph, ImportGraphEdge, ImportGraphNode
+from mcp_pystub.module_resolver import ModuleResolver
 
 
 def build_import_graph(
