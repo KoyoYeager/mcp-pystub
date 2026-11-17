@@ -32,6 +32,18 @@ ws = wb.active
 print("images", len(ws._images), ws["A1"].value)
 """, True),
 }
+# 2 本目の違反入口（第 4 回）: 12 は to_dataframe()（pandas を使う）
+VIOLATE2 = {
+    "12_asammdf": ("""
+import numpy as np
+from asammdf import MDF, Signal
+t = np.arange(0, 10, 1.0)
+m = MDF()
+m.append([Signal(samples=t*2, timestamps=t, name="sig1", unit="V")])
+df = m.to_dataframe()
+print("frame", df.shape)
+""", True),
+}
 MAKE_IMAGE_BOOK = """
 import io, openpyxl, sys
 from PIL import Image as PI
@@ -417,6 +429,20 @@ def run(name, entry2=False):
         viol = (vent, vres)
         R["violate"] = vres
         save()
+    viol2 = None
+    if name in VIOLATE2:
+        vsrc2, run_orig2 = VIOLATE2[name]
+        vdir = D / "proj_violate"
+        vdir.mkdir(exist_ok=True)
+        vent2 = vdir / "entry_violate2.py"
+        vent2.write_text(vsrc2.strip() + "\n", encoding="utf-8")
+        vres2 = {"entry": str(vent2)}
+        if run_orig2:
+            rc, o, e, _ = sh([str(VPY), str(vent2)], env=env, log=D / "violate2_original.log")
+            vres2["original"] = {"rc": rc, "stdout": o[-2000:], "stderr": e[-3000:]}
+        viol2 = (vent2, vres2)
+        R["violate2"] = vres2
+        save()
 
     def variant(tag, keys, excl, cycle=False, violate=False):
         if over():
@@ -452,6 +478,12 @@ def run(name, entry2=False):
             rc, o, e, _ = sh([str(VPY), str(vent)], env=venv2, timeout=300, log=D / f"violate_{tag}.log")
             vres["with_stubs"] = {"rc": rc, "stdout": o[-2000:], "stderr": e[-4000:]}
             R["violate"] = vres
+            save()
+        if violate and viol2 is not None:
+            vent2, vres2 = viol2
+            rc, o, e, _ = sh([str(VPY), str(vent2)], env=dict(env), timeout=300, log=D / f"violate2_{tag}.log")
+            vres2["with_stubs"] = {"rc": rc, "stdout": o[-2000:], "stderr": e[-4000:]}
+            R["violate2"] = vres2
             save()
         v["keys"] = list(keys)
         v["apply"] = steps

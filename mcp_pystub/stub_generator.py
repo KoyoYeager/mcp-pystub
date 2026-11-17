@@ -41,7 +41,8 @@ class _M(type):
     def __call__(c, *a, **k): raise RuntimeError(c.__name__ + " (stub)")
     __getitem__ = lambda c, i: c
 def _g(n, t=False):
-    return _M(n, (), {{"_pystub_known": (), "_pystub_truthy": t}})
+    # _pystub_ph: 値の代わり（元が何か分からない）。元がクラス・関数・モジュールなら t=True で印を付けない
+    return _M(n, (), {{"_pystub_known": (), "_pystub_truthy": t, "_pystub_ph": not t}})
 """
 
 # 条件付き候補のスタブ: 呼ばれたら「mcp-pystub のスタブ」と分かる例外で落ちる
@@ -80,14 +81,29 @@ class _M(type):
     def __iter__(c): _raise(c.__name__ + " の反復")
     def __len__(c): _raise("len(" + c.__name__ + ")")
     def __contains__(c, x): _raise(c.__name__ + " の in")
+    # 元がクラス・関数・モジュールのもの（スタブの class 文で作ったクラスと、_g(..., True)）は、
+    # 真偽・==・!=・str・書式を type の既定どおりにする（typing の Union の重複除去・辞書の検索などが使う）。
+    # 値の代わり（_g の既定）だけが止まる
     def __bool__(c):
-        if c.__dict__.get("_pystub_truthy"):
-            return True  # 元はモジュール・クラス・関数（常に真）
+        if not c.__dict__.get("_pystub_ph"):
+            return True
         _raise(c.__name__ + " の真偽")
-    def __str__(c): _raise("str(" + c.__name__ + ")")
-    def __format__(c, spec): _raise(c.__name__ + " の書式")
-    def __eq__(c, o): _raise(c.__name__ + " の比較")
-    def __ne__(c, o): _raise(c.__name__ + " の比較")
+    def __str__(c):
+        if not c.__dict__.get("_pystub_ph"):
+            return type.__str__(c)
+        _raise("str(" + c.__name__ + ")")
+    def __format__(c, spec):
+        if not c.__dict__.get("_pystub_ph"):
+            return type.__format__(c, spec)
+        _raise(c.__name__ + " の書式")
+    def __eq__(c, o):
+        if not c.__dict__.get("_pystub_ph"):
+            return c is o
+        _raise(c.__name__ + " の比較")
+    def __ne__(c, o):
+        if not c.__dict__.get("_pystub_ph"):
+            return c is not o
+        _raise(c.__name__ + " の比較")
     def __lt__(c, o): _raise(c.__name__ + " の比較")
     def __le__(c, o): _raise(c.__name__ + " の比較")
     def __gt__(c, o): _raise(c.__name__ + " の比較")
@@ -99,7 +115,8 @@ class _M(type):
     __float__ = __index__ = __int__
     __hash__ = type.__hash__
 def _g(n, t=False):
-    return _M(n, (), {{"_pystub_known": (), "_pystub_truthy": t}})
+    # _pystub_ph: 値の代わり（元が何か分からない）。元がクラス・関数・モジュールなら t=True で印を付けない
+    return _M(n, (), {{"_pystub_known": (), "_pystub_truthy": t, "_pystub_ph": not t}})
 """
 
 _NET_KNOWN = """_PYSTUB_KNOWN = {known}
@@ -388,10 +405,11 @@ class _StubBuilder:
             # 別パッケージのオブジェクトの再エクスポート: 元と同じものを import する
             if r.chain:
                 path = r.module
+                tf = ", True" if kind in ("class", "function") else ""
                 tail.append(
                     f"try:\n    import importlib as _il\n    {name} = _il.import_module({path!r})"
                     + "".join(f".{c}" for c in r.chain) + "\n"
-                    f"except (ImportError, AttributeError):\n    {name} = _g({name!r})\n"
+                    f"except (ImportError, AttributeError):\n    {name} = _g({name!r}{tf})\n"
                 )
                 return
         if kind in ("class", "function", "const") and r.chain and len(r.chain) == 1 and r.module != module \
@@ -399,9 +417,10 @@ class _StubBuilder:
             # 定義元のモジュールで定義し、ここではそれを import する（同一性を保つ: F04）
             for s in subs or {()}:
                 self.need(r.module, r.chain[0], s)
+            tf = ", True" if kind in ("class", "function") else ""
             tail.append(
                 f"try:\n    from {r.module} import {r.chain[0]} as {name}\n"
-                f"except ImportError:\n    {name} = _g({name!r})\n"
+                f"except ImportError:\n    {name} = _g({name!r}{tf})\n"
             )
             return
         if kind == "class":
