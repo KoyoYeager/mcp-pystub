@@ -59,6 +59,7 @@ class _Recorder:
         self.import_time: dict = {}  # import の途中だけで呼ばれたコード -> 所属モジュール
         # 記録を始めた時に既に読み込まれていたモジュール（.pth などで起動時に読み込まれたもの）
         self.startup_modules = sorted(n for n in list(sys.modules) if "." not in n)
+        self.lazy: set = set()  # エントリーの関数の実行中に import されたモジュール
 
     def _frame(self, code):
         f = sys._getframe(2)
@@ -66,7 +67,7 @@ class _Recorder:
             f = f.f_back
         return f
 
-    def _at_import(self, f) -> bool:
+    def _at_import(self, f, owner: str = "") -> bool:
         """f（関数の実行）が、そのコード自身のパッケージの import の途中（自分のモジュール本体から）か。
 
         別のパッケージの import の途中に呼ばれた（libconv の import 時に importtime.setup() を呼ぶ等）のは実行として数える。
@@ -75,31 +76,45 @@ class _Recorder:
         """
         if f is None:
             return False
-        own = str(f.f_globals.get("__name__", "")).split(".")[0]
+        own = (owner or str(f.f_globals.get("__name__", ""))).split(".")[0]
         g = f.f_back
-        first = None
         while g is not None:
             c = g.f_code
-            if self.entry_file and os.path.normcase(os.path.abspath(c.co_filename)) == self.entry_file:
-                if first is None or (c.co_flags & CO_OPTIMIZED):
-                    return False  # エントリーの本体から直接、またはエントリーの関数の実行中
-            if c.co_name == "<module>" and first is None:
-                mod = str(g.f_globals.get("__name__", "")).split(".")[0]
-                first = mod == own and own != "__main__"
-                if not first:
+            if c.co_name == "<module>":
+                if self.entry_file and os.path.normcase(os.path.abspath(c.co_filename)) == self.entry_file:
                     return False
+                name = str(g.f_globals.get("__name__", ""))
+                return name.split(".")[0] == own and own != "__main__" and name not in self.lazy
             g = g.f_back
-        return bool(first)
+        return False
+
+    def _module_started(self, code) -> None:
+        """モジュール本体の開始: エントリーの関数の実行中に import されたもの（遅れた import）を覚える。"""
+        if not self.entry_file:
+            return
+        f = self._frame(code)
+        if f is None:
+            return
+        g = f.f_back
+        while g is not None:
+            c = g.f_code
+            if (c.co_flags & CO_OPTIMIZED) and os.path.normcase(os.path.abspath(c.co_filename)) == self.entry_file:
+                self.lazy.add(str(f.f_globals.get("__name__", "")))
+                return
+            g = g.f_back
 
     def on_start(self, code) -> bool:
         """関数が始まった。True を返したら、このコードの以後の通知は要らない（実行時の呼び出しを見た）。"""
         if not (code.co_flags & CO_OPTIMIZED):
+            if code.co_name == "<module>":
+                self._module_started(code)
             return True  # モジュール本体・クラス本体（import の結果として modules で分かる）
         if code in self.runtime:
             return True
         f = self._frame(code)
-        owner = _owner(f) if (f is not None and code.co_filename.startswith("<")) else ""
-        if self._at_import(f):
+        fn = code.co_filename
+        owner = _owner(f) if (f is not None and fn.startswith("<") and not fn.startswith("<frozen")) else ""
+        if self._at_import(f, owner):
             self.import_time[code] = owner
             return False  # 実行時に呼ばれるまで見続ける
         self.runtime[code] = owner
