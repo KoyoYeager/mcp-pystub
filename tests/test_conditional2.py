@@ -35,15 +35,15 @@ def test_confidence_high_when_project_does_not_use_entry(tmp_path):
 
 
 def test_confidence_low_when_project_uses_entry_name(tmp_path):
-    """プロジェクト自身が同名の `plot` を参照している → low（照らす必要がある）"""
+    """プロジェクト自身に受け手の分からない同名の `o.plot()` がある → 解決できない呼び出しなので列挙は完了せず low"""
     main = ("import sig, other\nclass P:\n    def plot(self):\n        return 'p'\n"
             "def call(o):\n    return o.plot()\nprint('ok', sig.Signal(3).value(), call(P()))\n")
     c = Case(tmp_path, SIG, main, "import sig\nprint(sig.Signal(1).plot())\n")
     g = [p for p in c.res["conditional"] if p["package_name"] == "gx"][0]
     assert g["confidence"] == "low"
     cond = g["conditions"][0]
-    assert cond["project_uses_count"] >= 1 and cond["project_uses"]
-    assert "main.py" in cond["project_uses"][0]
+    assert cond["project_uses_count"] == 0  # 解決した参照は無い
+    assert cond["project_unresolved_calls"] and "main.py" in cond["project_unresolved_calls"][0]
 
 
 def test_confidence_low_for_branch(tmp_path):

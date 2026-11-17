@@ -773,9 +773,12 @@ def find_submodule_hints(
         others = tuple(x for x in chosen if x != c)
         uses = prefix_usage(sem, c, exclude=others).uses
         if uses:
-            if not allow_conditional or not _conditional_ok(sem, uses, c):
+            if not allow_conditional or any(is_certain_use(sem, u, ev) for u, ev, _ in uses):
                 return []
-            cond_info[c] = build_conditions(sem, uses, c)  # type: ignore[assignment]
+            info_c = build_conditions(sem, uses, c)
+            if info_c is None:
+                return []
+            cond_info[c] = info_c  # type: ignore[assignment]
     if allow_conditional and not cond_info:
         return []  # 証明済みのヒントとして出せる（こちらには出さない）
     # 静的な import グラフ（PyInstaller が同梱する範囲 ⊇ 実行時に読み込まれる範囲）から T が消えること。
@@ -912,7 +915,7 @@ def _public_route(sem: Semantics, caller: tuple[str, str] | None, limit: int = 8
     return api, route
 
 
-MAX_ENTRIES_ENUM = 50  # 入口がこれより多ければ列挙を打ち切る（high にしない。conditions_total は下限）
+_UNRESOLVED_EV = frozenset({"dynamic", "dynamic_param", "dynamic_import", "unanalyzable"})
 
 
 def _rev_index(sem: Semantics):
@@ -973,9 +976,6 @@ def _region_entries_multi(sem: Semantics, keys: list) -> tuple[dict, bool]:
                 dist[src] = dist[k] + 1
                 origin[src] = origin[k]
                 q.append(src)
-        if len(out) > MAX_ENTRIES_ENUM:
-            complete = False
-            break
     return out, complete
 
 
@@ -1052,6 +1052,8 @@ def build_conditions(sem: Semantics, uses: list, prefix: str) -> dict | None:
             return None  # 入口を特定できない: 区別できない
         for (k, t), (eev, src, d, orig) in found.items():
             flat.append((k, t, eev, src, d, sym_of.get(orig, []), orig))
+            # 依存ライブラリの中の動的な getattr などから入る辺も、入口としては列挙できている（過大近似の一種）。
+            # 列挙が完了しないのは、プロジェクトのコードに解決できない同名の呼び出しがある場合（下）
     for ekey, tag, eev, caller, dist, evsyms, orig in flat:
         if tag == "precise":
             return None  # 確実な辺の先が確実でない（起点から外れた）: 区別できない
@@ -1081,24 +1083,57 @@ def build_conditions(sem: Semantics, uses: list, prefix: str) -> dict | None:
                 g["may_be_swallowed"] = True
         if not g["may_be_swallowed"] and _swallowed_on_path(sem, caller, eev):
             g["may_be_swallowed"] = True
-    conds = sorted(groups.values(), key=lambda g: (g["_dist"], -len(g["uses"]), g["entry"]))
+    # サブモジュールのヒント: スタブにするサブモジュール自身の中の入口は 1 つにまとめる
+    inner = [g for g in groups.values() if "." in prefix and under(g["_key"][0], prefix)]
+    if inner:
+        merged = dict(inner[0])
+        merged.update({
+            "entry": f"{prefix} 以下を import・使用しない",
+            "entry_location": f"{prefix}（中の入口 {len(inner)} 件をまとめたもの）",
+            "why_unproven": "スタブにするサブモジュール自身の中の入口",
+            "dispatch_name": "", "inner_entries": len(inner),
+            "uses": sorted({u for g in inner for u in g["uses"]})[:5],
+            "may_be_swallowed": any(g["may_be_swallowed"] for g in inner),
+            "_dist": min(g["_dist"] for g in inner),
+        })
+        groups = {k: g for k, g in groups.items() if g not in inner}
+        groups[("#inner", prefix)] = merged
     all_project_zero = True
-    for g in conds:
+    unresolved_project = False
+    for g in groups.values():
         ekey, tag = g.pop("_key"), g.pop("_tag")
         g["distance_to_use"] = g.pop("_dist")
-        name = g["entry"].rstrip("()").split(".")[-1] if not g["entry"].startswith("import ") else ""
-        hits = project_entry_uses(sem, ekey, name)
-        g["project_uses_count"] = len(hits)
+        if g.get("inner_entries"):
+            hits, loose = _inner_project_uses(sem, prefix)
+        else:
+            name = g["entry"].rstrip("()").split(".")[-1] if not g["entry"].startswith("import ") else ""
+            hits, loose = project_entry_uses(sem, ekey, name)
+        g["project_uses_count"] = len(hits)  # 解決した参照だけ
         g["project_uses"] = hits[:10]
+        g["project_unresolved_calls"] = loose[:10]  # 受け手の分からない同名の呼び出し（解決できない呼び出し）
         if hits:
             all_project_zero = False
-            g["project_note"] = f"プロジェクトのコードに `{name}` の呼び出し・参照が {len(hits)} 件あります（照らしてください）"
+            g["project_note"] = f"プロジェクトのコードがこの入口を {len(hits)} か所で使っています（解決した参照）"
+        elif loose:
+            unresolved_project = True
+            g["project_note"] = (f"プロジェクトのコードに、受け手の分からない同名の呼び出しが {len(loose)} か所あります"
+                                 "（解決できない呼び出し: 列挙は完了していません）")
         else:
-            g["project_note"] = (f"プロジェクトのコードは `{name}` を直接使っていません"
+            g["project_note"] = ("プロジェクトのコードはこの入口を直接使っていません"
                                  + ("（到達は依存ライブラリ内の名前の一致による推定だけ）" if tag == "name" else ""))
+    # 表示の順: 公開 API に近い（プロジェクトから呼びやすい）順。総数は conditions_total に
+    if "." in prefix:
+        # サブモジュールのヒント: まとめた中の入口、次に使用に近い外の入口（Signal.plot() 等）から
+        conds = sorted(groups.values(), key=lambda g: (
+            0 if g.get("inner_entries") else 1, g["distance_to_use"], -len(g["uses"]), g["entry"]))
+    else:
+        conds = sorted(groups.values(), key=lambda g: (
+            0 if g.get("public_api") else 1,
+            len(g.get("route_from_project") or []) or 99,
+            g["distance_to_use"], -len(g["uses"]), g["entry"]))
     total = len(conds)
-    confidence = "high" if (all_project_zero and "branch" not in because and complete_all
-                            and 0 < total <= MAX_CONDITIONS) else "low"
+    complete = complete_all and not unresolved_project
+    confidence = "high" if (complete and all_project_zero and total > 0) else "low"
     shown = conds[:MAX_CONDITIONS]
     for g in shown:
         if g["may_be_swallowed"]:
@@ -1106,12 +1141,20 @@ def build_conditions(sem: Semantics, uses: list, prefix: str) -> dict | None:
                          "MCP_PYSTUB_STRICT=0 のときはスタブの例外が握りつぶされることがあります（既定では終了コード 70 で止まります）")
     summary = ", ".join(g["entry"] for g in shown[:3]) + (f" ほか {total - 3} 件" if total > 3 else "")
     return {"conditions": shown, "total": total, "because": sorted(_TAG_TEXT.get(t, t) for t in because),
-            "summary": summary, "confidence": confidence, "complete": complete_all}
+            "summary": summary, "confidence": confidence, "complete": complete}
 
 
-def project_entry_uses(sem: Semantics, ekey: tuple[str, str], name: str) -> list[str]:
-    """プロジェクト自身のコード（到達済みの local ユニット）で、入口 ekey を指す参照（解決した参照）と、
-    受け手の分からない同名のメソッド呼び出し（名前の一致で届きうるもの）の場所（ファイル:行）。"""
+def _inner_project_uses(sem: Semantics, prefix: str) -> tuple[list[str], list[str]]:
+    """プロジェクトのコードが、サブモジュール prefix の中を解決した参照で使う場所。"""
+    by_target, _by_name = _local_index(sem)
+    hits: list[str] = []
+    for (m, _q), where in by_target.items():
+        if under(m, prefix):
+            hits.extend(where)
+    return sorted(set(hits)), []
+
+
+def _local_index(sem: Semantics):
     idx = sem.__dict__.get("_local_ref_index")
     if idx is None:
         by_target: dict = {}
@@ -1132,9 +1175,16 @@ def project_entry_uses(sem: Semantics, ekey: tuple[str, str], name: str) -> list
                     by_name.setdefault(ev.name, []).append(where)  # 受け手が分からない呼び出し
         idx = (by_target, by_name)
         sem.__dict__["_local_ref_index"] = idx
-    by_target, by_name = idx
-    hits = list(dict.fromkeys(by_target.get(ekey, []) + (by_name.get(name, []) if name else [])))
-    return hits
+    return idx
+
+
+def project_entry_uses(sem: Semantics, ekey: tuple[str, str], name: str) -> tuple[list[str], list[str]]:
+    """プロジェクト自身のコード（到達済みの local ユニット）で、入口 ekey を指す解決した参照の場所と、
+    受け手の分からない同名のメソッド呼び出し（解決できない呼び出し）の場所（ファイル:行）。"""
+    by_target, by_name = _local_index(sem)
+    hits = list(dict.fromkeys(by_target.get(ekey, [])))
+    loose = list(dict.fromkeys(by_name.get(name, []))) if name else []
+    return hits, loose
 
 
 def project_name_uses(sem: Semantics, name: str) -> list[str]:

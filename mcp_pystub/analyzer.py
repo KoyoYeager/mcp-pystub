@@ -358,10 +358,10 @@ def _build_import_chains(
     return chains
 
 
-def _cond_text(conds: list[dict], total: int) -> tuple[str, int]:
+def _cond_text(conds: list[dict], total: int, complete: bool = True) -> tuple[str, int]:
     ents = [c.get("entry", "") for c in conds[:3]]
     uses = sum(int(c.get("project_uses_count", 0)) for c in conds)
-    more = f" ほか {total - 3} 件以上" if total > 3 else ""
+    more = (f" ほか {total - 3} 件" + ("" if complete else "以上")) if total > 3 else ""
     return "、".join(ents) + more, uses
 
 
@@ -382,7 +382,7 @@ def _summary(rd: dict, entry: str, python_path: str, required: list) -> dict:
     seen_targets: set[str] = set()
     cond_recs: list[str] = []
     for h in rd.get("conditional_submodule_hints", []):
-        text, uses = _cond_text(h.get("conditions", []), h.get("conditions_total", 0))
+        text, uses = _cond_text(h.get("conditions", []), h.get("conditions_total", 0), h.get("conditions_complete", True))
         if h.get("confidence") == "high":
             if h["target_package"] not in seen_targets:
                 high_mb += h.get("estimated_savings_mb", 0.0)
@@ -392,7 +392,7 @@ def _summary(rd: dict, entry: str, python_path: str, required: list) -> dict:
                           f"[{h.get('confidence')}] {h['submodule']} をスタブ化すると {h['target_package']} を排除できます"
                           f"（約 {h.get('estimated_savings_mb', 0.0):.1f} MB。条件: {text or '—'} を使わない。プロジェクト内の使用 {uses} 件）"))
     for p in rd.get("conditional", []):
-        text, uses = _cond_text(p.get("conditions", []), p.get("conditions_total", 0))
+        text, uses = _cond_text(p.get("conditions", []), p.get("conditions_total", 0), p.get("conditions_complete", True))
         if p.get("confidence") == "high":
             high_mb += p.get("estimated_savings_mb", 0.0)
             high_n += 1
