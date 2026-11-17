@@ -22,7 +22,7 @@ classifiers = [
     "Topic :: Software Development :: Libraries :: Python Modules",
 ]
 dependencies = [
-    "mcp>=1.0.0",
+    "mcp>=1.0.0,<2",  # mcp 2.x は FastMCP の名前と API が変わった
 ]
 
 [project.urls]
@@ -42,14 +42,17 @@ packages = ["mcp_pystub"]
 
 [tool.hatch.build.targets.sdist]
 include = [
-    "mcp_pystub/",
-    "tests/",
-    "README.md",
-    "LICENSE",
-    "pyproject.toml",
+    "/mcp_pystub",
+    "/tests",
+    "/README.md",
+    "/LICENSE",
+    "/pyproject.toml",
 ]
 exclude = [
-    "tests/attacks/runs",
+    "/.claude",
+    "/_check*",
+    "/_repro",
+    "/tests/attacks/runs",
     "**/__pycache__",
     "**/*.pyc",
     ".pytest_cache",

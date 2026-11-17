@@ -246,7 +246,7 @@ pip install mcp-pystub
 
 ### 依存パッケージ / Dependencies
 
-- `mcp>=1.0.0` - Model Context Protocol SDK
+- `mcp>=1.0.0,<2` - Model Context Protocol SDK（2.x は FastMCP の API が変わったため未対応）
 - 解析エンジンは Python 標準ライブラリのみ使用（ast, importlib, pathlib）
 
 ## 使い方 / Usage
@@ -387,7 +387,7 @@ mcp-pystub
 ## パフォーマンス / Performance
 
 `C:\tmp\pystub-e2e` の 15 シナリオで、analyze は 1 シナリオ 2〜21 秒程度（第 1〜3 回の修正前の約 2 倍）、ピークメモリは最大 401 MB
-（11_sklearn。ほかは 400 MB 以下）。実行の記録の負荷は、記録しない実行の 1.1〜2.5 倍（10 シナリオ）。
+（11_sklearn。ほかは 400 MB 以下）。実行の記録の負荷は、記録しない実行の 1.3〜3.3 倍（10 シナリオ。実行が 0.1 秒程度の短い例ほど倍率が大きい）。
 
 ## テスト / Testing
 

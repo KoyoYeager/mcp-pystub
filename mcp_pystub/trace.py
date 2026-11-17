@@ -559,6 +559,9 @@ def main(argv: list[str] | None = None) -> int:
     import tempfile
     from mcp_pystub import proc as _proc
     args = list(sys.argv[1:] if argv is None else argv)
+    if args[:1] in (["--help"], ["-h"]):
+        print(USAGE)
+        return 0
     out = None
     append = False
     while args and args[0].startswith("--"):
