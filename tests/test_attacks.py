@@ -171,8 +171,12 @@ F3_EXECUTED = {"N1_dataclass_generated_methods": "xdc", "N2_exec_defined_functio
                "N8_runtime_lazy_submodule_import": "xlz", "N10_multiprocessing_worker": "xmp"}
 
 
-def _run_args(script, tmp_path, args, timeout=1800):
+def _run_args(script, tmp_path, args, timeout=1800, plain_env=False):
     env = dict(os.environ, PYSTUB_ATTACK_RUNS=str(tmp_path), PYTHONIOENCODING="utf-8")
+    if plain_env:
+        # verify は呼ぶ側の環境変数をそのまま使う。ハーネスの「普段の実行」と同じ環境にする（PYTHONIOENCODING を付けない）
+        for k in ("PYTHONIOENCODING", "PYTHONUTF8"):
+            env.pop(k, None)
     r = subprocess.run([sys.executable, "-u", str(HERE / script), *args], cwd=str(HERE), capture_output=True, text=True,
                        encoding="utf-8", errors="replace", env=env, timeout=timeout)
     assert r.returncode == 0, r.stderr[-2000:]
@@ -209,3 +213,50 @@ def test_round8_import_only_never_runs_entry(tmp_path):
     assert len(res) == 24
     bad = {k: v for k, v in res.items() if v["top"] or v["main"]}
     assert not bad, bad
+
+
+# 第 9 回: verify / 記録の子プロセスが普段の実行と違う条件で動く穴（_check8 の写し）。確認済み（実行）の組を適用して、
+# 普段の実行（パイプにつないだ python entry.py）と標準出力・終了コードが変わるものが 0 件。件数を固定する
+def _summary_rows(out):
+    line = [l for l in out.splitlines() if l.startswith("SUMMARY ")]
+    assert line, out[-3000:]
+    return json.loads(line[0][len("SUMMARY "):])
+
+
+def test_round9_g_cases(tmp_path):
+    rows = _summary_rows(_run_args("g8.py", tmp_path, [], plain_env=True))
+    assert len(rows) == 14, len(rows)
+    assert all(r[1] != "ERROR" for r in rows), rows
+    bad = [r for r in rows if r[2] is True]
+    assert not bad, bad
+    # 子プロセスの記録・差し込みが効かない形（G1〜G4）と、普段と違う条件で分かれる形（G5〜G9）は確認済み（実行）にならない
+    for r in rows:
+        if r[0].split("_")[0] in ("G1", "G2", "G3", "G4", "G5", "G6", "G7", "G8", "G9"):
+            assert r[1] == [], r
+
+
+def test_round9_g_cases_b(tmp_path):
+    rows = _summary_rows(_run_args("g8b.py", tmp_path, [], plain_env=True))
+    assert [r[0] for r in rows] == ["G4b_child_pythonpath_overridden", "G13_user_pythonpath_dropped", "G14_atexit_stdout"]
+    for r in rows:
+        assert r[2] == [], r  # 確認済み（実行）なし
+        assert r[5] is False, r  # 適用して変わるもの無し
+
+
+def test_round9_n_cases(tmp_path):
+    rows = _summary_rows(_run_args("n8.py", tmp_path, [], plain_env=True))
+    assert len(rows) == 5
+    got = {r[0]: r for r in rows}
+    for r in rows:
+        assert r[2] == [] and r[3] is False, r
+    assert got["N8b_lazy_import_from_other_pkg"][1]["xlz"] == "executed"
+    assert got["N8c_lazy_import_from_local_helper"][1]["xlz"] == "executed"
+    assert got["N14_cross_pkg_import_time_call"][1]["xv"] == "executed"
+
+
+def test_round9_import_only_never_runs_entry_90(tmp_path):
+    out = _run_args("f4b.py", tmp_path, [])
+    line = [l for l in out.splitlines() if l.startswith("SUMMARY ")][0]
+    n, bad = line.split(" ", 2)[1], line.split(" bad ", 1)[1]
+    assert n == "90"
+    assert json.loads(bad) == {}, bad

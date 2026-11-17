@@ -15,7 +15,7 @@
 - Python 3.12 以降は sys.monitoring（関数の開始イベント。実行時に呼ばれたと分かったコードは以後の通知を止める）、
   それ以前は sys.setprofile + threading.setprofile
 
-制限: 子プロセスの中は記録しない。動かした入力の範囲しか分からない。拡張モジュール（.pyd / .so）の中は記録できない。
+制限: 起動用の仕組みが効かない子プロセス（環境を消した・-E / -I / -S・python 以外）は記録しない（数えて結果に出す）。動かした入力の範囲しか分からない。拡張モジュール（.pyd / .so）の中は記録できない。
 """
 
 from __future__ import annotations
@@ -89,19 +89,27 @@ class _Recorder:
         return False
 
     def _module_started(self, code) -> None:
-        """モジュール本体の開始: エントリーの関数の実行中に import されたもの（遅れた import）を覚える。"""
-        if not self.entry_file:
-            return
+        """モジュール本体の開始: 実行時に（エントリーの本体から呼ばれた関数の中で）import されたもの（遅れた import）を覚える。
+
+        import の仕組みのフレームを飛ばした最初のフレームが関数で、そこから上の最初のモジュール本体がエントリー
+        （またはモジュール本体が無い: スレッド）なら実行時。別のモジュールの本体の中（import の途中）なら import の途中。
+        """
         f = self._frame(code)
         if f is None:
             return
         g = f.f_back
+        while g is not None and ("importlib" in g.f_code.co_filename or g.f_code.co_filename.startswith("<frozen")):
+            g = g.f_back
+        if g is None or not (g.f_code.co_flags & CO_OPTIMIZED):
+            return
         while g is not None:
             c = g.f_code
-            if (c.co_flags & CO_OPTIMIZED) and os.path.normcase(os.path.abspath(c.co_filename)) == self.entry_file:
-                self.lazy.add(str(f.f_globals.get("__name__", "")))
+            if c.co_name == "<module>":
+                if self.entry_file and os.path.normcase(os.path.abspath(c.co_filename)) == self.entry_file:
+                    self.lazy.add(str(f.f_globals.get("__name__", "")))
                 return
             g = g.f_back
+        self.lazy.add(str(f.f_globals.get("__name__", "")))
 
     def on_start(self, code) -> bool:
         """関数が始まった。True を返したら、このコードの以後の通知は要らない（実行時の呼び出しを見た）。"""
@@ -300,25 +308,31 @@ def observe(trace: dict, target: str, site_packages: list[str]) -> dict:
 # ---------------------------------------------------------------------------
 
 BOOT = r'''
-# mcp-pystub の起動時の差し込み（verify・実行の記録の子孫のプロセスにも効かせる）。MCP_PYSTUB_BOOT の設定を読む
+# mcp-pystub の起動時の差し込み（verify・実行の記録のプロセスと、その子孫）。環境変数 MCP_PYSTUB_BOOT の設定を読む。
 def _pystub_boot():
     import json, os, sys
-    path = os.environ.get("MCP_PYSTUB_BOOT")
-    here = os.path.dirname(os.path.abspath(__file__))
+    raw = os.environ.get("MCP_PYSTUB_BOOT")
+    here = os.path.normcase(os.path.dirname(os.path.abspath(__file__)))
     try:
-        sys.path[:] = [x for x in sys.path if os.path.normcase(os.path.abspath(x or ".")) != os.path.normcase(here)]
+        sys.path[:] = [x for x in sys.path if os.path.normcase(os.path.abspath(x or ".")) != here]
     except Exception:
         pass
-    if not path:
+    if not raw:
         return
+    path, _, role = raw.partition("#")
+    root = role == ""
+    if root:
+        os.environ["MCP_PYSTUB_BOOT"] = path + "#d"  # これより後に起動する子孫は root ではない（同じ変数の値だけ変える）
     try:
-        cfg = json.load(open(path, encoding="utf-8"))
+        with open(path, encoding="utf-8") as fh:
+            cfg = json.load(fh)
     except Exception:
         return
     import importlib.abc, importlib.machinery, importlib.util
     STUBS, PREFIXES, BLOCK = cfg.get("stubs", {}), cfg.get("prefixes", []), cfg.get("block", [])
     entry = cfg.get("entry") or ""
-    nentry = os.path.normcase(os.path.abspath(entry)) if entry else ""
+    nentry = os.path.normcase(os.path.realpath(entry)) if entry else ""
+    ebase = os.path.normcase(os.path.basename(entry)) if entry else ""
     stem = os.path.splitext(os.path.basename(entry))[0] if entry else ""
     guard = bool(cfg.get("entry_guard"))
 
@@ -338,20 +352,13 @@ def _pystub_boot():
             for p in PREFIXES:
                 if _under(name, p):
                     raise ModuleNotFoundError(f"No module named {name!r} (not in stub)", name=name)
-            if guard and stem and name.rpartition(".")[2] == stem:
-                sp = importlib.machinery.PathFinder.find_spec(name, path)
-                if sp is not None and sp.origin and os.path.normcase(os.path.abspath(sp.origin)) == nentry:
-                    raise ImportError(f"{name}: import だけの確認ではエントリーのスクリプトを import しません "
-                                      "(excluded by verify)", name=name)
             return None
 
-    if STUBS or BLOCK or PREFIXES or guard:
+    if STUBS or BLOCK or PREFIXES:
         sys.meta_path.insert(0, _Finder())
     for d in cfg.get("extra_path", []):
         if d not in sys.path:
             sys.path.append(d)
-    root = os.environ.get("MCP_PYSTUB_ROOT") == "1"
-    os.environ["MCP_PYSTUB_ROOT"] = "0"  # これより後に起動する子孫は root ではない
     loaded = [p for p in cfg.get("watch", []) if any(_under(m, p) for m in list(sys.modules))]
     rec = None
     trm = None
@@ -360,28 +367,74 @@ def _pystub_boot():
         trm = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(trm)
         rec = trm.start(entry)
-    sys._pystub_boot = {"root": root, "startup_loaded": loaded, "rec": rec, "trm": trm}
-    if root:
-        return
+    # 監査フック: プロセスの起動を数える（起動用の仕組みで登録された子孫の数と比べ、記録・差し込みの効かなかった子を
+    # 見つける）。import だけの確認では、エントリーのファイルを開く操作を止める（どの読み方でもエントリーを動かさない）
+    if sys.platform == "win32":
+        LAUNCH = {"_winapi.CreateProcess", "os.system", "os.spawn", "os.exec", "os.startfile", "os.posix_spawn"}
+    else:
+        LAUNCH = {"subprocess.Popen", "os.system", "os.spawn", "os.exec", "os.posix_spawn", "os.fork", "os.forkpty"}
+    state = {"launched": 0, "blocked": []}
+
+    def _hook(ev, args):
+        if ev in LAUNCH:
+            state["launched"] += 1
+        elif guard and ev == "open" and args:
+            p = args[0]
+            if isinstance(p, (str, bytes)) or hasattr(p, "__fspath__"):
+                try:
+                    s = os.fsdecode(p)
+                    if os.path.normcase(os.path.basename(s)) != ebase:
+                        return
+                    if os.path.normcase(os.path.realpath(s)) != nentry:
+                        return
+                except Exception:
+                    return
+                cur = sys._pystub_boot.get("current", "") if hasattr(sys, "_pystub_boot") else ""
+                state["blocked"].append(cur)
+                raise PermissionError(f"import だけの確認ではエントリーのスクリプトを開きません: {s} (blocked by verify)")
+    sys.addaudithook(_hook)
     pd = cfg.get("proc_dir")
+    info = {"pid": os.getpid(), "role": "root" if root else "desc", "startup_loaded": loaded, "launched": None,
+            "trace": None, "finished": False}
+    sys._pystub_boot = {"root": root, "startup_loaded": loaded, "rec": rec, "trm": trm, "state": state, "current": ""}
     if not pd:
         return
-    os.makedirs(pd, exist_ok=True)
-    pf = os.path.join(pd, f"proc_{os.getpid()}.json")
-    info = {"pid": os.getpid(), "startup_loaded": loaded, "trace": None}
-    with open(pf, "w", encoding="utf-8") as fh:
-        json.dump(info, fh)
+    try:
+        os.makedirs(pd, exist_ok=True)
+    except Exception:
+        return
+    pf = os.path.join(pd, f"proc_{os.getpid()}_{'root' if root else 'desc'}.json")
+
+    def _write():
+        try:
+            with open(pf, "w", encoding="utf-8") as fh:
+                json.dump(info, fh)
+        except Exception:
+            pass
+    _write()
+    done = []
 
     def _done():
+        if done:
+            return
+        done.append(1)
         if rec is not None:
             try:
                 info["trace"] = trm.stop(rec)
             except Exception:
                 pass
-        with open(pf, "w", encoding="utf-8") as fh:
-            json.dump(info, fh)
+        info["launched"] = state["launched"]
+        info["blocked"] = state["blocked"]
+        info["finished"] = True
+        _write()
     import atexit
-    atexit.register(_done)
+    atexit.register(_done)  # 最初に登録する: 最後に動く（他の atexit の中の実行も記録に入る）
+    _real_exit = os._exit
+
+    def _exit(code):  # os._exit でも記録を残す
+        _done()
+        _real_exit(code)
+    os._exit = _exit
 
 
 _pystub_boot()
@@ -396,57 +449,21 @@ except ImportError:
 '''
 
 
-def shutil_rm(p: Path) -> None:
-    import shutil
-    shutil.rmtree(p, ignore_errors=True)
-
-
-def install_boot(proc_dir: Path, cfg: dict) -> dict:
-    """子孫のプロセスに差し込みを引き継ぐ: 一時フォルダの sitecustomize.py を PYTHONPATH の先頭に置く。"""
-    import tempfile
-    d = Path(tempfile.mkdtemp(prefix="pystub_boot_"))
-    (d / "sitecustomize.py").write_text(BOOT, encoding="utf-8")
-    (d / "boot.json").write_text(json.dumps(cfg, ensure_ascii=False), encoding="utf-8")
-    saved = {k: os.environ.get(k) for k in ("PYTHONPATH", "MCP_PYSTUB_BOOT", "MCP_PYSTUB_ROOT")}
-    pp = os.environ.get("PYTHONPATH")
-    os.environ["PYTHONPATH"] = str(d) + (os.pathsep + pp if pp else "")
-    os.environ["MCP_PYSTUB_BOOT"] = str(d / "boot.json")
-    os.environ["MCP_PYSTUB_ROOT"] = "0"
-    return {"dir": d, "saved": saved}
-
-
-def uninstall_boot(b: dict) -> None:
-    for k, v in b["saved"].items():
-        if v is None:
-            os.environ.pop(k, None)
-        else:
-            os.environ[k] = v
-    shutil_rm(b["dir"])
-
-
-def read_children(proc_dir: Path) -> list[dict]:
-    out = []
-    if proc_dir.is_dir():
-        for f in sorted(proc_dir.glob("proc_*.json")):
-            try:
-                out.append(json.loads(f.read_text(encoding="utf-8")))
-            except (OSError, ValueError):
-                out.append({"pid": f.stem, "trace": None, "startup_loaded": []})
-    return out
-
-
-def merge_children(data: dict, proc_dir: Path) -> dict:
-    """子孫のプロセスの記録を合算する（記録の取れなかった子孫は数える）。"""
-    kids = read_children(proc_dir)
-    runs = data.get("runs", 1)
-    for k in kids:
-        if k.get("trace"):
-            data = merge(data, k["trace"])
-        else:
-            data["untraced_child_processes"] = int(data.get("untraced_child_processes", 0)) + 1
-    data["runs"] = runs
-    data["child_processes"] = len(kids)
-    shutil_rm(proc_dir)
+def merge_procs(procs: list[dict]) -> dict | None:
+    """プロセスごとの記録（root と子孫）を合算する。"""
+    from mcp_pystub.proc import summarize_procs
+    data = None
+    for pr in sorted(procs, key=lambda x: 0 if x.get("role") == "root" else 1):
+        t = pr.get("trace")
+        if t:
+            runs = data.get("runs", 1) if data else 1
+            data = merge(data, t) if data else t
+            data["runs"] = runs
+    if data is None:
+        return None
+    sm = summarize_procs(procs, recording=True)
+    data["child_processes"] = sm["child_processes"]
+    data["untraced_child_processes"] = sm["untraced_child_processes"]
     return data
 
 
@@ -454,30 +471,14 @@ USAGE = ("usage: python -m mcp_pystub.trace --out TRACE.json [--append] (script.
          "対象のプログラムを実際に実行します（副作用が起きえます）。")
 
 
-def _run_script(path: str) -> None:
-    """python <スクリプト> と同じ形で実行する（runpy.run_path は sys.argv[0] を書き換えるので使わない）。"""
-    import builtins
-    import importlib.machinery
-    import types
-    with open(path, "rb") as fh:
-        code = compile(fh.read(), path, "exec")
-    mod = types.ModuleType("__main__")
-    mod.__file__ = path
-    mod.__builtins__ = builtins
-    mod.__loader__ = importlib.machinery.SourceFileLoader("__main__", path)
-    mod.__spec__ = None
-    mod.__cached__ = None
-    saved = sys.modules.get("__main__")
-    sys.modules["__main__"] = mod
-    try:
-        exec(code, mod.__dict__)
-    finally:
-        if saved is not None:
-            sys.modules["__main__"] = saved
-
-
 def main(argv: list[str] | None = None) -> int:
-    import runpy
+    """記録を取りながら python <スクリプト> 引数… / python -m <モジュール> 引数… を子プロセスで動かす。
+
+    子プロセスは普段の起動と同じ（標準入出力はそのまま受け継ぐ）で、違いは PYTHONPATH の先頭の起動用フォルダと
+    環境変数 MCP_PYSTUB_BOOT だけ。エントリーが os._exit しても記録は残る。
+    """
+    import tempfile
+    from mcp_pystub import proc as _proc
     args = list(sys.argv[1:] if argv is None else argv)
     out = None
     append = False
@@ -493,42 +494,34 @@ def main(argv: list[str] | None = None) -> int:
     if not out or not args:
         print(USAGE, file=sys.stderr)
         return 2
-    module = None
     if args[0] == "-m" and len(args) >= 2:
-        module = args[1]
-        target_argv = [args[1]] + args[2:]  # runpy が sys.argv[0] をモジュールのファイルに置き換える（普段の -m と同じ）
+        cmd = [sys.executable, "-m"] + args[1:]
         entry_file = ""
     else:
-        # 普段の python entry.py と同じにする: __file__ は絶対パス、sys.argv[0] は渡したまま、sys.path[0] はスクリプトの
-        # あるフォルダ（-m mcp_pystub.trace が入れた作業フォルダは置き換える）
+        cmd = [sys.executable] + args
         entry_file = os.path.abspath(args[0])
-        target_argv = args
-        sys.path[0] = os.path.dirname(entry_file)
-    # 子孫のプロセス（multiprocessing の spawn・subprocess で起動した python）にも記録を引き継ぐ
-    child_dir = Path(out).with_name(Path(out).name + ".procs")
-    shutil_rm(child_dir)
-    boot = install_boot(child_dir, {"stubs": {}, "prefixes": [], "block": [], "watch": [], "entry": entry_file,
-                                    "trace_mod": str(Path(__file__).resolve()), "proc_dir": str(child_dir)})
-    rc = 0
-    rec = start(entry_file)
-    old_argv = sys.argv
-    sys.argv = target_argv
+    work = Path(tempfile.mkdtemp(prefix="pystub_boot_"))
+    rc: int | None = 1
     try:
-        if module:
-            runpy.run_module(module, run_name="__main__", alter_sys=True)
-        else:
-            _run_script(entry_file)
-    except SystemExit as e:
-        rc = e.code if isinstance(e.code, int) else (0 if e.code is None else 1)
-    except BaseException:  # noqa: BLE001
-        import traceback
-        traceback.print_exc()
-        rc = 1
-    finally:
-        sys.argv = old_argv
-        data = stop(rec)
-        data = merge_children(data, child_dir)
-        uninstall_boot(boot)
+        boot_dir = work / "boot"
+        _proc.write_boot(boot_dir)
+        proc_dir = work / "procs"
+        cfg_path = work / "boot.json"
+        cfg_path.write_text(json.dumps({"entry": entry_file, "trace_mod": str(Path(__file__).resolve()),
+                                        "proc_dir": str(proc_dir)}, ensure_ascii=False), encoding="utf-8")
+        env = _proc.boot_env(boot_dir, cfg_path)
+        try:
+            rc, _t = _proc.run_tree(cmd, os.getcwd(), env, None, stdin=None)
+        except KeyboardInterrupt:
+            rc = 130
+        procs = _proc.read_procs(proc_dir)
+        data = merge_procs(procs) or {"version": TRACE_VERSION, "runs": 1, "executed": [], "import_time": [],
+                                      "modules": {}, "startup_modules": [], "child_processes": 0,
+                                      "untraced_child_processes": 1}
+        if not any(p.get("role") == "root" and p.get("finished") for p in procs):
+            data["untraced_child_processes"] = int(data.get("untraced_child_processes", 0)) + 1
+            data["note"] = "記録を取るプロセスが最後まで記録を書けませんでした（止められた等）"
+        data["argv"] = [args]
         data["rc"] = [rc]
         prev = None
         if append and Path(out).exists():
@@ -540,7 +533,9 @@ def main(argv: list[str] | None = None) -> int:
             data = merge(prev, data)
             data["rc"] = list(prev.get("rc", [])) + [rc]
         Path(out).write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
-    return rc
+    finally:
+        _proc.rmtree_retry(work)
+    return rc if isinstance(rc, int) else 1
 
 
 if __name__ == "__main__":

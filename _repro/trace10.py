@@ -2,6 +2,8 @@
 
 python trace10.py <out_dir> <scenario> ...
 """
+import sys as _sys0
+_sys0.stdout.reconfigure(encoding="utf-8")
 import json, os, subprocess, sys, time
 from pathlib import Path
 W = str(Path(__file__).resolve().parent.parent)

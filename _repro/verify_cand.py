@@ -1,4 +1,6 @@
 """記録からの候補を verify(run_entry=True, record=True) で確かめる: python verify_cand.py <out.json> <scenario> <pkg,...>"""
+import sys as _sys0
+_sys0.stdout.reconfigure(encoding="utf-8")
 import json, sys, time
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))

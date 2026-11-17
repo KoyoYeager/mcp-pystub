@@ -7,8 +7,11 @@
   ヒントでは対象の C 拡張パッケージを import 不可にして、本当に要らないことを確かめる）
 - まずスタブ無しで同じ import を行い（基準）、スタブありで新たに失敗したものを「スタブが原因」とする
 - 失敗の原因になったスタブを外して繰り返し、検証を通った組を返す
-- エントリーの実行は run_entry=True のときだけ（標準出力の全体・終了コードを基準と比べる）。import だけの確認では、
-  エントリーのスクリプトはどの名前でも実行しない
+- エントリーの実行は run_entry=True のときだけ。普段の起動（python entry.py 引数…、標準出力はファイル）と同じ条件の
+  子プロセスで動かし、標準出力のバイト列の全体と終了コードを基準と比べる（違いは PYTHONPATH の先頭の起動用フォルダと
+  環境変数 MCP_PYSTUB_BOOT だけ）
+- import の確認は別の子プロセスで行い、エントリーのスクリプトは動かさない（エントリーを import するローカルの
+  モジュールは対象から外し、import の途中でエントリーのファイルを開く操作は監査フックで止める）
 """
 
 from __future__ import annotations
@@ -27,11 +30,11 @@ from mcp_pystub.semantics import under
 from mcp_pystub.usage_analyzer import analyze_packages, get_semantics
 
 _CHILD = r'''
-import hashlib, importlib, io, json, os, runpy, sys, traceback
+import importlib, json, os, sys, traceback
 cfg = json.load(open(sys.argv[1], encoding="utf-8"))
 out = open(cfg["out"], "a", encoding="utf-8")
-# スタブの差し込み（meta path finder）と実行の記録は、インタープリタの起動時に sitecustomize（PYTHONPATH の先頭の
-# 一時フォルダ）が始めている。子孫のプロセス（multiprocessing の spawn・subprocess の python）にも同じものが効く
+# import だけの確認。スタブの差し込みと監査フック（エントリーのファイルを開く操作を止める）は、起動時に
+# sitecustomize（PYTHONPATH の先頭の起動用フォルダ）が始めている
 BOOT = getattr(sys, "_pystub_boot", None)
 for d in reversed(cfg["sys_path"]):
     sys.path.insert(0, d)
@@ -41,60 +44,18 @@ def emit(rec):
     out.flush()
 
 emit({"startup_loaded": (BOOT or {}).get("startup_loaded", []), "boot": BOOT is not None})
-
-def run_entry():
-    emit({"start": "<entry>"})
-    # 普段の実行（python <エントリー> <引数>、エントリーのあるフォルダで）と同じ条件にする
-    saved_argv, saved_cwd = sys.argv, os.getcwd()
-    sys.argv = [cfg["entry"]] + list(cfg.get("entry_args") or [])
-    try:
-        os.chdir(cfg.get("cwd") or os.path.dirname(cfg["entry"]))
-    except OSError:
-        pass
-    buf = io.StringIO()
-    old = sys.stdout
-    sys.stdout = buf
-    rc = 0
-    err = ""
-    try:
-        runpy.run_path(cfg["entry"], run_name="__main__")
-    except SystemExit as e:
-        rc = e.code if isinstance(e.code, int) else (0 if e.code is None else 1)
-    except BaseException as e:  # noqa
-        rc = 1
-        err = f"{type(e).__name__}: {e}"[:800] + "\n" + traceback.format_exc()[-3000:]
-    finally:
-        sys.stdout = old
-        sys.argv = saved_argv
-        try:
-            os.chdir(saved_cwd)
-        except OSError:
-            pass
-    text = buf.getvalue()
-    # 比べるのは標準出力の全体（長さとハッシュ）。表示用に先頭と末尾だけ持つ（第 8 回 L1）
-    key = f"{len(text)}:{hashlib.sha256(text.encode('utf-8', 'surrogatepass')).hexdigest()}"
-    shown = text if len(text) <= 4000 else text[:2000] + "\n…\n" + text[-2000:]
-    emit({"m": "<entry>", "ok": rc == 0, "rc": rc, "stdout": shown, "stdout_key": key, "err": err})
-
-if cfg["run_entry"]:
-    # エントリーは常に先に動かす（普段の実行と同じく、グラフ上のモジュールを先に import しない: 第 8 回 P1）。
-    # 記録は基準（スタブなし）の実行の時だけ。起動時から始まっていて、エントリーの実行が終わったところで止める
-    try:
-        run_entry()
-    finally:
-        if cfg.get("trace_out") and BOOT and BOOT.get("rec") is not None:
-            _data = BOOT["trm"].stop(BOOT["rec"])
-            with open(cfg["trace_out"], "w", encoding="utf-8") as _f:
-                json.dump(_data, _f, ensure_ascii=False)
-    cfg["run_entry"] = False
-
 for m in cfg["targets"]:
     emit({"start": m})
+    if BOOT is not None:
+        BOOT["current"] = m
+    nb = len(BOOT["state"]["blocked"]) if BOOT is not None else 0
     try:
         importlib.import_module(m)
         emit({"m": m, "ok": True})
     except BaseException as e:  # noqa
-        emit({"m": m, "ok": False, "err": f"{type(e).__name__}: {e}"[:800], "tb": traceback.format_exc()[-3000:]})
+        blocked = BOOT is not None and len(BOOT["state"]["blocked"]) > nb
+        emit({"m": m, "ok": False, "err": f"{type(e).__name__}: {e}"[:800], "tb": traceback.format_exc()[-3000:],
+              "blocked_entry": blocked})
 emit({"done": True})
 '''
 
@@ -119,44 +80,32 @@ def _is_test_module(name: str) -> bool:
         name.endswith(("_test", ".setup"))
 
 
-def _run_child(py: str, cfg: dict, workdir: Path, timeout: float) -> tuple[list[dict], bool]:
-    cfg_path = workdir / f"cfg_{time.time_ns()}.json"
-    out_path = workdir / f"out_{time.time_ns()}.jsonl"
+def _run_import_child(py: str, cfg: dict, workdir: Path, timeout: float, last: dict) -> tuple[list[dict], bool]:
+    """import だけの確認の子プロセス（エントリーは動かさない）。"""
+    from mcp_pystub import proc as _proc
+    ns = time.time_ns()
+    cfg_path = workdir / f"cfg_{ns}.json"
+    out_path = workdir / f"out_{ns}.jsonl"
+    err_path = workdir / f"err_{ns}.txt"
     cfg = dict(cfg, out=str(out_path))
     cfg_path.write_text(json.dumps(cfg, ensure_ascii=False), encoding="utf-8")
     child = workdir / "child.py"
     if not child.exists():
         child.write_text(_CHILD, encoding="utf-8")
-    from mcp_pystub import trace as _trace
     boot_dir = workdir / "boot"
-    if not (boot_dir / "sitecustomize.py").exists():
-        boot_dir.mkdir(parents=True, exist_ok=True)
-        (boot_dir / "sitecustomize.py").write_text(_trace.BOOT, encoding="utf-8")
-    proc_dir = workdir / f"procs_{time.time_ns()}"
+    _proc.write_boot(boot_dir)
+    proc_dir = workdir / f"procs_{ns}"
     boot_cfg = {"stubs": cfg["stubs"], "prefixes": cfg["prefixes"], "block": cfg["block"], "watch": cfg.get("watch", []),
-                "entry": cfg["entry"], "entry_guard": not cfg["run_entry"], "extra_path": cfg.get("extra_path", []),
+                "entry": cfg["entry"], "entry_guard": True, "extra_path": cfg.get("extra_path", []),
                 "proc_dir": str(proc_dir)}
-    if cfg.get("trace_out"):
-        boot_cfg["trace_mod"] = cfg["trace_mod"]
-    boot_path = workdir / f"boot_{time.time_ns()}.json"
+    boot_path = workdir / f"boot_{ns}.json"
     boot_path.write_text(json.dumps(boot_cfg, ensure_ascii=False), encoding="utf-8")
-    env = dict(os.environ)
-    env.update({"PYTHONIOENCODING": "utf-8", "PYTHONDONTWRITEBYTECODE": "1", "MPLBACKEND": "Agg",
-                "QT_QPA_PLATFORM": "offscreen", "PYTHONNOUSERSITE": "1" if cfg.get("isolate_user") else ""})
-    env["PYTHONPATH"] = str(boot_dir)
-    env["MCP_PYSTUB_BOOT"] = str(boot_path)
-    env["MCP_PYSTUB_ROOT"] = "1"
-    timed_out = False
-    try:
-        cp = subprocess.run([py, "-X", "utf8", str(child), str(cfg_path)], cwd=str(workdir), env=env,
-                            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
-                            timeout=timeout)
-        _LAST_CHILD["rc"] = cp.returncode
-        _LAST_CHILD["stderr"] = (cp.stderr or b"").decode("utf-8", "replace")[-1500:]
-    except subprocess.TimeoutExpired:
-        timed_out = True
-        _LAST_CHILD["rc"] = None
-        _LAST_CHILD["stderr"] = "timeout"
+    env = _proc.boot_env(boot_dir, boot_path)
+    with open(err_path, "wb") as fe:
+        rc, timed_out = _proc.run_tree([py, str(child), str(cfg_path)], str(workdir), env, timeout,
+                                       stdout=subprocess.DEVNULL, stderr=fe)
+    last["rc"] = rc
+    last["stderr"] = "timeout" if timed_out else _decode(err_path.read_bytes()[-3000:])
     recs: list[dict] = []
     if out_path.exists():
         for line in out_path.read_text(encoding="utf-8", errors="replace").splitlines():
@@ -164,15 +113,68 @@ def _run_child(py: str, cfg: dict, workdir: Path, timeout: float) -> tuple[list[
                 recs.append(json.loads(line))
             except json.JSONDecodeError:
                 pass
-    _LAST_CHILD["startup_loaded"] = next((r["startup_loaded"] for r in recs if "startup_loaded" in r), [])
-    _LAST_CHILD["boot"] = next((r["boot"] for r in recs if "boot" in r), False)
-    _LAST_CHILD["procs"] = _trace.read_children(proc_dir)
-    shutil.rmtree(proc_dir, ignore_errors=True)
+    procs = _proc.read_procs(proc_dir)
+    last["startup_loaded"] = next((r["startup_loaded"] for r in recs if "startup_loaded" in r), [])
+    for pr in procs:
+        last["startup_loaded"] = sorted(set(last["startup_loaded"]) | set(pr.get("startup_loaded") or []))
+    last["blocked"] = sorted({b for pr in procs for b in (pr.get("blocked") or []) if b})
+    _proc.rmtree_retry(proc_dir)
     return recs, timed_out
 
 
-_LAST_CHILD: dict = {}
-_BASE_EXTRA: dict = {}  # 基準の実行にだけ渡す設定（実行の記録）  # 直前の子プロセスの終了コードと標準エラー（エントリーが最後まで走らなかった理由に使う）
+def _decode(b: bytes) -> str:
+    """表示・原因の特定用のデコード（比較には使わない）。UTF-8 で読めなければ、子プロセスの既定（ロケール）の符号化で読む。"""
+    try:
+        return b.decode("utf-8")
+    except UnicodeDecodeError:
+        import locale
+        return b.decode(locale.getpreferredencoding(False) or "utf-8", "replace")
+
+
+def _entry_command(py: str, entry: Path, entry_args: list[str]) -> tuple[list[str], str]:
+    """普段の起動のコマンドと既定の作業フォルダ（python entry.py 引数… / パッケージの中なら python -m pkg.mod 引数…）。"""
+    from mcp_pystub.import_graph import entry_module_name
+    try:
+        name, root = entry_module_name(entry)
+    except Exception:  # noqa: BLE001
+        name, root = entry.stem, entry.parent
+    if Path(root).resolve() != entry.parent.resolve() and "." in name:
+        return [py, "-m", name] + list(entry_args), str(root)
+    return [py, str(entry)] + list(entry_args), str(entry.parent)
+
+
+def _run_entry_proc(py: str, cmd: list[str], cwd: str, boot_cfg: dict, workdir: Path, timeout: float,
+                    recording: bool) -> dict:
+    """エントリーを普段の起動と同じ条件で動かす（標準出力はファイルにつなぎ、バイト列の全体を比べる）。"""
+    import hashlib
+    from mcp_pystub import proc as _proc
+    ns = time.time_ns()
+    boot_dir = workdir / "boot"
+    _proc.write_boot(boot_dir)
+    proc_dir = workdir / f"eprocs_{ns}"
+    boot_path = workdir / f"eboot_{ns}.json"
+    boot_path.write_text(json.dumps(dict(boot_cfg, proc_dir=str(proc_dir)), ensure_ascii=False), encoding="utf-8")
+    env = _proc.boot_env(boot_dir, boot_path)
+    out_path, err_path = workdir / f"eout_{ns}.bin", workdir / f"eerr_{ns}.bin"
+    with open(out_path, "wb") as fo, open(err_path, "wb") as fe:
+        rc, timed_out = _proc.run_tree(cmd, cwd, env, timeout, stdout=fo, stderr=fe)
+    data = out_path.read_bytes()
+    err = _decode(err_path.read_bytes()[-4000:])
+    shown = _decode(data)
+    if len(shown) > 4000:
+        shown = shown[:2000] + "\n…\n" + shown[-2000:]
+    procs = _proc.read_procs(proc_dir)
+    _proc.rmtree_retry(proc_dir)
+    for f in (out_path, err_path, boot_path):
+        try:
+            f.unlink()
+        except OSError:
+            pass
+    lines = [x for x in err.strip().splitlines() if x.strip()]
+    return {"m": "<entry>", "rc": rc, "timed_out": timed_out, "ok": rc == 0 and not timed_out,
+            "stdout_key": f"{len(data)}:{hashlib.sha256(data).hexdigest()}", "stdout": shown,
+            "err": ("timeout" if timed_out else (lines[-1] if lines else "")), "tb": err,
+            "procs": procs, "summary": _proc.summarize_procs(procs, recording)}
 
 
 def _results(recs: list[dict]) -> tuple[dict[str, dict], str | None, bool]:
@@ -218,7 +220,19 @@ def _blame(rec: dict, items: dict[str, dict]) -> list[str]:
     return hit
 
 
-def verify(
+def verify(*args, **kwargs) -> dict:
+    """スタブ（とサブモジュールのヒント・nofollow）に差し替えた状態で、実際に import して確かめる（_verify の後始末つき）。"""
+    holder: list[Path] = []
+    try:
+        return _verify(holder, *args, **kwargs)
+    finally:
+        from mcp_pystub.proc import rmtree_retry
+        for w in holder:
+            rmtree_retry(w)
+
+
+def _verify(
+    _holder: list,
     entry_point: str,
     python_path: str = "",
     packages: list[str] | None = None,
@@ -265,6 +279,7 @@ def verify(
             submodules = [f"{h.submodule}=>{h.target_package}" for h in hints]
 
     work = Path(tempfile.mkdtemp(prefix="pystub_verify_"))
+    _holder.append(work)
     items: dict[str, dict] = {}
     errors: list[dict] = []
     if True:  # 同じグラフ・意味解析を使い回す（モジュールの関数を書き換えない: 同時呼び出しで干渉しない）
@@ -341,7 +356,7 @@ def verify(
     watch = sorted({p for it in items.values() for p in it["prefixes"] + it["block"]})
     extra_path = [str(Path(python_path).resolve())] if python_path else []
 
-    def cfg_for(keys: list[str], tgts: list[str]) -> dict:
+    def stub_cfg(keys: list[str]) -> dict:
         stubs: dict[str, str] = {}
         prefixes: list[str] = []
         block: list[str] = []
@@ -349,10 +364,13 @@ def verify(
             stubs.update(stub_map[k])
             prefixes += items[k]["prefixes"]
             block += items[k]["block"]
-        return {**_BASE_EXTRA, "stubs": stubs, "prefixes": prefixes, "watch": watch, "extra_path": extra_path,
-                "block": block, "targets": tgts, "sys_path": sys_path,
-                "entry": str(entry), "run_entry": run_entry, "entry_args": list(entry_args or []),
-                "cwd": str(Path(cwd).resolve()) if cwd else str(Path(entry).parent)}
+        return {"stubs": stubs, "prefixes": prefixes, "block": block}
+
+    def cfg_for(keys: list[str], tgts: list[str]) -> dict:
+        return {**stub_cfg(keys), "watch": watch, "extra_path": extra_path, "targets": tgts, "sys_path": sys_path,
+                "entry": str(entry)}
+
+    last: dict = {}  # 直前の import の子プロセスの終了コード・標準エラー（呼び出しごとの状態）
 
     def run_all(keys: list[str], tgts: list[str]) -> tuple[dict[str, dict], list[str]]:
         """固まるモジュールは飛ばして最後まで import する。"""
@@ -360,60 +378,61 @@ def verify(
         res: dict[str, dict] = {}
         hung: list[str] = []
         for _ in range(6):
-            recs, timed_out = _run_child(py, cfg_for(keys, remaining), work, timeout)
-            r, last, done = _results(recs)
+            recs, timed_out = _run_import_child(py, cfg_for(keys, remaining), work, timeout, last)
+            r, lst, done = _results(recs)
             res.update(r)
             if done or not timed_out:
                 break
-            if last is None:
+            if lst is None:
                 break
-            hung.append(last)
-            res[last] = {"m": last, "ok": False, "err": "timeout", "tb": ""}
-            idx = remaining.index(last) + 1 if last in remaining else len(remaining)
+            hung.append(lst)
+            res[lst] = {"m": lst, "ok": False, "err": "timeout", "tb": ""}
+            idx = remaining.index(lst) + 1 if lst in remaining else len(remaining)
             remaining = remaining[idx:]
             if not remaining:
                 break
         return res, hung
 
-    trace_path = work / "base_trace.json"
-    base_cfg_extra = {}
-    if record and run_entry:
-        base_cfg_extra = {"trace_out": str(trace_path), "trace_mod": str(Path(__file__).with_name("trace.py"))}
-    _BASE_EXTRA.clear()
-    _BASE_EXTRA.update(base_cfg_extra)
+    ecmd, ecwd = _entry_command(py, Path(entry), list(entry_args or []))
+    if cwd:
+        ecwd = str(Path(cwd).resolve())
+    trace_mod = str(Path(__file__).with_name("trace.py"))
+
+    def run_entry_with(keys: list[str], recording: bool = False) -> dict:
+        bc = dict(stub_cfg(keys), watch=watch, entry=str(entry), extra_path=extra_path)
+        if recording:
+            bc["trace_mod"] = trace_mod
+        return _run_entry_proc(py, ecmd, ecwd, bc, work, timeout, recording)
+
     base, base_hung = run_all([], targets)
-    _BASE_EXTRA.clear()
-    base_child = dict(_LAST_CHILD)  # 基準の子プロセス全体の終了コード・標準エラー（エントリーの後の atexit も含む）
-    base_startup = set(base_child.get("startup_loaded") or [])
-    base_procs = list(base_child.get("procs") or [])
-    for pr in base_procs:
-        base_startup |= set(pr.get("startup_loaded") or [])
+    base_imp = dict(last)
+    base_startup = set(base_imp.get("startup_loaded") or [])
+    blocked_entry = sorted(set(base_imp.get("blocked") or []) |
+                           {m for m, r in base.items() if r.get("blocked_entry")})
     ok_targets = [m for m in targets if base.get(m, {}).get("ok")]
-    base_entry = base.get("<entry>")
+    base_entry = None
     entry_note = ""
-    if run_entry and base_entry is None:
-        # import の途中で固まったなどで、基準のエントリー実行が済んでいない: 単独でやり直す
-        recs, t_out = _run_child(py, cfg_for([], []), work, timeout)
-        r0, _l, _d = _results(recs)
-        base_entry = r0.get("<entry>")
-        base_child = dict(_LAST_CHILD)
-        if base_entry is None:
-            entry_note = ("基準（スタブなし）のエントリー実行が" + ("時間内に終わらない" if t_out else "できない")
-                          + "ため、エントリーの出力の一致は確かめていません")
+    if run_entry:
+        base_entry = run_entry_with([], recording=bool(record))
+        for pr in base_entry["procs"]:
+            base_startup |= set(pr.get("startup_loaded") or [])
+        if base_entry["timed_out"]:
+            entry_note = f"基準（スタブなし）のエントリー実行が {timeout} 秒で終わらなかったため、出力の一致は確かめていません"
+    base_procs = list(base_entry["procs"]) if base_entry else []
+    base_sum = base_entry["summary"] if base_entry else {"child_processes": 0, "untraced_child_processes": 0}
 
     # 基準（スタブなし）が失敗したら、何も通さない（比べる元が無い: 第 7 回）
     baseline_failed = None
-    why_b = (base_child.get("stderr") or "").strip()
+    why_b = (base_imp.get("stderr") or "").strip()
     if targets and not ok_targets:
         baseline_failed = {"reason": "基準（スタブなし）で import できたモジュールが 0 件です",
-                           "rc": base_child.get("rc"), "stderr_tail": why_b[-800:]}
-    elif run_entry and base_entry is None:
-        baseline_failed = {"reason": "基準（スタブなし）でエントリーが最後まで実行されませんでした",
-                           "rc": base_child.get("rc"), "stderr_tail": why_b[-800:]}
-    elif run_entry and (base_entry.get("rc") not in (0, None) or base_child.get("rc") not in (0, None)):
-        baseline_failed = {"reason": f"基準（スタブなし）のエントリーが終了コード "
-                                     f"{base_entry.get('rc')}（子プロセス全体 {base_child.get('rc')}）で終わりました",
-                           "rc": base_child.get("rc"), "stderr_tail": ((base_entry.get("err") or "") + why_b)[-800:]}
+                           "rc": base_imp.get("rc"), "stderr_tail": why_b[-800:]}
+    elif run_entry and base_entry["timed_out"]:
+        baseline_failed = {"reason": "基準（スタブなし）でエントリーが最後まで実行されませんでした（timeout）",
+                           "rc": None, "stderr_tail": base_entry["tb"][-800:]}
+    elif run_entry and base_entry["rc"] != 0:
+        baseline_failed = {"reason": f"基準（スタブなし）のエントリーが終了コード {base_entry['rc']} で終わりました",
+                           "rc": base_entry["rc"], "stderr_tail": base_entry["tb"][-800:]}
     if baseline_failed is not None:
         baseline_failed["hint"] = ("エントリーが引数・入力ファイル・作業フォルダを必要とするなら entry_args / cwd を指定して"
                                    "ください。メモリ不足などで基準の実行が途中で終わった場合は、空きを確保して回し直してください")
@@ -422,6 +441,7 @@ def verify(
     rejected: list[dict] = list(errors)
     rounds = 0
     last_res: dict[str, dict] = {}
+
     def visible(keys: list[str]) -> list[str]:
         """差し替えた範囲の内側でスタブに無いモジュール・外したモジュールは、直接 import の対象にしない。
 
@@ -442,25 +462,23 @@ def verify(
         miss = [m for m in tg if m not in res]
         if miss and not fl:
             # 子プロセスが import の途中で終わった（止まるスタブの os._exit(70) など）: 最初の未完了のモジュールを失敗として扱う
-            why = (_LAST_CHILD.get("stderr") or "").strip()
+            why = (last.get("stderr") or "").strip()
             fl.append({"m": miss[0], "ok": False, "err": (
-                f"{miss[0]} の import の途中で子プロセスが終了した（終了コード {_LAST_CHILD.get('rc')}）: "
-                + (why.splitlines()[-1] if why else "標準エラーなし"))})
-        if run_entry and base_entry is not None:
-            er = res.get("<entry>")
-            if er is not None and _LAST_CHILD.get("rc") != base_child.get("rc") \
-                    and er.get("rc") == base_entry.get("rc") and er.get("stdout_key") == base_entry.get("stdout_key"):
-                why = (_LAST_CHILD.get("stderr") or "").strip()
-                fl.append({"m": "<entry>", "entry_mismatch": True, "err": (
-                    f"エントリーの後（atexit 等）で子プロセスの終了コードが変わった: 基準 {base_child.get('rc')} → "
-                    f"{_LAST_CHILD.get('rc')}: " + (why.splitlines()[-1] if why else "標準エラーなし"))})
-            elif er is None or er.get("rc") != base_entry.get("rc") or er.get("stdout_key") != base_entry.get("stdout_key"):
-                if er is None:
-                    why = _LAST_CHILD.get("stderr", "") or ""
-                    er = {"m": "<entry>", "err": (
-                        f"エントリーが最後まで実行されなかった（終了コード {_LAST_CHILD.get('rc')}）: "
-                        + (why.strip().splitlines()[-1] if why.strip() else "標準エラーなし"))}
-                fl.append(dict(er, m="<entry>", entry_mismatch=True))
+                f"{miss[0]} の import の途中で子プロセスが終了した（終了コード {last.get('rc')}）: "
+                + (why.splitlines()[-1] if why else "標準エラーなし")), "tb": why[-3000:]})
+        if run_entry and base_entry is not None and not base_entry["timed_out"]:
+            er = run_entry_with(keys)
+            res["<entry>"] = er
+            if er["timed_out"] or er["rc"] != base_entry["rc"] or er["stdout_key"] != base_entry["stdout_key"]:
+                msg = er["err"]
+                if er["timed_out"]:
+                    msg = f"エントリーが最後まで実行されなかった（{timeout} 秒で打ち切り）"
+                elif er["rc"] != base_entry["rc"]:
+                    msg = (f"エントリーが最後まで実行されなかった（終了コード {er['rc']}。基準は {base_entry['rc']}）: "
+                           + (er["err"] or "標準エラーなし"))
+                else:
+                    msg = er["err"] if er["err"] and er["rc"] != 0 else ""
+                fl.append({"m": "<entry>", "entry_mismatch": True, "err": msg, "tb": er["tb"]})
         return fl, res, miss
 
     unresolved: list[dict] = []
@@ -509,24 +527,10 @@ def verify(
                                        "module": fails[0].get("m") if fails else "", "error": fails[0].get("err") if fails else ""})
                 active = []
 
-    # 実行の記録（指定された時だけ）: 基準の実行の記録と、渡された記録ファイルを合算し、各項目に観測の区分を付ける
+    # 実行の記録（指定された時だけ）: 基準のエントリー実行の各プロセス（root と子孫）の記録と、渡された記録ファイルを
+    # 合算し、各項目に観測の区分を付ける
     from mcp_pystub import trace as _trace
-    trace_data = None
-    if record and run_entry and trace_path.exists():
-        try:
-            trace_data = json.loads(trace_path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            trace_data = None
-    if trace_data is not None:
-        # 基準の実行の子孫のプロセスの記録を足す（記録の取れなかった子孫は数える）
-        runs0 = trace_data.get("runs", 1)
-        for pr in base_procs:
-            if pr.get("trace"):
-                trace_data = _trace.merge(trace_data, pr["trace"])
-            else:
-                trace_data["untraced_child_processes"] = int(trace_data.get("untraced_child_processes", 0)) + 1
-        trace_data["runs"] = runs0
-        trace_data["child_processes"] = len(base_procs)
+    trace_data = _trace.merge_procs(base_procs) if (record and run_entry) else None
     if trace_files:
         trace_data = _trace.merge(trace_data, _trace.load(trace_files)) if trace_data else _trace.load(trace_files)
     site_dirs = [str(Path(python_path).resolve())] if python_path else [str(p) for p in resolver._site_packages]
@@ -541,10 +545,13 @@ def verify(
         if any(under(x, q) or under(q, x) for x in base_startup for q in it["prefixes"] + it["block"]) or \
                 (obs is not None and obs.get("loaded_at_startup")):
             why.append("起動時（.pth など）に読み込まれるため未確認（スタブの差し込みより前に本物が読み込まれる）")
-        if base_procs and trace_data is not None and (int(trace_data.get("untraced_child_processes", 0)) > 0):
-            why.append("子プロセスが起動されたため、その中の使用は確かめていない（記録の取れなかった子プロセスがある）")
-        elif base_procs and trace_data is None:
-            why.append("子プロセスが起動された（記録が無い）")
+        if int(base_sum.get("untraced_child_processes", 0)) > 0 or \
+                (trace_data is not None and int(trace_data.get("untraced_child_processes", 0)) > 0):
+            why.append("子プロセスが起動されたため、その中の使用は確かめていない（記録・差し込みの効かなかった子プロセスがある: "
+                       "環境を消した・-E / -I / -S・PYTHONPATH の上書き・python 以外のプログラム、または止められた）")
+        elif base_sum.get("child_processes") and not record and \
+                not (trace_data is not None and int(trace_data.get("child_processes", 0)) > 0):
+            why.append("子プロセスが起動された（その中の記録が無い）")
         if ok and run_entry and obs is not None and obs["state"] in ("not_imported", "import_only") and not why:
             st = "confirmed_run"  # 記録で未実行、かつエントリーの差し替え実行を通った
         elif ok:
@@ -597,14 +604,20 @@ def verify(
         "verified_sets": verified_sets,
         "verified_sets_note": ("確かめた組をそのまま適用してください。一部だけを適用するなら、その組で verify を回し直してください"
                                "（組ごとに結果が変わることがあります）。"),
-        "child_processes": len(base_procs),
+        "child_processes": base_sum.get("child_processes", 0),
+        "untraced_child_processes": base_sum.get("untraced_child_processes", 0),
+        "blocked_entry_open": blocked_entry,
+        "entry_conditions": (None if not run_entry else {
+            "command": ecmd, "cwd": ecwd, "stdin": "DEVNULL", "stdout": "ファイル（バイト列の全体を比べる）",
+            "env_added": ["PYTHONPATH の先頭に起動用フォルダ", "MCP_PYSTUB_BOOT"],
+            "stdout_head": (base_entry or {}).get("stdout", "")[:2000]}),
         "startup_loaded": sorted(base_startup),
         "excluded_from_import": excluded_entry_shown,
         "traced": trace_data is not None,
         "status_note": ("確認済み（実行）= 実行の記録で未実行（not_imported / import_only）かつ run_entry=True の差し替え実行を通った。"
                         "import 確認済み = スタブに差し替えた import（と、run_entry=True ならエントリーの実行）を通ったが、"
                         "実行の記録での確認は無い / 記録では実行されていた。未確認 = 通らなかった・確かめられなかった。"
-                        "記録は動かした入力の範囲だけで、子プロセスの中と拡張モジュール（.pyd / .so）の中は記録できません。"),
+                        "記録は動かした入力の範囲だけです。起動用の仕組みが効かない子プロセスと拡張モジュール（.pyd / .so）の中は記録できません（子プロセスは数えて、確認済み（実行）にしません）。"),
         "baseline_failed": baseline_failed,
         "rejected": rejected,
         "unresolved": unresolved,
@@ -623,14 +636,18 @@ def verify(
         "note": ("" if not excluded_entry_shown else
                  "エントリーを（間接に）import するローカルのモジュールは、エントリーを動かさないため import の対象から外しました: "
                  + ", ".join(excluded_entry_shown) + "。")
+                + ("" if not blocked_entry else
+                   "import の途中でエントリーのファイルを開こうとしたため止めたモジュール（import できなかった扱い）: "
+                   + ", ".join(blocked_entry) + "。")
                 + "verify は import（と run_entry=True ならエントリーの 1 回の実行）で確かめるだけで、"
                 "全ての実行経路の保証ではありません。ビルド後の実行確認も行ってください。"
-                + ("" if run_entry else "run_entry=False（既定）は import だけの確認で、グラフ上のモジュールの直下のコード"
-                   "（import 時のコード）は動きますが、エントリーのスクリプトはどの名前でも実行しません（エントリーを import する"
-                   "ローカルのモジュールは対象から外し、それでも import されそうになったら止めます）。")
-                + "比べるのはエントリーの標準出力の全体（実行中に sys.stdout へ書いたもの。長さとハッシュ）と終了コード（エントリーと子プロセス全体）"
-                "だけで、標準エラー・ファイルへの出力・import 時に掴まれた stdout への出力は比べません。"
-                "エントリーは sys.argv = [エントリー] + entry_args、作業フォルダ cwd（既定はエントリーのあるフォルダ）で実行します。",
+                + "import の確認は別の子プロセスで行い、グラフ上のモジュールの直下のコード（import 時のコード）は動きますが、"
+                "エントリーのスクリプトは動かしません（エントリーを import するローカルのモジュールは対象から外し、import の途中で"
+                "エントリーのファイルを開く操作は監査フックで止めます）。"
+                + ("" if not run_entry else
+                   "エントリーは、標準出力をファイルにつないだ普段の実行（" + " ".join(ecmd[1:]) + "、作業フォルダ " + ecwd +
+                   "）と同じ条件で動かし、標準出力のバイト列の全体（子孫のプロセス・atexit の出力も含む）と終了コードを比べます。"
+                   "普段と違うのは PYTHONPATH の先頭の起動用フォルダと環境変数 MCP_PYSTUB_BOOT だけで、標準入力は空"
+                   "（DEVNULL）です。標準エラー・ファイル・通信は比べません。終わった後・timeout の時は孫を含むプロセスの木を止めます。"),
     }
-    shutil.rmtree(work, ignore_errors=True)
     return out
