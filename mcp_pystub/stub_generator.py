@@ -864,12 +864,14 @@ def generate_stubs(
                 if init not in files:
                     files[init] = (_LOUD_HEADER.format(module=".".join(parts[:i]), note=note) + _NET_ALL) if note \
                         else _HEADER.format(module=".".join(parts[:i]))
-        if note:
-            # 条件付きのスタブ: 元にある全てのサブモジュールと公開名を import できるようにし、使った時点で止める
-            # （第 4 回 条件付きの段 5: `from fontTools import subset` の ImportError を無くす）
+        if note and conditional_info is not None:
+            # 条件付き・記録からの候補のスタブ: 元にある全てのサブモジュールと公開名を import できるようにし、使った時点で
+            # 止める（第 4 回 条件付きの段 5: `from fontTools import subset` の ImportError を無くす）。stubbable のスタブは
+            # 静的解析で参照が見つかったモジュールだけを持つ（それ以外の import は ModuleNotFoundError: README の制限）
             pkg_dir = main if main.is_dir() else main.parent
             if (pkg_dir / "__init__.py").exists():
                 files.update(_all_submodule_stubs(pkg_dir, package_name, files, note))
+    _add_build_hook_entry_points(files, package_name, site_root)
 
     for rel, code in files.items():
         compile(code, rel, "exec")  # 生成物は必ず構文として正しい
@@ -899,6 +901,34 @@ def generate_stubs(
         "conditional": bool(conditional_info),
         "conditions": (conditional_info or {}).get("conditions", []),
     }
+
+
+def _add_build_hook_entry_points(files: dict, package_name: str, site_root: Path | None) -> None:
+    """配布物が宣言するビルド時のフック探索の入口（entry_points の pyinstaller40: hook-dirs 等）を、空のリストを返す関数として
+    スタブに入れる。PyInstaller はビルド時にこれを呼ぶので、止まるスタブだとビルドが失敗する（numpy:_pyinstaller_hooks_dir）。
+    スタブにしたパッケージのフックは要らないので、空でよい。"""
+    if site_root is None:
+        return
+    try:
+        dists = list(importlib.metadata.distributions(path=[str(site_root)]))
+    except Exception:  # noqa: BLE001
+        return
+    for dist in dists:
+        try:
+            eps = [e for e in dist.entry_points if e.group == "pyinstaller40"]
+        except Exception:  # noqa: BLE001
+            continue
+        for ep in eps:
+            mod, _, attr = ep.value.partition(":")
+            mod, attr = mod.strip(), attr.strip()
+            if not attr or not attr.isidentifier() or not (mod == package_name or mod.startswith(package_name + ".")):
+                continue
+            base = mod.replace(".", "/")
+            rel = base + "/__init__.py" if (base + "/__init__.py") in files else base + ".py"
+            if rel not in files:
+                continue
+            files[rel] += (f"\n\ndef {attr}():  # ビルド時のフック探索（{ep.group}: {ep.name}）。スタブにしたので空\n"
+                           "    return []\n")
 
 
 def _all_submodule_stubs(pkg_dir: Path, package_name: str, have: dict, note: str) -> dict:
@@ -1258,7 +1288,8 @@ def generate_submodule_stubs(
             rel = "/".join(submod_parts) + ".py"
         files[rel] = c
     sub_dir = sub_main if sub_main.is_dir() else sub_main.parent
-    if note and (sub_main.is_dir() or sub_main.name == "__init__.py") and (sub_dir / "__init__.py").exists():
+    if note and conditional_info is not None and (sub_main.is_dir() or sub_main.name == "__init__.py") and \
+            (sub_dir / "__init__.py").exists():
         # 条件付き: サブモジュールの中の全てのモジュールを import できるようにし、使った時点で止める
         extra_files = _all_submodule_stubs(sub_dir, submodule, files, note)
         files.update({k: v for k, v in extra_files.items() if k.startswith("/".join(submod_parts) + "/")})
