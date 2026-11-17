@@ -16,23 +16,17 @@ When building Python apps into executables, heavy packages imported at module le
 
 ### 実証データ / Verified Results
 
-> **再測定中**: 下の数値は判定を 2 段（使用が見つからなかった候補 / 条件付き）に分ける前のものです。差し替え予定です。
+測定条件: Windows 11、Python 3.13、PyInstaller（onefile）、各シナリオの `entry.py`（`C:\tmp\pystub-e2e` の合成シナリオ）。
+exe の出力が元と一致することと、site-packages の復元が元と一致することを確かめた値です（第 9〜10 回の独立検証で再現）。
 
-**asammdf プロジェクト — PyInstaller exe ビルド（E2E 動作確認済み）:**
-
-| | exe サイズ | 動作 | PySide6 |
+| シナリオ | スタブなし | 適用後 | 適用した候補 |
 |---|---|---|---|
-| スタブなし | 431 MB | OK | ロード済み |
-| asammdf.gui スタブ適用 | **259 MB** | OK | **排除** |
-| **削減** | **-40%（172 MB）** | 影響なし | |
-
-**asammdf 変換ツール（analyze 結果）:**
-```
-stubbable:          pandas (59.7 MB), canmatrix (4.0 MB) — 合計 63.7 MB
-submodule hints:    asammdf.gui → PySide6 (523 MB) 排除可能 — 50 hints 検出
-```
-
-> 手動でスタブ化していた 3 パッケージ（pandas, canmatrix, asammdf.gui）を**全て自動検出**
+| 12_asammdf | 240.1 MB | **36.9 MB** | 確認済み（実行）の `asammdf.gui`（PySide6・lxml を排除）だけ |
+| 12_asammdf | 240.1 MB | **25.1 MB** | 静的解析の候補を全部（pandas + asammdf.gui） |
+| 03_networkx | 76.7 MB | **40.8 MB** | scipy（記録からの候補）・fontTools・pandas |
+| 01_tqdm | 47.7 MB | **32.7 MB** | pandas・fontTools・PIL（記録からの候補） |
+| 02_openpyxl | 26.2 MB | **20.3 MB** | openpyxl.drawing.image（PIL を排除） |
+| 15_pillow | 25.7 MB | **14.4 MB** | numpy |
 
 ## 機能 / Features
 
@@ -91,8 +85,8 @@ site-packages の `.pth` と `sitecustomize` が起動時に実行するコー�
 （その時は `confidence_reason` に「プロジェクトから入口へ入る経路があります」と出ます）。
 
 low でも、解析したエントリーで変わらないことは `verify(..., run_entry=True)` で確かめられます。verify が比べるのは
-エントリーの標準出力の全体（実行中に `sys.stdout` へ書いたもの。長さとハッシュで比べる）と終了コード（エントリーと子プロセス全体。atexit の後も含む）だけで、
-標準エラー・ファイルへの出力・import 時に掴まれた stdout への出力は比べません。エントリーは `sys.argv = [エントリー] + entry_args`、
+エントリーのプロセスの標準出力（fd 1）のバイト列の全体（子孫のプロセス・atexit・`os.write(1, …)` の出力も含む。長さとハッシュで比べる）と
+終了コードだけで、標準エラー・ファイルへの出力・通信は比べません。エントリーは `sys.argv = [エントリー] + entry_args`、
 作業フォルダ `cwd`（既定はエントリーのあるフォルダ）で実行するので、引数や入力ファイルが要るエントリーでは `entry_args` /
 `cwd` を指定してください。基準（スタブなし）の実行が失敗した時は何も通さず `baseline_failed` に理由を返します。
 
@@ -111,7 +105,7 @@ exe の削減量ではありません（実際の削減は PyInstaller の同梱
 - **try/except 保護の自動検出**: 保護された import は `nofollow` と判定
 - **スタブコード自動生成**: 参照シンボルのみの最小スタブ + ビルド手順（バックアップ・復元・検証）
 - **C 拡張の自動検出**: .pyd / .so を含むパッケージは直接スタブ化不可と判定
-- **C 拡張の間接排除** *(v0.2 new)*: C拡張パッケージを import しているサブモジュールが未使用なら、そのサブモジュールをスタブ化して C拡張を排除可能。PySide6 (523 MB) → asammdf.gui スタブで **exe 40% 削減**を実証
+- **C 拡張の間接排除** *(v0.2 new)*: C拡張パッケージを import しているサブモジュールが未使用なら、そのサブモジュールをスタブ化して C拡張を排除可能。12_asammdf で asammdf.gui をスタブにして PySide6・lxml を外し、exe 240.1 → 36.9 MB（上の実証データ）
 - **復元安全設計**: 元ファイルは site-packages の外の `_pystub_bak/<項目名>/` へ移動（pip uninstall しない）。
   項目ごとの領域なので、パッケージ全体とサブモジュールのスタブを重ねても元ファイルを失いません（内側が適用中なら
   外側の適用は断ります）。二重適用・中断にも耐え、復元後は verify_commands が `__file__` と RECORD のハッシュで確かめます
@@ -119,7 +113,7 @@ exe の削減量ではありません（実際の削減は PyInstaller の同梱
 
 ## できないこと・制限事項 / Limitations
 
-- **C 拡張パッケージ**（.pyd / .so）は直接スタブ化すると C 拡張が欠落するため required 判定。ただし `generate_submodule` で**間接排除が可能**（v0.2 で対応）
+- **C 拡張パッケージ**（.pyd / .so）は直接スタブ化すると C 拡張が欠落するため required 判定。ただし `generate_submodule` で**間接排除が可能**
 - **動的 import**（`importlib.import_module(変数)` / `__import__(変数)`）は静的解析で追跡不可。プロジェクトのコードに
   あれば安全側（required）、依存ライブラリの中なら warnings にモジュールと行を出し、判定の前提とします（仕様 5 節）
 - **PyInstaller カスタムフック**: スタブと衝突する場合がありフックの手動無効化が必要
@@ -133,10 +127,12 @@ exe の削減量ではありません（実際の削減は PyInstaller の同梱
 | 層 | 役割 | 保証 |
 |---|---|---|
 | 静的解析（`analyze`） | 候補を出し、サイズ順に並べ、理由（使われ方・条件・confidence）を説明する | 保証しない（提案） |
-| 動的解析（`verify(run_entry=True)` と実行の記録） | エントリーを実際に動かし、候補が実行されたか（記録）と、スタブに差し替えても動作が変わらないか（verify）を確かめる | **標準出力をパイプ・ファイルにつないだ普段の実行（`python entry.py 引数… > out.txt`）と同じ条件で動かした入力では、標準出力と終了コードが変わらない**。成り立つ範囲: 比べるのは標準出力のバイト列の全体（子孫のプロセス・atexit・`os.write(1, …)` の出力も含む）と終了コードだけ（標準エラー・ファイル・通信は比べない）。確かめた組（`verified_sets`）をそのまま適用した場合だけ。普段と違うのは PYTHONPATH の先頭の起動用フォルダと環境変数 `MCP_PYSTUB_BOOT` だけで、標準入力は空（DEVNULL）。記録・差し込みの効かなかった子プロセス（監査フックで数えた起動の数と、登録された子孫の数が合わない）、`.pth` で起動時に読み込まれるパッケージは、確認済み（実行）にしない |
+| 動的解析（`verify(run_entry=True)` と実行の記録） | エントリーを実際に動かし、候補が実行されたか（記録）と、スタブに差し替えても動作が変わらないか（verify）を確かめる | **標準出力をファイルにつないだ普段の実行（`python entry.py 引数… > out.txt`）と、下の表の違いの範囲で同じ条件で動かした入力では、標準出力と終了コードが変わらない**。比べるのは標準出力のバイト列の全体と終了コードだけ（標準エラー・ファイル・通信は比べない）。確かめた組（`verified_sets`）をそのまま適用した場合だけ。親子の対応が合わない子プロセス（下の「記録と差し込みの制限」）、`.pth` で起動時に読み込まれるパッケージは確認済み（実行）にしない。確認済み（実行）は、下の表の違いの範囲で、動かした入力について確かめた結果です。配布前に、ビルドした exe を普段のやり方で試してください。 |
 | 実行時（止まるスタブ） | 動かしていない経路でスタブに触れたら、原因を出して終了コード 70 で止まる（条件付きのスタブ） | 黙って結果が変わらない（下の制限を除く） |
 
-**確認の手順**: (1) `verify`（既定は import だけ: 別の子プロセスでグラフ上のモジュールを import する。各モジュールの直下のコード（import 時のコード）は動くが、エントリーのスクリプトは動かさない（エントリーを import するローカルのモジュールは対象から外し、import の途中でエントリーのファイルを開く操作は監査フックで止めて note に出す））→ (2) スタブを適用してビルドし、普段のやり方で exe を
+**保証の締め**: 確認済み（実行）は、下の表の違いの範囲で、動かした入力について確かめた結果です。配布前に、ビルドした exe を普段のやり方で試してください。
+
+**確認の手順**: (1) `verify`（既定は import だけ: 別の子プロセスでグラフ上のモジュールを import する。各モジュールの直下のコード（import 時のコード）は動くが、エントリーのスクリプトは動かさない（エントリーを import するローカルのモジュールは対象から外し、import の途中でエントリーのファイルを開く操作は監査フックで止めて note に出す。Python の `open` を通る読み込みは、別名（短いパス名・`\\?\`・UNC・ハードリンク）でも、ファイルの同一性で見分けて止めます。OS のコピー API（`shutil.copy2` の CopyFile2 など）、ctypes、外部コマンド（`cmd /c type` 等）での読み込みと、それでコピーしたファイル経由の import（zipimport 等）は止められません））→ (2) スタブを適用してビルドし、普段のやり方で exe を
 試す（スタブに触れたら原因を出して終了コード 70 で止まる）→（任意）エントリーを動かしても安全な時だけ `run_entry=True` や
 実行の記録でより強く確かめる。
 
@@ -157,22 +153,31 @@ exe の削減量ではありません（実際の削減は PyInstaller の同梱
 | PYTHONPATH | 利用者の値 | 先頭に起動用フォルダ + 利用者の値（起動後、`sys.path` からは起動用フォルダを外す） | 残る違い（起動用） |
 | 起動用の環境変数 | なし | `MCP_PYSTUB_BOOT`（子孫では値の末尾に `#d`） | 残る違い（起動用） |
 | PYTHONIOENCODING / MPLBACKEND / QT_QPA_PLATFORM / PYTHONNOUSERSITE / PYTHONDONTWRITEBYTECODE | 利用者の値 | verify を呼ぶ側（MCP サーバーのプロセス）の値のまま（付けない・消さない） | 無くした（ただし MCP サーバーを普段と違う環境変数で起動していると、その違いはそのまま入る。文書） |
-| 標準出力 | パイプ・ファイル | ファイル（`sys.stdout` は差し替えない。`fileno()`・`encoding`・`reconfigure()` も普段と同じ） | 無くした |
+| 標準出力 | パイプ・ファイル・コンソール | ファイル（`sys.stdout` は差し替えない。`fileno()`・`encoding`・`reconfigure()` はファイルにつないだ普段の実行と同じ） | 文書: 普段がパイプやコンソールの場合とは種類が違う（`isatty` や FIFO かどうかで分岐するプログラムは結果が変わりうる） |
 | 標準エラー | 端末・ファイル | ファイル（比べない。表示用） | 文書（比べない） |
 | 標準入力 | 端末 | 空（DEVNULL） | 文書 |
-| `sys.argv` / `__main__` / `__file__` / `sys.path[0]` | `python entry.py` のとおり | 同じ（エントリーを直接起動。パッケージの中のエントリーは `python -m pkg.mod`） | 無くした |
+| `sys.argv` / `__main__` / `__file__` / `sys.path[0]` | `python entry.py` のとおり | 同じ（エントリーを直接起動） | 無くした |
+| パッケージの中のエントリー（相対 import・`__main__.py`） | 利用者の起動のしかた | `python -m pkg.mod` で起動する | 文書 |
+| `import sitecustomize` | 普段は ImportError（無ければ） | `import sitecustomize` が成功する（起動用のもの。元の sitecustomize があれば続けて読む） | 文書 |
+| atexit | 利用者の登録だけ | atexit の登録が 1 つ増える（記録を書く） | 文書 |
+| `sys._pystub_boot` | 無い | ある（起動用の状態） | 文書 |
+| `sys.path_importer_cache` | 普段の件数 | 起動用フォルダの分などで件数が違いうる | 文書 |
+| site-packages のファイル | 適用後は元のパッケージのファイルが無い | verify の時は元のパッケージのファイルがディスクに残る（スタブは meta path finder で差し込む） | 文書: `importlib.metadata.files()` などで import せずにパッケージ内のファイルを読むプログラムは、適用後に結果が変わりうる |
+| Job Object | 入っていない | 入っている（プロセスの木を止めるため。venv でない python でも同じ） | 文書: Job に入っているかどうかで分岐するプログラムは結果が変わりうる |
 | 作業フォルダ | 利用者の場所 | `cwd`（既定はエントリーのあるフォルダ） | 文書（`cwd` で指定） |
 | 先に import されるモジュール | site と `.pth` の分 | 同じ + 起動用の sitecustomize の分（json・importlib.abc 等の標準ライブラリ。記録の時は mcp_pystub.trace） | 文書 |
 | 監査フック・`os._exit` の置き換え | なし | `sys.addaudithook` 1 つ（プロセスの起動を数える。import の確認ではエントリーのファイルを開く操作を止める）、`os._exit` を包む（記録を書いてから終わる） | 文書 |
 | 記録（`sys.monitoring` / `sys.setprofile`） | なし | 記録の時だけ（遅くなる。tool id を 1 つ使う） | 文書 |
-| 子孫のプロセス | 環境を受け継ぐ | 同じ。起動の数（監査フック）より登録された子孫が少なければ、記録・差し込みの効かなかった子として数え、確認済み（実行）にしない | 検出 |
+| 子孫のプロセス | 環境を受け継ぐ | 同じ。Python の監査イベントで分かる起動（subprocess・os.spawn*・os.exec*・os.system・CreateProcess）を、親子の対応で確かめます（プロセスごとに、起動した数と、自分を親とする登録済みの子の数が合うか）。合わなければ全項目を確認済み（実行）にしません。`ctypes` で OS の API を直接呼ぶ起動、COM / WMI 経由の起動は検出できません | 既知の経路だけ検出（完全ではない） |
 | `.pth` が起動時に読み込むパッケージ | 本物 | 本物（スタブが効かない） | 検出（`loaded_at_startup`） |
 | 終了の後 | 孫は残りうる | 孫を含むプロセスの木を止める | 文書 |
 
 **記録と差し込みの制限**: 起動用の `sitecustomize.py` は site-packages の `.pth` より後に読まれるので、`.pth` が起動時に読み込む
-パッケージにはスタブが効かず、記録でも確かめられません（`loaded_at_startup`）。`-E` / `-I` / `-S` で起動された python、環境を
-消したり PYTHONPATH を上書きしたりして起動した子、python 以外のプログラムには効かないので、その起動を数えて確認済み（実行）に
-しません（`child_processes` / `untraced_child_processes`）。3.12 より前は `threading.setprofile` を使うので、
+パッケージにはスタブが効かず、記録でも確かめられません（`loaded_at_startup`）。子プロセスは、Python の監査イベントで分かる起動（subprocess・os.spawn*・os.exec*・os.system・CreateProcess）を、親子の対応で確かめます（プロセスごとに、起動した数と、自分を親とする登録済みの子の数が合うか）。合わなければ全項目を確認済み（実行）にしません。`ctypes` で OS の API を直接呼ぶ起動、COM / WMI 経由の起動は検出できません。
+`-E` / `-I` / `-S` で起動された python、環境を消したり PYTHONPATH を上書きしたりして起動した子、python 以外のプログラム（cmd など）
+には起動用の仕組みが効かないので、親子の対応が合わず、確認済み（実行）にしません（その先の孫の python が登録されていても相殺しません。
+サブインタープリターは子孫として数えず、その中の起動の数を親のプロセスに足します）。検出は既知の経路に対するもので、完全ではありません。
+3.12 より前は `threading.setprofile` を使うので、
 `_thread.start_new_thread` で直接起動したスレッドの中は記録されません。ファイルの無いコードのうち、所属のモジュールを
 決められないもの（実在しない `__name__` のグローバルで exec し、最初の引数も所属を示さない関数: N12。実在しないファイル名で
 compile した関数: N13）は記録から所属のパッケージに数えられません（verify の差し替え実行では却下されます）。
@@ -305,7 +310,7 @@ mcp-pystub
   }
 ```
 
-> 出力例の数値は再測定中です。
+> 出力例の数値は説明用です（実測は上の「実証データ」）。
 
 #### verify
 
@@ -318,8 +323,12 @@ mcp-pystub
   {"passed": {"packages": [...], "submodules": [...], "nofollow": [...]},
    "rejected": [{"item": "...", "reason": "...", "module": "...", "error": "..."}],
    "unresolved": [...],          # 原因を特定できなかった項目（passed には入れない）
-   "entry_matched": true,        # run_entry=True のとき、エントリーの出力が元と一致したか
-   "note": "..."}                # run_entry=False では import だけを確かめ、実行は確かめていないこと
+   "entry_matched": true,        # run_entry=True のとき、エントリーの標準出力（バイト列の全体）と終了コードが元と一致したか
+   "status_summary": {"確認済み（実行）": [...], "import 確認済み": [...], "未確認": [...]},
+   "verified_sets": [...],       # どの組で確かめたか（そのまま適用する）
+   "child_processes": 0, "untraced_child_processes": 0,
+   "entry_conditions": {...},    # エントリーを起動したコマンド・作業フォルダ・普段との違い
+   "note": "..."}
 ```
 
 #### generate
@@ -377,14 +386,8 @@ mcp-pystub
 
 ## パフォーマンス / Performance
 
-> **再測定中**: 下の表は判定を 2 段に分ける前（v0.2.0）の値です。
-
-| プロジェクト規模 | 解析時間 | ノード数 |
-|-----------------|---------|---------|
-| 軽量 (click) | 335ms | 73 |
-| 中規模 (flask) | 1,743ms | 230 |
-| 重量級 (pandas) | 4,820ms | 491 |
-| 超重量級 (sympy) | 6,919ms | 681 |
+`C:\tmp\pystub-e2e` の 15 シナリオで、analyze は 1 シナリオ 2〜21 秒程度（第 1〜3 回の修正前の約 2 倍）、ピークメモリは最大 401 MB
+（11_sklearn。ほかは 400 MB 以下）。実行の記録の負荷は、記録しない実行の 1.1〜2.5 倍（10 シナリオ）。
 
 ## テスト / Testing
 
@@ -394,14 +397,29 @@ python -m pytest tests/ -v
 
 ### テスト実績
 
-| テスト種別 | 件数 | 結果 |
-|-----------|------|------|
-| ユニットテスト（tests/、攻撃シナリオの回帰を含む） | 351 | 全通過（第 9 回の時点） |
-| PyPI ライブラリ大規模テスト（requests, flask, pandas 等） | 84 | クラッシュ 0 |
-| PyInstaller exe ビルド + 動作テスト | 22 | **全 PASS** |
-| asammdf E2E（MDF作成→読取→リサンプリング） | 1 | **exe 40% 削減 + 正常動作** |
-| 復元テスト（バックアップ → 復元 → 検証） | 4 | 全成功 |
+| テスト種別 | 結果 |
+|-----------|------|
+| ユニットテスト（tests/、攻撃シナリオの回帰を含む） | 件数は下の変更履歴の版の時点の全件で全通過 |
+| 実ビルド（上の実証データの 6 本） | exe の出力一致・復元一致 |
 
 ## ライセンス / License
 
 MIT
+
+## 変更履歴 / Changelog
+
+### 0.3.0（未公開）
+
+- パッケージ名を `src` から `mcp_pystub` に変えた（`python -m mcp_pystub.trace` など）
+- 判定を 3 層に分けた: 静的解析（候補を出すだけ。保証ではない）・動的解析（`verify`、実行の記録）・実行時（止まるスタブ、終了コード 70）
+- 追加: `verify` ツール（import だけの確認が既定。`run_entry=True`・`record=True`・`trace_files`・`entry_args`・`cwd`・`timeout`）、
+  実行の記録（`python -m mcp_pystub.trace`）、条件付きの候補（`conditional` / `conditional_submodule_hints`、`confidence`）
+- 出力キーの追加: `summary`・`conditional`・`conditional_submodule_hints`・`conditional_omitted_small`・`verify_status`・`next_steps`・
+  `trace_conflicts`・`trace_candidates`（analyze）、`status_summary`・`statuses`・`verified_sets`・`baseline_failed`・`unresolved`・
+  `child_processes`・`untraced_child_processes`・`startup_loaded`・`blocked_entry_open`・`excluded_from_import`・`entry_conditions`（verify）。
+  既存のキー（`stubbable` / `nofollow` / `required` / `submodule_stub_hints`）の名前は変えていない
+- 適用・復元: 元ファイルは項目ごとの `_pystub_bak/<項目名>/` へ移す（重ねた適用でも元ファイルを失わない）
+
+### 0.2.0
+
+- C 拡張パッケージの間接排除（サブモジュールのスタブ）

@@ -140,38 +140,83 @@ def _kill(p: subprocess.Popen, job: _Job, in_job: bool) -> None:
 
 
 def read_procs(proc_dir: Path) -> list[dict]:
-    """起動用の仕組みが書いたプロセスごとの記録（root と子孫）。"""
+    """起動用の仕組みが書いたプロセスごとの記録（root と子孫）。サブインタープリターの起動の数は親のプロセスに足す。"""
     out = []
+    sub: dict[str, int] = {}
     if proc_dir.is_dir():
+        for f in sorted(proc_dir.glob("sublaunch_*.txt")):
+            try:
+                sub[f.stem.split("_", 1)[1]] = len(f.read_text(encoding="utf-8").split())
+            except OSError:
+                pass
         for f in sorted(proc_dir.glob("proc_*.json")):
             try:
-                out.append(json.loads(f.read_text(encoding="utf-8")))
+                rec = json.loads(f.read_text(encoding="utf-8"))
             except (OSError, ValueError):
-                out.append({"pid": f.stem, "role": "desc", "trace": None, "startup_loaded": [], "launched": None,
-                            "finished": False})
+                rec = {"pid": f.stem.split("_")[1] if "_" in f.stem else f.stem, "role": "desc", "trace": None,
+                       "startup_loaded": [], "launched": None, "finished": False}
+            n = sub.get(str(rec.get("pid")), 0)
+            if n and rec.get("launched") is not None:
+                rec["launched"] = int(rec["launched"]) + n
+            out.append(rec)
     return out
 
 
 def summarize_procs(procs: list[dict], recording: bool) -> dict:
-    """子孫のプロセスの数と、記録・差し込みの効かなかった（数の合わない）子の数。
+    """子孫のプロセスの数と、記録・差し込みの効かなかった（親子の対応が合わない）プロセスの数。
 
-    launched = 監査フックで数えたプロセスの起動（subprocess / os.spawn* / os.exec* / os.system / CreateProcess 等）。
-    起動した数より、起動用の仕組みで登録された子孫が少なければ、その差は記録・差し込みの効かなかった子
-    （環境を消した・-E / -I / -S・PYTHONPATH の上書き・python 以外のプログラム）。
+    各プロセスは、自分の pid・親の pid・自分が起動した子の数（監査フックで数えた subprocess / os.spawn* / os.exec* /
+    os.system / CreateProcess 等）を書く。プロセスごとに「起動した数 = 自分を親とする登録済みの子の数」を確かめ、
+    合わないプロセスを数える（python 以外の子・環境を消した子・-E / -I / -S の子は登録されないので合わない。
+    その先の孫の python が登録されていても、親は登録されていないプロセスなので相殺しない）。
     """
-    desc = [p for p in procs if p.get("role") != "root"]
-    launched = 0
-    unknown = 0
+    pids = {str(p.get("pid")) for p in procs}
+    kids: dict[str, int] = {}
+    orphans = 0
+    for p in procs:
+        if p.get("role") == "root":
+            continue
+        pp = str(p.get("ppid"))
+        if pp in pids:
+            kids[pp] = kids.get(pp, 0) + 1
+        else:
+            orphans += 1  # 親が登録されていない（python 以外・効かなかった python の子）
+    mismatched = 0
     for p in procs:
         if p.get("launched") is None:
-            unknown += 1  # 終わり方が分からない（止められた等）: その子の起動の数は分からない
-        else:
-            launched += int(p["launched"])
-    untraced = max(0, launched - len(desc)) + unknown
+            mismatched += 1  # 終わり方が分からない（止められた等）: 起動の数が分からない
+        elif int(p["launched"]) != kids.get(str(p.get("pid")), 0):
+            mismatched += 1
+    untraced = mismatched + orphans
     if recording:
-        untraced += sum(1 for p in desc if p.get("launched") is not None and not p.get("trace"))
-    return {"child_processes": len(desc), "launched": launched, "untraced_child_processes": untraced,
+        untraced += sum(1 for p in procs if p.get("role") != "root" and p.get("launched") is not None
+                        and not p.get("trace"))
+    desc = [p for p in procs if p.get("role") != "root"]
+    return {"child_processes": len(desc), "launched": sum(int(p.get("launched") or 0) for p in procs),
+            "untraced_child_processes": untraced, "mismatched_processes": mismatched, "orphan_processes": orphans,
             "root_seen": any(p.get("role") == "root" for p in procs)}
+
+
+def cleanup_stale_temp(max_age_s: float = 86400.0) -> int:
+    """呼び出し元が強制終了されて残った一時フォルダ（作成から 1 日以上たった pystub_verify_* / pystub_boot_*）を消す。"""
+    import tempfile
+    n = 0
+    now = time.time()
+    try:
+        cands = list(Path(tempfile.gettempdir()).glob("pystub_verify_*")) + \
+            list(Path(tempfile.gettempdir()).glob("pystub_boot_*"))
+    except OSError:
+        return 0
+    for d in cands:
+        try:
+            st = d.stat()
+            born = getattr(st, "st_birthtime", None) or (st.st_ctime if sys.platform == "win32" else st.st_mtime)
+            if d.is_dir() and now - born >= max_age_s:
+                shutil.rmtree(d, ignore_errors=True)
+                n += 0 if d.exists() else 1
+        except OSError:
+            pass
+    return n
 
 
 def rmtree_retry(p: Path) -> None:

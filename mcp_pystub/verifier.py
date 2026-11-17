@@ -8,10 +8,11 @@
 - まずスタブ無しで同じ import を行い（基準）、スタブありで新たに失敗したものを「スタブが原因」とする
 - 失敗の原因になったスタブを外して繰り返し、検証を通った組を返す
 - エントリーの実行は run_entry=True のときだけ。普段の起動（python entry.py 引数…、標準出力はファイル）と同じ条件の
-  子プロセスで動かし、標準出力のバイト列の全体と終了コードを基準と比べる（違いは PYTHONPATH の先頭の起動用フォルダと
-  環境変数 MCP_PYSTUB_BOOT だけ）
+  子プロセスで動かし、標準出力のバイト列の全体と終了コードを基準と比べる（主な違いは PYTHONPATH の先頭の起動用フォルダと
+  環境変数 MCP_PYSTUB_BOOT の 2 つ。ほかは README の表）
 - import の確認は別の子プロセスで行い、エントリーのスクリプトは動かさない（エントリーを import するローカルの
-  モジュールは対象から外し、import の途中でエントリーのファイルを開く操作は監査フックで止める）
+  モジュールは対象から外し、import の途中でエントリーのファイルを open で開く操作は、ファイルの同一性で見分けて監査フックで止める。
+  OS のコピー API・ctypes・外部コマンドでの読み込みは止められない）
 """
 
 from __future__ import annotations
@@ -223,6 +224,8 @@ def _blame(rec: dict, items: dict[str, dict]) -> list[str]:
 def verify(*args, **kwargs) -> dict:
     """スタブ（とサブモジュールのヒント・nofollow）に差し替えた状態で、実際に import して確かめる（_verify の後始末つき）。"""
     holder: list[Path] = []
+    from mcp_pystub.proc import cleanup_stale_temp
+    cleanup_stale_temp()  # 呼び出し元が強制終了されて残った古い一時フォルダ（1 日以上前）を消す
     try:
         return _verify(holder, *args, **kwargs)
     finally:
@@ -643,11 +646,11 @@ def _verify(
                 "全ての実行経路の保証ではありません。ビルド後の実行確認も行ってください。"
                 + "import の確認は別の子プロセスで行い、グラフ上のモジュールの直下のコード（import 時のコード）は動きますが、"
                 "エントリーのスクリプトは動かしません（エントリーを import するローカルのモジュールは対象から外し、import の途中で"
-                "エントリーのファイルを開く操作は監査フックで止めます）。"
+                "エントリーのファイルを開く操作は監査フックで止めます。Python の `open` を通る読み込みは、別名（短いパス名・`\\?\`・UNC・ハードリンク）でも、ファイルの同一性で見分けて止めます。OS のコピー API（`shutil.copy2` の CopyFile2 など）、ctypes、外部コマンド（`cmd /c type` 等）での読み込みと、それでコピーしたファイル経由の import（zipimport 等）は止められません）。"
                 + ("" if not run_entry else
                    "エントリーは、標準出力をファイルにつないだ普段の実行（" + " ".join(ecmd[1:]) + "、作業フォルダ " + ecwd +
                    "）と同じ条件で動かし、標準出力のバイト列の全体（子孫のプロセス・atexit の出力も含む）と終了コードを比べます。"
-                   "普段と違うのは PYTHONPATH の先頭の起動用フォルダと環境変数 MCP_PYSTUB_BOOT だけで、標準入力は空"
+                   "主な違いは PYTHONPATH の先頭の起動用フォルダと環境変数 MCP_PYSTUB_BOOT の 2 つで（ほかは README の表）、標準入力は空"
                    "（DEVNULL）です。標準エラー・ファイル・通信は比べません。終わった後・timeout の時は孫を含むプロセスの木を止めます。"),
     }
     return out

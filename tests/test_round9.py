@@ -129,3 +129,30 @@ def test_entry_sees_normal_conditions(tmp_path):
     assert lines[3] == "[]"  # 普段は無い
     assert v["entry_matched"] is True, v
     assert v["entry_conditions"]["stdout_head"].splitlines()[:3] == lines[:3], (v["entry_conditions"], lines)
+
+
+def test_stale_temp_cleanup(tmp_path, monkeypatch):
+    """1 日以上前の pystub_verify_* / pystub_boot_* を次の開始時に消す（新しいものは消さない）"""
+    from mcp_pystub import proc
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+    old = tmp_path / "pystub_verify_old"
+    new = tmp_path / "pystub_boot_new"
+    old.mkdir()
+    new.mkdir()
+    assert proc.cleanup_stale_temp(max_age_s=86400.0) == 0
+    assert proc.cleanup_stale_temp(max_age_s=-1) == 2
+    assert not old.exists() and not new.exists()
+
+
+def test_summarize_procs_parent_child():
+    from mcp_pystub.proc import summarize_procs
+    root = {"pid": 1, "ppid": 0, "role": "root", "launched": 1, "trace": {"executed": []}}
+    ok = [root, {"pid": 2, "ppid": 1, "role": "desc", "launched": 0, "trace": {"executed": []}}]
+    assert summarize_procs(ok, True)["untraced_child_processes"] == 0
+    # cmd（登録されない）の下の python: 親が登録されていない + root の起動の数が合わない
+    cmd = [dict(root), {"pid": 3, "ppid": 99, "role": "desc", "launched": 0, "trace": {"executed": []}}]
+    assert summarize_procs(cmd, True)["untraced_child_processes"] == 2
+    # -I の子（登録されない）が普通の孫を起動: 合計では合うが、親子の対応では合わない
+    i_child = [{"pid": 1, "ppid": 0, "role": "root", "launched": 1, "trace": {"executed": []}},
+               {"pid": 5, "ppid": 4, "role": "desc", "launched": 0, "trace": {"executed": []}}]
+    assert summarize_procs(i_child, True)["untraced_child_processes"] >= 1

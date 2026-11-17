@@ -260,3 +260,43 @@ def test_round9_import_only_never_runs_entry_90(tmp_path):
     n, bad = line.split(" ", 2)[1], line.split(" bad ", 1)[1]
     assert n == "90"
     assert json.loads(bad) == {}, bad
+
+
+# 第 10 回: 子プロセスは親子の対応で数える（A3 / A3b / A4 / A8）。直さない形は制限として名前を挙げ、README の該当の文と対応づける
+G9_FIXED = ["A3_I_child_spawns_grandchild", "A3b_E_child_spawns_grandchild", "A4_cmd_two_pythons", "A8_subinterp_plus_I_child"]
+# 制限（直さない）: 名前 -> README に書いてある文（その文が README にあることも確かめる）
+G9_LIMITATIONS = {
+    "A2_sitecustomize_branch": "`import sitecustomize` が成功する",
+    "A2b_atexit_count_branch": "atexit の登録が 1 つ増える",
+    "A5_ctypes_createprocess_I": "`ctypes` で OS の API を直接呼ぶ起動",
+    "A6_metadata_file_read": "元のパッケージのファイルがディスクに残る",
+    "A7b_stdout_fifo_branch": "`isatty` や FIFO かどうかで分岐するプログラム",
+}
+F4C_LIMITATIONS = {
+    "copy2": "OS のコピー API", "ctypes_createfile": "ctypes", "cmd_type": "外部コマンド", "zipimport": "OS のコピー API",
+}
+
+
+def test_round10_parent_child_matching(tmp_path):
+    rows = _summary_rows(_run_args("g9.py", tmp_path, [], plain_env=True))
+    got = {r[0]: r for r in rows}
+    assert len(rows) == 18, len(rows)
+    for n in G9_FIXED:
+        assert got[n][1] == [], got[n]
+    bad = [r[0] for r in rows if r[2] is True]
+    assert set(bad) <= set(G9_LIMITATIONS), bad  # 確認済み（実行）を適用して変わるのは、文書に書いた制限だけ
+
+
+def test_round10_limitations_are_documented():
+    readme = (Path(__file__).resolve().parent.parent / "README.md").read_text(encoding="utf-8")
+    for name, text in {**G9_LIMITATIONS, **F4C_LIMITATIONS}.items():
+        assert text in readme, (name, text)
+
+
+def test_round10_entry_open_by_identity(tmp_path):
+    out = _run_args("f4c.py", tmp_path, [], plain_env=True)
+    line = [l for l in out.splitlines() if l.startswith("SUMMARY ")][0]
+    parts = line.split(" ", 4)
+    assert parts[1] == "34"
+    bad = {k.split("/")[0] for k in json.loads(parts[4])}
+    assert bad == set(F4C_LIMITATIONS), bad  # 8.3 形式・\\?\・UNC・ハードリンクは 0 件、残るのは制限の 4 形だけ

@@ -168,6 +168,7 @@ def _analyze(entry_point: str, python_path: str, max_depth: int, include_small_c
         "任意: エントリーを動かしても安全な時（副作用が無い・試験用の引数や入力がある）だけ、run_entry=True や実行の記録"
         "（python -m mcp_pystub.trace）でより強く確かめられます。",
         "この結果は静的解析による候補です（実行の保証ではありません）。verify は site-packages を書き換えません。",
+        "確認済み（実行）は、下の表の違いの範囲で、動かした入力について確かめた結果です。配布前に、ビルドした exe を普段のやり方で試してください。",
     ]
 
     return result_dict
@@ -493,6 +494,7 @@ def _summary(rd: dict, entry: str, python_path: str, required: list) -> dict:
             r for _, _, r in cond_recs if not r.startswith("[high]")],
         "next_steps": steps,
         "note": "stubbable / submodule_stub_hints は静的解析で使用が見つからなかった候補、[high] / [low] は条件付きの候補です。どちらも保証ではありません。実際に外せるかは verify（既定は import だけ）とビルド後の実行で確かめます。エントリーを動かして安全なら run_entry=True と実行の記録でより強く確かめられます。",
+        "closing_note": "確認済み（実行）は、下の表の違いの範囲で、動かした入力について確かめた結果です。配布前に、ビルドした exe を普段のやり方で試してください。",
         "size_note": "MB はインストール済みのファイルの大きさ（__pycache__ を除く）で、exe の削減量ではありません"
                      "（PyInstaller が同梱する範囲・圧縮で変わります）。",
     }

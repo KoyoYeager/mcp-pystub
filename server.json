@@ -6,12 +6,12 @@
     "url": "https://github.com/KoyoYeager/mcp-pystub",
     "source": "github"
   },
-  "version": "0.1.1",
+  "version": "0.3.0",
   "packages": [
     {
       "registryType": "pypi",
       "identifier": "mcp-pystub",
-      "version": "0.1.1",
+      "version": "0.3.0",
       "transport": {
         "type": "stdio"
       }

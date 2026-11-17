@@ -309,6 +309,55 @@ def observe(trace: dict, target: str, site_packages: list[str]) -> dict:
 
 BOOT = r'''
 # mcp-pystub の起動時の差し込み（verify・実行の記録のプロセスと、その子孫）。環境変数 MCP_PYSTUB_BOOT の設定を読む。
+def _effective_ppid(pd):
+    """親のプロセス。venv の python.exe（起動を中継するだけのランチャー）が間にあり、そのランチャーが登録されていない時は、
+    ランチャーの親を親とする（Windows）。python 以外（cmd など）の親はそのまま（その親は登録されないので数が合わない）。"""
+    import os, sys
+    ppid = os.getppid()
+    if sys.platform != "win32" or not pd:
+        return ppid
+    if sys.executable == getattr(sys, "_base_executable", sys.executable):
+        return ppid
+    import glob
+    if glob.glob(os.path.join(pd, f"proc_{ppid}_*.json")):
+        return ppid
+    before = set(sys.modules)
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class PE(ctypes.Structure):
+            _fields_ = [("dwSize", wintypes.DWORD), ("cntUsage", wintypes.DWORD), ("th32ProcessID", wintypes.DWORD),
+                        ("th32DefaultHeapID", ctypes.c_size_t), ("th32ModuleID", wintypes.DWORD),
+                        ("cntThreads", wintypes.DWORD), ("th32ParentProcessID", wintypes.DWORD),
+                        ("pcPriClassBase", ctypes.c_long), ("dwFlags", wintypes.DWORD), ("szExeFile", ctypes.c_wchar * 260)]
+        k = ctypes.WinDLL("kernel32")
+        k.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+        k.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+        k.Process32FirstW.argtypes = [wintypes.HANDLE, ctypes.POINTER(PE)]
+        k.Process32NextW.argtypes = [wintypes.HANDLE, ctypes.POINTER(PE)]
+        k.CloseHandle.argtypes = [wintypes.HANDLE]
+        h = k.CreateToolhelp32Snapshot(2, 0)
+        e = PE()
+        e.dwSize = ctypes.sizeof(PE)
+        found = None
+        ok = k.Process32FirstW(h, ctypes.byref(e))
+        while ok:
+            if e.th32ProcessID == ppid:
+                found = (e.th32ParentProcessID, e.szExeFile)
+                break
+            ok = k.Process32NextW(h, ctypes.byref(e))
+        k.CloseHandle(h)
+        if found and os.path.normcase(found[1]) == os.path.normcase(os.path.basename(sys.executable)):
+            return found[0]
+        return ppid
+    except Exception:
+        return ppid
+    finally:
+        for m in set(sys.modules) - before:  # 起動用に読み込んだもの（ctypes）は sys.modules から外す
+            sys.modules.pop(m, None)
+
+
 def _pystub_boot():
     import json, os, sys
     raw = os.environ.get("MCP_PYSTUB_BOOT")
@@ -321,8 +370,10 @@ def _pystub_boot():
         return
     path, _, role = raw.partition("#")
     root = role == ""
-    if root:
-        os.environ["MCP_PYSTUB_BOOT"] = path + "#d"  # これより後に起動する子孫は root ではない（同じ変数の値だけ変える）
+    # 同じプロセスのサブインタープリター（値の末尾の pid が自分）: 子孫として登録しない。起動の数だけ親に足す
+    sub = role.startswith("d") and role[1:] == str(os.getpid())
+    if not sub:
+        os.environ["MCP_PYSTUB_BOOT"] = path + "#d" + str(os.getpid())  # 子孫は root ではない（同じ変数の値だけ変える）
     try:
         with open(path, encoding="utf-8") as fh:
             cfg = json.load(fh)
@@ -335,6 +386,10 @@ def _pystub_boot():
     ebase = os.path.normcase(os.path.basename(entry)) if entry else ""
     stem = os.path.splitext(os.path.basename(entry))[0] if entry else ""
     guard = bool(cfg.get("entry_guard"))
+    try:
+        est = os.stat(entry) if (guard and entry) else None
+    except OSError:
+        est = None
 
     def _under(n, p):
         return n == p or n.startswith(p + ".")
@@ -374,28 +429,52 @@ def _pystub_boot():
     else:
         LAUNCH = {"subprocess.Popen", "os.system", "os.spawn", "os.exec", "os.posix_spawn", "os.fork", "os.forkpty"}
     state = {"launched": 0, "blocked": []}
+    pd = cfg.get("proc_dir")
+
+    def _same_as_entry(s):
+        # 名前でなくファイルの同一性で比べる（短いパス名・\\?\・UNC・ハードリンクでも同じファイル）
+        try:
+            st = os.stat(s)
+        except Exception:
+            return False
+        if est is not None:
+            if st.st_size != est.st_size:
+                return False
+            if st.st_ino and est.st_ino and (st.st_dev, st.st_ino) == (est.st_dev, est.st_ino):
+                return True
+        try:
+            return os.path.normcase(os.path.realpath(s)) == nentry
+        except Exception:
+            return False
 
     def _hook(ev, args):
         if ev in LAUNCH:
             state["launched"] += 1
+            if sub and pd:
+                try:
+                    with open(os.path.join(pd, f"sublaunch_{os.getpid()}.txt"), "a") as fh:
+                        fh.write("1\n")
+                except Exception:
+                    pass
         elif guard and ev == "open" and args:
             p = args[0]
             if isinstance(p, (str, bytes)) or hasattr(p, "__fspath__"):
                 try:
                     s = os.fsdecode(p)
-                    if os.path.normcase(os.path.basename(s)) != ebase:
-                        return
-                    if os.path.normcase(os.path.realpath(s)) != nentry:
-                        return
                 except Exception:
+                    return
+                if not _same_as_entry(s):
                     return
                 cur = sys._pystub_boot.get("current", "") if hasattr(sys, "_pystub_boot") else ""
                 state["blocked"].append(cur)
                 raise PermissionError(f"import だけの確認ではエントリーのスクリプトを開きません: {s} (blocked by verify)")
     sys.addaudithook(_hook)
-    pd = cfg.get("proc_dir")
-    info = {"pid": os.getpid(), "role": "root" if root else "desc", "startup_loaded": loaded, "launched": None,
-            "trace": None, "finished": False}
+    if sub:
+        sys._pystub_boot = {"root": False, "startup_loaded": loaded, "rec": None, "trm": None, "state": state,
+                            "current": "", "subinterpreter": True}
+        return
+    info = {"pid": os.getpid(), "ppid": _effective_ppid(pd), "role": "root" if root else "desc",
+            "startup_loaded": loaded, "launched": None, "trace": None, "finished": False}
     sys._pystub_boot = {"root": root, "startup_loaded": loaded, "rec": rec, "trm": trm, "state": state, "current": ""}
     if not pd:
         return
@@ -438,7 +517,7 @@ def _pystub_boot():
 
 
 _pystub_boot()
-del _pystub_boot
+del _pystub_boot, _effective_ppid
 import sys as _s
 _me = _s.modules.pop("sitecustomize", None)
 try:
@@ -500,6 +579,7 @@ def main(argv: list[str] | None = None) -> int:
     else:
         cmd = [sys.executable] + args
         entry_file = os.path.abspath(args[0])
+    _proc.cleanup_stale_temp()  # 呼び出し元が強制終了されて残った古い一時フォルダ（1 日以上前）を消す
     work = Path(tempfile.mkdtemp(prefix="pystub_boot_"))
     rc: int | None = 1
     try:
