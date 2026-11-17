@@ -475,6 +475,46 @@ def decorator_registers(fn: ast.AST, strict: bool = False) -> bool:
     return False
 
 
+def _registers_names(fn: ast.AST, names: set[str]) -> bool:
+    """対象（names）を入れ物・属性に入れるか（names は対象を閉じ込めた wrapper なども含む）。"""
+    for n in ast.walk(fn):
+        if isinstance(n, (ast.Assign, ast.AugAssign)) and n.value is not None and \
+                isinstance(n.value, ast.Name) and n.value.id in names:
+            targets = n.targets if isinstance(n, ast.Assign) else [n.target]
+            if any(isinstance(t, ast.Subscript) or (isinstance(t, ast.Attribute) and not t.attr.startswith("__")
+                                                    and not (isinstance(t.value, ast.Name) and t.value.id in names))
+                   for t in targets):
+                return True
+        if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) and n.func.attr in _REGISTER_ATTRS and any(
+                isinstance(y, ast.Name) and y.id in names for a in list(n.args) + [k.value for k in n.keywords]
+                for y in ast.walk(a)):
+            return True
+    return False
+
+
+def _wraps_target(v: ast.AST, names: set[str]) -> bool:
+    """値 v が対象そのものを包むか（Wrap(f) / [f] / {k: f} / lambda: f()）。f.__name__ のような対象の属性は包まない。"""
+    if isinstance(v, ast.Name):
+        return v.id in names
+    if isinstance(v, ast.Lambda):
+        return any(isinstance(y, ast.Name) and y.id in names for y in ast.walk(v.body))
+    if isinstance(v, ast.Call):
+        return any(_wraps_target(a, names) for a in list(v.args) + [k.value for k in v.keywords])
+    if isinstance(v, (ast.List, ast.Tuple, ast.Set)):
+        return any(_wraps_target(a, names) for a in v.elts)
+    if isinstance(v, ast.Dict):
+        return any(_wraps_target(a, names) for a in v.values if a is not None)
+    return False
+
+
+def _returns_param_only(fn: ast.AST, params: set[str]) -> bool:
+    """関数が渡された対象をそのまま返すだけ（ほかに使わない）か。"""
+    uses = [y for y in ast.walk(fn) if isinstance(y, ast.Name) and y.id in params and isinstance(y.ctx, ast.Load)]
+    rets = [n for n in ast.walk(fn) if isinstance(n, ast.Return)]
+    return bool(rets) and all(isinstance(r.value, ast.Name) and r.value.id in params for r in rets) and \
+        len(uses) == len(rets)
+
+
 def decorator_escapes(fn: ast.AST, depth: int = 0) -> bool:
     """デコレータ関数 fn（def）が引数の関数を保持・登録・その場で呼ぶか。
 
@@ -1143,6 +1183,89 @@ class Program:
         self._plain_cache[key] = ok  # type: ignore[index]
         return ok
 
+    _NO_ESCAPE_CALLS = frozenset({"wraps", "update_wrapper", "cast", "isinstance", "issubclass", "callable", "getattr", "hasattr",
+                                  "len", "repr", "str", "print", "id", "type", "iter", "next", "format", "vars", "dir",
+                                  "signature", "getdoc", "cleandoc", "dedent", "indent", "iscoroutinefunction",
+                                  "isgeneratorfunction", "isclass", "isfunction", "ismethod", "getmodule", "getsourcefile",
+                                  "warn", "debug", "info", "warning", "error"})
+
+    def decorator_escapes_target(self, info: ModuleInfo, fn: ast.AST, depth: int = 0,
+                                 target_params: set[str] | None = None) -> bool:
+        """デコレータ（工場を含む）fn の中で、飾られる対象（関数・クラス）が逃げ出すか（登録と見なす）。
+
+        逃げ出す = (a) 別の関数の引数に渡される（3 段まで追う。wraps / update_wrapper・対象をそのまま返すだけの関数は除く）、
+        (b) 入れ物・属性に入れられる（対象を包んだ値の setattr も含む）、(c) 対象を閉じ込めた wrapper / lambda が (a)(b)。
+        追い切れない（解析できない関数に渡す・3 段を超える）なら逃げ出すとみなす。
+        """
+        if depth > 3 or not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+            return True
+        params: set[str] = set(target_params or ())
+        if target_params is None:
+            for n in ast.walk(fn):
+                if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+                    params.update(a.arg for a in n.args.posonlyargs + n.args.args + n.args.kwonlyargs)
+        # (c) 対象を閉じ込めた入れ子の関数・lambda・対象を包んだ値も、対象と同じに扱う
+        changed = True
+        while changed:
+            changed = False
+            for n in ast.walk(fn):
+                if n is fn:
+                    continue
+                if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name not in params and any(
+                        isinstance(y, ast.Name) and y.id in params for y in ast.walk(n)):
+                    params.add(n.name)
+                    changed = True
+                elif isinstance(n, ast.Assign) and _wraps_target(n.value, params):
+                    for t in n.targets:
+                        if isinstance(t, ast.Name) and t.id not in params:
+                            params.add(t.id)
+                            changed = True
+        if decorator_registers(fn) or _registers_names(fn, params):
+            return True  # (b)
+        for n in ast.walk(fn):
+            if not isinstance(n, ast.Call):
+                continue
+            args = list(n.args) + [k.value for k in n.keywords]
+            direct = [i for i, a in enumerate(n.args) if isinstance(a, ast.Name) and a.id in params]
+            if not direct and not any(isinstance(a, ast.Name) and a.id in params for a in args):
+                continue
+            last = _decorator_last_name(n.func)
+            if last in self._NO_ESCAPE_CALLS or last in _TRANSPARENT_DECORATORS:
+                continue
+            if isinstance(n.func, ast.Name) and n.func.id in params:
+                continue  # 対象そのものの呼び出し
+            r = self.ref_of_expr(info, n.func, None)
+            if r is not None and r.kind in ("function", "method") and not r.alts:
+                cinfo = self.get(r.module)
+                cnode = self.function_node(cinfo, r.target) if cinfo is not None else None
+                if cnode is None:
+                    return True
+                cparams = [a.arg for a in cnode.args.posonlyargs + cnode.args.args]
+                if r.kind == "method" and cparams:
+                    cparams = cparams[1:]
+                passed = {cparams[i] for i in direct if i < len(cparams)}
+                if not passed:
+                    passed = set(cparams)
+                if _returns_param_only(cnode, passed):
+                    continue
+                if self.decorator_escapes_target(cinfo, cnode, depth + 1, passed):  # type: ignore[arg-type]
+                    return True
+                continue
+            if r is not None and r.kind in ("builtin_value", "external") and r.module in ("builtins",):
+                continue
+            return True  # 解析できない関数に渡す: 追い切れない（a）
+        # 工場が別の関数の結果を返す（return _register_accessor(name, DataFrame)）: その関数を追う
+        if target_params is None:
+            for n in ast.walk(fn):
+                if isinstance(n, ast.Return) and isinstance(n.value, ast.Call):
+                    r = self.ref_of_expr(info, n.value.func, None)
+                    if r is not None and r.kind in ("function", "method") and not r.alts:
+                        cinfo = self.get(r.module)
+                        cnode = self.function_node(cinfo, r.target) if cinfo is not None else None
+                        if cnode is None or self.decorator_escapes_target(cinfo, cnode, depth + 1):  # type: ignore[arg-type]
+                            return True
+        return False
+
     def class_is_plain(self, module: str, qual: str, depth: int = 0) -> bool:
         """基底が object か解析対象の単純なクラスだけで、metaclass 指定が無いか。"""
         key = (module, qual)
@@ -1662,7 +1785,9 @@ class _UnitWalker:
         if r is not None and r.kind in ("function", "method") and not r.alts:
             dinfo = self.p.get(r.module)
             dnode = self.p.function_node(dinfo, r.target) if dinfo is not None else None
-            return dnode is not None and decorator_registers(dnode, strict=strict)
+            return dnode is None or self.p.decorator_escapes_target(dinfo, dnode)  # type: ignore[arg-type]
+        if r is None or r.kind in ("missing", "opaque") or (r.kind == "external" and r.module.split(".")[0] not in _STDLIB):
+            return True  # 解析できない（第三者の）クラスデコレータ: 追い切れないので登録と見なす
         if r is not None and r.kind in ("derived", "unknown", "instance") and not r.alts and isinstance(target, ast.Name):
             return True  # 関数が作って返したデコレータを名前に入れたもの（hook = make_registrar(); @hook）
         return isinstance(target, ast.Attribute) and (target.attr in _REGISTRY_DECORATOR_NAMES
@@ -1905,14 +2030,18 @@ class _UnitWalker:
                 dnode = self.p.function_node(dinfo, r.target) if dinfo is not None else None
                 if dnode is not None and not decorator_escapes(dnode):
                     continue
-                if dnode is not None and decorator_registers(dnode):
-                    registry = True
+                if dnode is None or self.p.decorator_escapes_target(dinfo, dnode):  # type: ignore[arg-type]
+                    registry = True  # 飾られる関数が逃げ出す（追い切れないものも）: 登録の仕組み
             elif r is not None and r.kind == "method" and not r.alts:
                 # インスタンスのメソッドのデコレータ（@bus.listen）: 中身で登録を確かめる
                 dinfo = self.p.get(r.module)
                 dnode = self.p.function_node(dinfo, r.target) if dinfo is not None else None
-                if dnode is not None and decorator_registers(dnode):
+                if dnode is None or self.p.decorator_escapes_target(dinfo, dnode):  # type: ignore[arg-type]
                     registry = True
+            elif r is None or r.kind in ("missing", "opaque") or (
+                    r.kind == "external" and r.module.split(".")[0] not in _STDLIB):
+                if not (r is not None and r.module.split(".")[0] in _CLASS_TRANSFORM_LIBS):
+                    registry = True  # 解析できないデコレータ（第三者のもの）: 追い切れないので登録と見なす
             elif r is not None and r.kind in ("derived", "unknown", "instance") and not r.alts and isinstance(target, ast.Name):
                 registry = True  # 関数が作って返したデコレータ（hook = make_registrar()）: 登録の仕組みとみなす
             elif isinstance(target, ast.Attribute) and (target.attr in _REGISTRY_DECORATOR_NAMES

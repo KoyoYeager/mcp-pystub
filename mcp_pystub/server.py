@@ -160,6 +160,8 @@ def verify(
     nofollow: list[str] | None = None,
     run_entry: bool = False,
     timeout: float = 900.0,
+    entry_args: list[str] | None = None,
+    cwd: str = "",
 ) -> dict:
     """スタブに差し替えた状態を、対象環境の python で実際に import して確かめます（任意実行）。
 
@@ -175,13 +177,16 @@ def verify(
         nofollow: 除外して確かめるパッケージ（省略時は analyze の nofollow）
         run_entry: True ならエントリー本体も実行して出力を元と比べる（False では import だけを確かめる）
         timeout: 子プロセス 1 回あたりの制限時間（秒）
+        entry_args: エントリーに渡す引数（sys.argv[1:]。既定は空）
+        cwd: エントリーを実行する作業フォルダ（既定はエントリーのあるフォルダ）
 
     Returns:
         passed: 検証を通った組 / rejected: 外した項目と失敗の原文 / unresolved: 原因を特定できなかった項目
         （passed には入れない）/ entry_matched・entry_note: エントリーの出力の一致（確かめていない時はその旨）
     """
     from mcp_pystub.verifier import verify as _verify
-    return _verify(entry_point, python_path, packages, submodules, nofollow, run_entry, timeout=timeout)
+    return _verify(entry_point, python_path, packages, submodules, nofollow, run_entry, timeout=timeout,
+                   entry_args=entry_args, cwd=cwd)
 
 
 def main() -> None:

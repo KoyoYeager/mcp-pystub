@@ -69,6 +69,12 @@ for m in cfg["targets"]:
         emit({"m": m, "ok": False, "err": f"{type(e).__name__}: {e}"[:800], "tb": traceback.format_exc()[-3000:]})
 if cfg["run_entry"]:
     emit({"start": "<entry>"})
+    # 普段の実行（python <エントリー> <引数>、エントリーのあるフォルダで）と同じ条件にする
+    sys.argv = [cfg["entry"]] + list(cfg.get("entry_args") or [])
+    try:
+        os.chdir(cfg.get("cwd") or os.path.dirname(cfg["entry"]))
+    except OSError:
+        pass
     buf = io.StringIO()
     old = sys.stdout
     sys.stdout = buf
@@ -188,6 +194,8 @@ def verify(
     max_depth: int = 10,
     timeout: float = 900.0,
     max_rounds: int = 8,
+    entry_args: list[str] | None = None,
+    cwd: str = "",
 ) -> dict:
     """スタブ（とサブモジュールのヒント・nofollow）に差し替えた状態で、実際に import して確かめる。
 
@@ -287,7 +295,8 @@ def verify(
             prefixes += items[k]["prefixes"]
             block += items[k]["block"]
         return {"stubs": stubs, "prefixes": prefixes, "block": block, "targets": tgts, "sys_path": sys_path,
-                "entry": str(entry), "run_entry": run_entry}
+                "entry": str(entry), "run_entry": run_entry, "entry_args": list(entry_args or []),
+                "cwd": str(Path(cwd).resolve()) if cwd else str(Path(entry).parent)}
 
     def run_all(keys: list[str], tgts: list[str]) -> tuple[dict[str, dict], list[str]]:
         """固まるモジュールは飛ばして最後まで import する。"""
@@ -311,6 +320,7 @@ def verify(
         return res, hung
 
     base, base_hung = run_all([], targets)
+    base_child = dict(_LAST_CHILD)  # 基準の子プロセス全体の終了コード・標準エラー（エントリーの後の atexit も含む）
     ok_targets = [m for m in targets if base.get(m, {}).get("ok")]
     base_entry = base.get("<entry>")
     entry_note = ""
@@ -319,11 +329,29 @@ def verify(
         recs, t_out = _run_child(py, cfg_for([], []), work, timeout)
         r0, _l, _d = _results(recs)
         base_entry = r0.get("<entry>")
+        base_child = dict(_LAST_CHILD)
         if base_entry is None:
             entry_note = ("基準（スタブなし）のエントリー実行が" + ("時間内に終わらない" if t_out else "できない")
                           + "ため、エントリーの出力の一致は確かめていません")
 
-    active = [k for k in items]
+    # 基準（スタブなし）が失敗したら、何も通さない（比べる元が無い: 第 7 回）
+    baseline_failed = None
+    why_b = (base_child.get("stderr") or "").strip()
+    if targets and not ok_targets:
+        baseline_failed = {"reason": "基準（スタブなし）で import できたモジュールが 0 件です",
+                           "rc": base_child.get("rc"), "stderr_tail": why_b[-800:]}
+    elif run_entry and base_entry is None:
+        baseline_failed = {"reason": "基準（スタブなし）でエントリーが最後まで実行されませんでした",
+                           "rc": base_child.get("rc"), "stderr_tail": why_b[-800:]}
+    elif run_entry and (base_entry.get("rc") not in (0, None) or base_child.get("rc") not in (0, None)):
+        baseline_failed = {"reason": f"基準（スタブなし）のエントリーが終了コード "
+                                     f"{base_entry.get('rc')}（子プロセス全体 {base_child.get('rc')}）で終わりました",
+                           "rc": base_child.get("rc"), "stderr_tail": ((base_entry.get("err") or "") + why_b)[-800:]}
+    if baseline_failed is not None:
+        baseline_failed["hint"] = ("エントリーが引数・入力ファイル・作業フォルダを必要とするなら entry_args / cwd を指定して"
+                                   "ください。メモリ不足などで基準の実行が途中で終わった場合は、空きを確保して回し直してください")
+
+    active = [k for k in items] if baseline_failed is None else []
     rejected: list[dict] = list(errors)
     rounds = 0
     last_res: dict[str, dict] = {}
@@ -347,7 +375,13 @@ def verify(
         miss = [m for m in tg if m not in res]
         if run_entry and base_entry is not None:
             er = res.get("<entry>")
-            if er is None or er.get("rc") != base_entry.get("rc") or er.get("stdout") != base_entry.get("stdout"):
+            if er is not None and _LAST_CHILD.get("rc") != base_child.get("rc") \
+                    and er.get("rc") == base_entry.get("rc") and er.get("stdout") == base_entry.get("stdout"):
+                why = (_LAST_CHILD.get("stderr") or "").strip()
+                fl.append({"m": "<entry>", "entry_mismatch": True, "err": (
+                    f"エントリーの後（atexit 等）で子プロセスの終了コードが変わった: 基準 {base_child.get('rc')} → "
+                    f"{_LAST_CHILD.get('rc')}: " + (why.splitlines()[-1] if why else "標準エラーなし"))})
+            elif er is None or er.get("rc") != base_entry.get("rc") or er.get("stdout") != base_entry.get("stdout"):
                 if er is None:
                     why = _LAST_CHILD.get("stderr", "") or ""
                     er = {"m": "<entry>", "err": (
@@ -416,6 +450,7 @@ def verify(
             "nofollow": [k.split(":", 1)[1] for k in items if items[k]["kind"] == "nofollow"],
         },
         "passed": passed,
+        "baseline_failed": baseline_failed,
         "rejected": rejected,
         "unresolved": unresolved,
         "imported_modules": len(ok_targets),
@@ -431,7 +466,10 @@ def verify(
         "elapsed_s": round(time.monotonic() - t0, 1),
         "python_note": py_note,
         "note": "verify は import（と run_entry=True ならエントリーの 1 回の実行）で確かめるだけで、"
-                "全ての実行経路の保証ではありません。ビルド後の実行確認も行ってください。",
+                "全ての実行経路の保証ではありません。ビルド後の実行確認も行ってください。"
+                "比べるのはエントリーの標準出力（実行中に sys.stdout へ書いたもの）と終了コード（エントリーと子プロセス全体）"
+                "だけで、標準エラー・ファイルへの出力・import 時に掴まれた stdout への出力は比べません。"
+                "エントリーは sys.argv = [エントリー] + entry_args、作業フォルダ cwd（既定はエントリーのあるフォルダ）で実行します。",
     }
     shutil.rmtree(work, ignore_errors=True)
     return out

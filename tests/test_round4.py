@@ -321,3 +321,70 @@ def test_stop_without_stderr_writes_log(tmp_path):
     assert r.returncode == 70
     log = work / "pystub_stop.log"
     assert log.exists() and "PystubConditionalStubError" in log.read_text(encoding="utf-8")
+
+
+# ---------------------------------------------------------------------------
+# 第 7 回: verify を普段の実行と同じ条件で（sys.argv・cwd・子プロセス全体の終了コード・基準の失敗）
+# ---------------------------------------------------------------------------
+
+LIB7 = {
+    "hv/__init__.py": "def render(v):\n    return 'R%s' % v\n",
+    "other/__init__.py": "def show(obj):\n    return obj.plot()\n",
+    "sig/__init__.py": "class Signal:\n    def __init__(self, v): self.v = v\n    def value(self): return self.v\n"
+                       "    def plot(self):\n        import hv\n        return hv.render(self.v)\n",
+}
+PRE7 = ("import sig, other\nclass P:\n    def plot(self): return 'p'\n"
+        "def make(k):\n    return sig.Signal(3) if k == 'sig' else P()\n")
+
+
+def _verify7(tmp_path, main, extra=None, **kw):
+    sp = tmp_path / "sp"
+    _write(sp, LIB7)
+    _write(tmp_path / "proj", {"main.py": PRE7 + main, "pyproject.toml": "", **(extra or {})})
+    return verify(str(tmp_path / "proj" / "main.py"), str(sp), packages=["hv"], submodules=[], nofollow=[],
+                  run_entry=True, **kw)
+
+
+def test_verify_entry_sees_normal_argv(tmp_path):
+    """A1 / A2: sys.argv はエントリーのパスだけ（引数なし）。argparse・sys.argv[1:] を読むエントリーで、hv を通さない"""
+    r = _verify7(tmp_path, "import argparse\nap = argparse.ArgumentParser(); ap.add_argument('--fast', action='store_true')\n"
+                           "a = ap.parse_args()\nprint('v', other.show(make('p')))\nif not a.fast:\n"
+                           "    print('p', other.show(make('sig')))\n")
+    assert "hv" not in r["passed"]["packages"], r
+    # entry_args で --fast を渡すと条件の機能に入らない → 通る
+    r2 = _verify7(tmp_path / "b", "import argparse\nap = argparse.ArgumentParser(); ap.add_argument('--fast', action='store_true')\n"
+                                  "a = ap.parse_args()\nprint('v', other.show(make('p')))\nif not a.fast:\n"
+                                  "    print('p', other.show(make('sig')))\n", entry_args=["--fast"])
+    assert "hv" in r2["passed"]["packages"], r2
+
+
+def test_verify_entry_runs_in_entry_folder(tmp_path):
+    """A3: 既定の作業フォルダはエントリーのあるフォルダ（相対パスのファイルを読むエントリー）"""
+    r = _verify7(tmp_path, "import os\nprint('v', other.show(make('p')))\nif os.path.exists('settings.ini'):\n"
+                           "    print('p', other.show(make('sig')))\n", extra={"settings.ini": "[x]\n"})
+    assert "hv" not in r["passed"]["packages"], r
+
+
+def test_verify_compares_child_exit_code(tmp_path):
+    """A4: エントリーの後（atexit）で 70 で終わる変化も見つける"""
+    r = _verify7(tmp_path, "import atexit\natexit.register(lambda: print('bye', other.show(make('sig'))))\n"
+                           "print('v', other.show(make('p')))\n")
+    assert "hv" not in r["passed"]["packages"], r
+    rej = [x for x in r["rejected"] if x["item"] == "hv"]
+    assert rej and ("終了コード" in (rej[0].get("error") or "") or "出力" in rej[0]["reason"]), rej
+
+
+def test_verify_baseline_failed_passes_nothing(tmp_path):
+    """基準（スタブなし）のエントリーが失敗するなら何も passed に入れず、baseline_failed に理由と案内を返す"""
+    r = _verify7(tmp_path, "import sys\nprint('v', other.show(make('p')))\nsys.exit(3)\n")
+    assert r["baseline_failed"] is not None and r["baseline_failed"]["rc"] is not None or r["baseline_failed"]["reason"]
+    assert not r["passed"]["packages"], r
+    assert "entry_args" in r["baseline_failed"]["hint"]
+
+
+def test_verify_reason_when_entry_did_not_finish(tmp_path):
+    """エントリーが条件付きスタブで 70 で止まった時の理由は「最後まで実行されなかった（終了コード 70）」"""
+    r = _verify7(tmp_path, "print('v', other.show(make('sig')))\n")
+    rej = [x for x in r["rejected"] if x["item"] == "hv"]
+    assert rej, r
+    assert "終了コード 70" in (rej[0].get("error") or "") or "出力が変わった" in rej[0]["reason"], rej

@@ -82,10 +82,18 @@ site-packages の `.pth` と `sitecustomize` が起動時に実行するコー�
 
 | 値 | 意味 |
 |---|---|
-| `high` | プロジェクトが、入口に届く公開関数を 1 つも呼んでいない（入口の列挙が完了し、受け手の分からない同名の呼び出しも無く、入口へ入る辺が登録・間接呼び出しの仕組み（singledispatch・登録辞書・コールバック一覧・methodcaller・attrgetter・`__init_subclass__`）でない）という事実の表示 |
+| `high` | プロジェクトから使用まで、**推定を挟まずに届く経路が 1 本も無い**（入口の列挙が完了し、受け手の分からない同名の呼び出しも無く、入口へ入る辺が登録・間接呼び出しの仕組みでない）という事実の表示。推定の経路（`estimated_routes`）がある時は「推定の経路があります。verify(run_entry=True) で確かめてください」と出す |
 | `low` | 条件を守れば外せるが、プロジェクトが入口に届く公開関数を呼んでいる（直接でも、ほかの関数を経てでも）・経路が間接的。解析したエントリーでは変わらなくても、別の入力で終了コード 70 で止まりうる。理由は `confidence_reason`（例: 「プロジェクトが `asammdf.MDF.append()` を呼んでいます。入力によってはここから … pandas に届きます」） |
 
-low でも、解析したエントリーで変わらないことは `verify(..., run_entry=True)` で確かめられます。
+「推定」は、名前だけで結び付けた呼び出し（受け手の型が分からない `o.plot()` を同名のメソッド全てに結ぶ）、`__del__` のような
+暗黙の呼び出し、動的な振り分け（getattr・登録辞書など）のことです。確定した経路は `route_from_project`、推定の経路は
+`estimated_routes` に分けて出し、high の候補に確定した経路が出ることはありません。
+
+low でも、解析したエントリーで変わらないことは `verify(..., run_entry=True)` で確かめられます。verify が比べるのは
+エントリーの標準出力（実行中に `sys.stdout` へ書いたもの）と終了コード（エントリーと子プロセス全体。atexit の後も含む）だけで、
+標準エラー・ファイルへの出力・import 時に掴まれた stdout への出力は比べません。エントリーは `sys.argv = [エントリー] + entry_args`、
+作業フォルダ `cwd`（既定はエントリーのあるフォルダ）で実行するので、引数や入力ファイルが要るエントリーでは `entry_args` /
+`cwd` を指定してください。基準（スタブなし）の実行が失敗した時は何も通さず `baseline_failed` に理由を返します。
 
 `analyze` の結果の先頭には `summary`（証明済みの推定削減 MB・conditional(high) の MB と件数・推奨の一覧・次の手順）が
 付きます。1 MB 未満の条件付き候補は既定で省き（`conditional_omitted_small` に件数）、`include_small_conditional=True`
@@ -127,7 +135,7 @@ exe の削減量ではありません（実際の削減は PyInstaller の同梱
 required（安全側）に倒し、逆方向の誤判定（本当は stubbable なのに required）は許容します。
 
 条件付きは、条件を破ると原則として終了コード 70 で止まります。ただし、値の代わりに対する `isinstance` / `type()` /
-`callable` / `dir()` / `vars()`、スタブのクラスの `issubclass` / `__mro__` / `dataclasses.is_dataclass`、外部の基底から
+`callable` / `dir()` / `vars()`、スタブのクラスの `issubclass` / `__mro__` / `dir()` / `vars()` / `dataclasses.is_dataclass`、外部の基底から
 継承した属性では、止まる前に結果が元と変わりえます（Python の仕組み上スタブ側で止められない）。元に無い属性のエラー文も
 元と違います。
 

@@ -1156,6 +1156,12 @@ def build_conditions(sem: Semantics, uses: list, prefix: str) -> dict | None:
         caller = g.pop("_caller", None)
         exact_entry = g.pop("_exact", False)
         loc = sem.program.local_modules
+        # 経路を分ける（第 7 回）: 確定した経路 = プロジェクト →（確実な辺）→ 入口へ入る呼び出し →（推定を挟まない辺）→ 使用。
+        # それ以外（入口から使用までに名前だけの結び付け・暗黙の呼び出し・動的な振り分けを挟む）は推定の経路
+        route = g.get("route_from_project") or []
+        confirmed = bool(route) and (tag == "branch" or (exact_entry and bool(g.get("public_api"))))
+        g["route_from_project"] = route if confirmed else []
+        g["estimated_routes"] = [] if confirmed else ([route] if route else [])
         if tag != "branch" and exact_entry and g.get("public_api") and not g.get("project_calls_entry"):
             # 推移的（第 6 回）: 入口へ入る呼び出しのある関数に、プロジェクトが呼ぶ公開関数から確実に届く
             # （lib3.top() → lib2.run() → _dispatch() の o.plot() 等。直接の呼び出しに限らない）
@@ -1208,6 +1214,9 @@ def build_conditions(sem: Semantics, uses: list, prefix: str) -> dict | None:
         reason = low_reasons[0] if low_reasons else "入口の列挙が完了していません"
         if len(low_reasons) > 1:
             reason += f"（ほか {len(low_reasons) - 1} 件）"
+    elif any(g.get("estimated_routes") for g in conds):
+        reason = "推定の経路があります。verify(run_entry=True) で確かめてください"
+    assert confidence != "high" or not any(g.get("route_from_project") for g in conds)
     shown = conds[:MAX_CONDITIONS]
     for g in shown:
         if g["may_be_swallowed"]:
