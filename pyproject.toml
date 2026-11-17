@@ -52,6 +52,7 @@ include = [
     "/README.md",
     "/LICENSE",
     "/pyproject.toml",
+    "/server.json",
 ]
 exclude = [
     "/.claude",
