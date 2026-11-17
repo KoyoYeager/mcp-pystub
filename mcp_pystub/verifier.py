@@ -122,11 +122,15 @@ def _run_child(py: str, cfg: dict, workdir: Path, timeout: float) -> tuple[list[
     env.pop("PYTHONPATH", None)
     timed_out = False
     try:
-        subprocess.run([py, "-X", "utf8", str(child), str(cfg_path)], cwd=str(workdir), env=env,
-                       stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                       timeout=timeout)
+        cp = subprocess.run([py, "-X", "utf8", str(child), str(cfg_path)], cwd=str(workdir), env=env,
+                            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                            timeout=timeout)
+        _LAST_CHILD["rc"] = cp.returncode
+        _LAST_CHILD["stderr"] = (cp.stderr or b"").decode("utf-8", "replace")[-1500:]
     except subprocess.TimeoutExpired:
         timed_out = True
+        _LAST_CHILD["rc"] = None
+        _LAST_CHILD["stderr"] = "timeout"
     recs: list[dict] = []
     if out_path.exists():
         for line in out_path.read_text(encoding="utf-8", errors="replace").splitlines():
@@ -135,6 +139,9 @@ def _run_child(py: str, cfg: dict, workdir: Path, timeout: float) -> tuple[list[
             except json.JSONDecodeError:
                 pass
     return recs, timed_out
+
+
+_LAST_CHILD: dict = {}  # 直前の子プロセスの終了コードと標準エラー（エントリーが最後まで走らなかった理由に使う）
 
 
 def _results(recs: list[dict]) -> tuple[dict[str, dict], str | None, bool]:
@@ -341,7 +348,12 @@ def verify(
         if run_entry and base_entry is not None:
             er = res.get("<entry>")
             if er is None or er.get("rc") != base_entry.get("rc") or er.get("stdout") != base_entry.get("stdout"):
-                fl.append(dict(er or {"m": "<entry>", "err": "entry not run"}, m="<entry>", entry_mismatch=True))
+                if er is None:
+                    why = _LAST_CHILD.get("stderr", "") or ""
+                    er = {"m": "<entry>", "err": (
+                        f"エントリーが最後まで実行されなかった（終了コード {_LAST_CHILD.get('rc')}）: "
+                        + (why.strip().splitlines()[-1] if why.strip() else "標準エラーなし"))}
+                fl.append(dict(er, m="<entry>", entry_mismatch=True))
         return fl, res, miss
 
     unresolved: list[dict] = []

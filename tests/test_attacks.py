@@ -48,7 +48,27 @@ def test_proven_attacks_b(script, tmp_path):
     assert not broken, "\n".join(x[:400] for x in broken)
 
 
-@pytest.mark.parametrize("script", ["c1.py", "c1b.py", "c2.py", "e1.py", "e4.py"])
+# 「直さない」（仕様 10.5 / README の制限）: Python の仕組み上スタブ側で止められない操作。条件を破った時に限り、
+# 止まる前に結果が元と変わりうる。名前を挙げて除外し、期待する結果の種類も固定する（黙って増やさない）
+LIMITATIONS = {
+    "S01_isinstance_value": "SILENT",        # isinstance(値の代わり, int)
+    "S03_callable_value": "SILENT",          # callable(値の代わり)
+    "S07_isinstance_property": "SILENT",     # isinstance(property の代わり, property)
+    "S08b_enum_member_isinstance": "SILENT", # isinstance(Enum のメンバーの代わり, Enum のクラス)
+    "S11_type_name_value": "SILENT",         # type(値の代わり).__name__
+    "S12_issubclass_stub_classes": "SILENT", # issubclass(スタブのクラス, スタブのクラス)
+    "S13_mro_len": "SILENT",                 # スタブのクラスの __mro__
+    "S15_is_dataclass": "SILENT",            # dataclasses.is_dataclass(スタブのクラス)
+    "S17_namedtuple_fields": "CHANGED",      # 外部の基底（NamedTuple）から継承した属性は元に無いとして AttributeError
+    "S21_type_is_value": "SILENT",           # type(値の代わり) is int
+    "S23_dir_len": "SILENT",                 # dir(スタブのクラス)
+    "S24_vars_keys": "SILENT",               # vars(スタブのクラス)
+    "S25_try_attr_missing": "SAME_STDOUT",   # 元に無い属性のエラー文の違い
+    "S29_names_tuple_isinstance": "SILENT",  # isinstance(値の代わり, tuple)
+}
+
+
+@pytest.mark.parametrize("script", ["c1.py", "c1b.py", "c2.py", "e1.py", "e4.py", "f1.py", "f2.py", "f3.py", "g_high.py"])
 def test_conditional_attacks(script, tmp_path):
     """条件付きの段（第 5 回の基準）:
     - 黙って変わる（SILENT / CHANGED）は 0 件
@@ -57,6 +77,7 @@ def test_conditional_attacks(script, tmp_path):
     """
     out = _run(script, tmp_path)
     bad = []
+    highs: list[str] = []
     n = 0
     confs: list[str] = []
     for l in out.splitlines():
@@ -69,13 +90,23 @@ def test_conditional_attacks(script, tmp_path):
         if not m:
             continue
         n += 1
+        name = m.group(1)
         for lv, entry, kind in ast.literal_eval(m.group(2)):
-            if kind != "LOUD":
-                bad.append((m.group(1), lv, entry, kind, "黙って変わった"))
+            if lv == "proven":
+                bad.append((name, lv, entry, kind, "証明済みの段の破れ"))
+            elif name in LIMITATIONS and entry != "main.py":
+                if not kind.startswith(LIMITATIONS[name]):
+                    bad.append((name, lv, entry, kind, f"制限として期待した結果 {LIMITATIONS[name]} と違う"))
+            elif kind != "LOUD":
+                bad.append((name, lv, entry, kind, "黙って変わった"))
             elif entry == "main.py" and "high" in confs:
-                bad.append((m.group(1), lv, entry, kind, f"high の候補で解析したエントリーが止まった {confs}"))
+                bad.append((name, lv, entry, kind, f"high の候補で解析したエントリーが止まった {confs}"))
+        if name.startswith("G0"):
+            highs.append(name) if "high" in confs else bad.append((name, "-", "-", "-", f"high が出ない {confs}"))
     assert n, out[-2000:]
     assert not bad, bad
+    if script == "g_high.py":
+        assert len(highs) >= 3, highs  # high が実際に出て、解析したエントリーが変わらない事例
 
 
 def test_overlap_reverse_order(tmp_path):

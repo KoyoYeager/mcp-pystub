@@ -90,6 +90,9 @@ class _M(type):
     def __getattr__(c, n):
         d = c.__dict__
         if n[:2] == "__":
+            k = d.get("_pystub_known")
+            if k is not None and n in k and n not in ("__init__", "__new__", "__doc__"):
+                _raise(c.__name__ + "." + n)  # 元のクラスが定義する dunder（__slots__ 等）: 有無を偽らず止まる
             raise AttributeError(n)
         if d.get("_pystub_ph"):
             _raise(c.__name__ + "." + n)
@@ -97,7 +100,8 @@ class _M(type):
         if k is not None and n not in k:
             raise AttributeError(n)  # 元のクラスに無い名前
         kind = (d.get("_pystub_kinds") or {{}}).get(n, "v")
-        v = _g(c.__name__ + "." + n, kind in ("c", "f"))
+        v = _g(n, kind in ("c", "f"))
+        type.__setattr__(v, "__qualname__", c.__qualname__ + "." + n)  # 入れ子のクラスの名前を元どおりに
         type.__setattr__(c, n, v)  # 同じ属性は同じオブジェクト
         return v
     def __call__(c, *a, **k): _raise(c.__name__)
@@ -138,7 +142,10 @@ class _M(type):
     __mod__ = __rmod__ = __floordiv__ = __pow__ = __neg__ = __pos__ = __abs__ = __add__
     def __int__(c): _raise("int(" + c.__name__ + ")")
     __float__ = __index__ = __int__
-    __hash__ = type.__hash__
+    def __hash__(c):
+        if c.__dict__.get("_pystub_ph"):
+            _raise("hash(" + c.__name__ + ")")  # 値の代わり: 辞書・集合の検索で黙って変わらないように
+        return type.__hash__(c)
 def _g(n, t=False, strict=False):
     # t=True: 元はクラス・関数・モジュール（上の (1)。属性は分からないので全て値の代わり）。t=False: 値の代わり (2)
     # strict: 元が普通のクラスでない（Enum 等）
@@ -481,7 +488,7 @@ class _StubBuilder:
             defs.append(self._class_code(name, r, subs))
             return
         if kind in ("function", "method"):
-            defs.append(self._func_stub(name, module + "." + name))
+            defs.append(self._func_stub(name, module + "." + name, r))
             return
         if kind in ("const", "classconst"):
             lit = self._const_source(r)
@@ -490,8 +497,20 @@ class _StubBuilder:
                 return
         defs.append(f"{name} = _g({name!r})\n")
 
-    def _func_stub(self, name: str, qual: str) -> str:
+    def _func_doc(self, r: Ref | None) -> str | None:
+        if r is None or r.kind not in ("function", "method") or not r.target:
+            return None
+        info = self.p.get(r.module)
+        if info is None or info.opaque:
+            return None
+        node = self.p.function_node(info, r.target)
+        return ast.get_docstring(node, clean=False) if node is not None else None
+
+    def _func_stub(self, name: str, qual: str, r: Ref | None = None) -> str:
         if self.loud_note:
+            doc = self._func_doc(r)
+            if doc is not None:
+                return f"def {name}(*a, **k):\n    {doc!r}\n    _raise({qual!r})\n"
             return f"def {name}(*a, **k): _raise({qual!r})\n"
         return f"def {name}(*a, **k): raise RuntimeError({qual!r})\n"
 
@@ -547,8 +566,8 @@ class _StubBuilder:
         if info is not None and ci is not None:
             bases = self._exc_bases(info, ci)
             known = self._class_known(info, ci)
-            if not self.p.class_is_plain(r.module, r.target):
-                known = None  # Enum 等: 属性の有無を静的に決めない
+            if not self.p.class_is_plain(r.module, r.target) and not self.loud_note:
+                known = None  # Enum 等: 属性の有無を静的に決めない（証明済みのスタブ。条件付きは元の名前の一覧を持つ）
         body: list[str] = [f"    _pystub_known = {repr(frozenset(sorted(known))) if known is not None else 'None'}"]
         if self.loud_note and ci is not None and ci.doc is not None:
             body.append(f"    __doc__ = {ci.doc!r}")  # 条件付き: 元の docstring を写す（証明済みのスタブは変えない）
@@ -578,7 +597,12 @@ class _StubBuilder:
                     continue
             if ar.kind in ("method", "function"):
                 if self.loud_note:
-                    body.append(f"    @staticmethod\n    def {attr}(*a, **k): _raise({(name + '.' + attr)!r})")
+                    mdoc = self._func_doc(ar)
+                    if mdoc is not None:
+                        body.append(f"    @staticmethod\n    def {attr}(*a, **k):\n        {mdoc!r}\n"
+                                    f"        _raise({(name + '.' + attr)!r})")
+                    else:
+                        body.append(f"    @staticmethod\n    def {attr}(*a, **k): _raise({(name + '.' + attr)!r})")
                 else:
                     body.append(f"    @staticmethod\n    def {attr}(*a, **k): raise RuntimeError({(name + '.' + attr)!r})")
         inner = "\n".join(dict.fromkeys(body))

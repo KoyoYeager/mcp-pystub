@@ -994,7 +994,7 @@ def _indirect_edge(tag: str, ev) -> bool:
         return True
     if getattr(ev, "ctx", "") == "methodcaller":
         return True
-    return getattr(ev, "kind", "") == "classdef"  # 定義時のフック（__init_subclass__ / metaclass）から
+    return getattr(ev, "kind", "") in ("classdef", "class_escape")  # 定義時のフック・クラスの登録から
 
 
 def _exact_region(sem: Semantics, keys: list) -> set:
@@ -1156,13 +1156,13 @@ def build_conditions(sem: Semantics, uses: list, prefix: str) -> dict | None:
         caller = g.pop("_caller", None)
         exact_entry = g.pop("_exact", False)
         loc = sem.program.local_modules
-        if tag != "branch" and exact_entry and caller is not None and (
-                caller[0] in loc or (sem.precise_parent.get(caller) or ("",))[0] in loc):
-            # 入口へ入る呼び出しのある関数を、プロジェクトが直接呼んでいる（MDF.append() の中の self._mdf.append 等）
+        if tag != "branch" and exact_entry and g.get("public_api") and not g.get("project_calls_entry"):
+            # 推移的（第 6 回）: 入口へ入る呼び出しのある関数に、プロジェクトが呼ぶ公開関数から確実に届く
+            # （lib3.top() → lib2.run() → _dispatch() の o.plot() 等。直接の呼び出しに限らない）
             all_project_zero = False
             g["project_calls_entry"] = True
-            low_reasons.append(f"プロジェクトが `{_api_name(sem, caller)}` を呼んでいます。入力によってはここから "
-                               f"{g['entry']} を経て {prefix} に届きます")
+            low_reasons.append(f"プロジェクトが `{g['public_api']}` を呼んでいます。入力によってはそこから "
+                               f"{_api_name(sem, caller) if caller else '?'} → {g['entry']} を経て {prefix} に届きます")
         if g.get("indirect"):
             low_reasons.append(f"{g['entry']} から {prefix} への経路に、登録・間接呼び出しの仕組み（デコレータでの登録 / "
                                "singledispatch / 登録辞書・コールバック一覧 / methodcaller / __init_subclass__ 等）があります")

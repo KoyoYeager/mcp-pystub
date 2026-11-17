@@ -25,8 +25,10 @@ def test_confidence_high_when_project_does_not_use_entry(tmp_path):
              "import sig\nprint(sig.Signal(1).plot())\n")
     # 名前の振り分けを起こすのはライブラリ内（other.show）だけにし、プロジェクトは other.show を呼ばない
     # （第 5 回: 入口へ入る呼び出しのある関数をプロジェクトが直接呼ぶなら low）
-    _write(c.sp, {"lib2/__init__.py": "import other\ndef go(objs):\n    return [other.show(o) for o in objs]\n"})
-    _write(c.proj, {"main.py": "import sig, lib2\nprint('ok', sig.Signal(3).value(), lib2.go([]))\n"})
+    # 名前の振り分け（o.plot()）は、ライブラリの import 時のコードだけが行う。プロジェクトは、入口に届く公開関数を
+    # 1 つも呼ばない（import するだけ）→ high（第 6 回: high は「入口に届く公開関数を呼んでいない」事実の表示）
+    _write(c.sp, {"lib2/__init__.py": "def _d(objs):\n    return [o.plot() for o in objs]\nWARM = _d([])\n"})
+    _write(c.proj, {"main.py": "import sig, lib2\nprint('ok', sig.Signal(3).value(), lib2.WARM)\n"})
     res = analyze(str(c.proj / "main.py"), python_path=str(c.sp), include_small_conditional=True)
     cond = {p["package_name"]: p for p in res["conditional"]}
     assert "gx" in cond, res["conditional"]  # 候補が出ないなら失敗（黙って通さない）
@@ -58,10 +60,9 @@ def test_confidence_low_for_branch(tmp_path):
 
 def test_summary_is_first_and_lists_high_first(tmp_path):
     sp = dict(SIG)
-    sp["lib2/__init__.py"] = "def _dispatch(objs):\n    return [o.plot() for o in objs]\ndef run(objs):\n    return _dispatch(objs)\n"
-    sp["lib3/__init__.py"] = "import lib2\ndef top(objs):\n    return lib2.run(objs)\n"
+    sp["lib2/__init__.py"] = "def _d(objs):\n    return [o.plot() for o in objs]\nWARM = _d([])\n"
     _write(tmp_path / "sp", sp)
-    _write(tmp_path / "proj", {"main.py": "import sig, lib3\nprint('ok', sig.Signal(3).value(), lib3.top([]))\n", "pyproject.toml": ""})
+    _write(tmp_path / "proj", {"main.py": "import sig, lib2\nprint('ok', sig.Signal(3).value(), lib2.WARM)\n", "pyproject.toml": ""})
     res = analyze(str(tmp_path / "proj" / "main.py"), python_path=str(tmp_path / "sp"), include_small_conditional=True)
     assert list(res)[0] == "summary"
     s = res["summary"]
@@ -161,3 +162,17 @@ def test_low_when_project_calls_function_that_dispatches(tmp_path):
     g = [p for p in c.res["conditional"] if p["package_name"] == "gx"][0]
     assert g["confidence"] == "low"
     assert "other.show()" in g["confidence_reason"]
+
+
+def test_low_when_project_calls_public_function_transitively(tmp_path):
+    """プロジェクトが、入口に届く公開関数（lib3.top → lib2.run → _dispatch の o.plot()）を呼ぶ → low（推移的: 第 6 回 K01）。
+    空のリストを渡して実際には止まらない事例でも、「呼んでいる」事実で low にする"""
+    sp = dict(SIG)
+    sp["lib2/__init__.py"] = "def _dispatch(objs):\n    return [o.plot() for o in objs]\ndef run(objs):\n    return _dispatch(objs)\n"
+    sp["lib3/__init__.py"] = "import lib2\ndef top(objs):\n    return lib2.run(objs)\n"
+    _write(tmp_path / "sp", sp)
+    _write(tmp_path / "proj", {"main.py": "import sig, lib3\nprint('ok', sig.Signal(3).value(), lib3.top([]))\n", "pyproject.toml": ""})
+    res = analyze(str(tmp_path / "proj" / "main.py"), python_path=str(tmp_path / "sp"), include_small_conditional=True)
+    g = {p["package_name"]: p for p in res["conditional"]}["gx"]
+    assert g["confidence"] == "low"
+    assert "lib3.top()" in g["confidence_reason"], g["confidence_reason"]

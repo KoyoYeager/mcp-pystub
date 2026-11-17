@@ -156,6 +156,8 @@ def _analyze(entry_point: str, python_path: str, max_depth: int, include_small_c
     result_dict["verify_status"] = "未実施"
     result_dict = {"summary": _summary(result_dict, str(entry), python_path, required), **result_dict}
     result_dict["next_steps"] = [
+        "適用前に verify(entry_point, python_path, packages=[...], submodules=[...], nofollow=[...], run_entry=True) で、"
+        "解析したエントリーが変わらないことを確かめてください（保証の最後の拠り所は verify と実ビルドの実行確認です）。",
         "この結果は静的解析による候補です（実行の保証ではありません）。",
         "適用前に verify ツールで、スタブ（とサブモジュールのヒント・nofollow）に差し替えた状態の import を"
         "対象環境の python で確かめてください（verify は site-packages を書き換えません）。",
@@ -404,12 +406,12 @@ def _summary(rd: dict, entry: str, python_path: str, required: list) -> dict:
     cond_recs.sort(key=lambda x: (0 if x[0] == "high" else 1, x[1]))
     py = f", python_path={python_path!r}" if python_path else ""
     steps = [
-        "1. 推奨の上から選ぶ。[high] = 入口の列挙が完了し、プロジェクトのコードがどの入口の関数も呼ばず、経路に登録・"
-        "間接呼び出しの仕組みが無い（解析したエントリーは止まらない見込み）。[low] = 条件を守れば外せるが、プロジェクトが"
-        "入口の関数を呼んでいる・経路が間接的（解析したエントリーでは変わらなくても、別の入力で終了コード 70 で止まりうる）",
-        "   low でも、解析したエントリーで変わらないことは verify(..., run_entry=True) で確かめられます",
-        f"2. サブモジュールなら generate_submodule({entry!r}, <親>, <サブモジュール>{py})、パッケージなら generate(...) でスタブを作る",
-        f"3. verify({entry!r}{py}, packages=[...], submodules=['<サブモジュール>=><排除する C 拡張>'], run_entry=True) で確かめる",
+        f"1. 適用前に必ず verify({entry!r}{py}, packages=[...], submodules=['<サブモジュール>=><排除する C 拡張>'], "
+        "run_entry=True) で、解析したエントリーが変わらないことを確かめる（証明済み・条件付きとも静的解析による提案です）",
+        "2. 推奨の上から選ぶ。[high] = プロジェクトが、入口に届く公開関数を 1 つも呼んでいない（入口の列挙が完了し、入口へ"
+        "入る辺が登録・間接呼び出しの仕組みでない）。[low] = プロジェクトが入口に届く公開関数を呼んでいる・経路が間接的"
+        "（条件を破る入力では終了コード 70 で止まる。理由は confidence_reason）",
+        f"3. サブモジュールなら generate_submodule({entry!r}, <親>, <サブモジュール>{py})、パッケージなら generate(...) でスタブを作る",
         "4. build_instructions の手順で適用 → ビルド → 実行結果を元と比べる → 手順どおり復元",
     ]
     return {

@@ -317,6 +317,11 @@ def _is_mutable_literal(node: ast.AST | None) -> bool:
 
 
 _STUB_ERROR_CATCHERS = frozenset({"Exception", "BaseException", "RuntimeError"})
+_CLASS_TRANSFORM_LIBS = frozenset({"attr", "attrs", "dataclasses", "pydantic", "typing", "typing_extensions",
+                                   "functools", "enum", "abc", "msgspec", "marshmallow_dataclass"})
+# クラスを登録しない（そのまま返す）と分かっているクラスデコレータ
+_PLAIN_CLASS_DECORATOR_NAMES = frozenset({"dataclass", "total_ordering", "final", "unique", "runtime_checkable",
+                                          "dataclass_transform", "add_metaclass"})
 
 
 def _catches_stub_error(t: ast.expr | None) -> bool:
@@ -420,25 +425,53 @@ def _sys_modules_guard(stmt: ast.stmt) -> str:
 
 
 _REGISTER_ATTRS = frozenset({"append", "add", "register", "setdefault", "insert", "extend", "update", "appendleft",
-                             "connect", "subscribe", "put"})
+                             "connect", "subscribe", "put", "__setitem__"})
 _REGISTRY_DECORATOR_NAMES = frozenset({"register", "route", "command", "group", "hook", "hookimpl", "listens_for",
                                        "connect", "subscribe", "receiver", "handler", "callback", "task",
                                        "fixture", "implementer", "plugin", "entrypoint", "add", "append"})
 
 
-def decorator_registers(fn: ast.AST) -> bool:
+def decorator_registers(fn: ast.AST, strict: bool = False) -> bool:
     """デコレータ関数（工場を含む）が、引数の関数を入れ物（辞書・一覧・集合）に登録するか（登録の仕組み）。"""
     params: set[str] = set()
     for n in ast.walk(fn):
         if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
             params.update(a.arg for a in n.args.posonlyargs + n.args.args + n.args.kwonlyargs)
+    globals_: set[str] = set()
     for n in ast.walk(fn):
-        if isinstance(n, ast.Assign) and isinstance(n.value, ast.Name) and n.value.id in params \
-                and any(isinstance(t, ast.Subscript) for t in n.targets):
-            return True  # _REG[name] = f
+        if isinstance(n, (ast.Global, ast.Nonlocal)):
+            globals_.update(n.names)
+
+    def has_param(x: ast.AST) -> bool:
+        if strict:  # 飾る対象そのもの（またはそれを値にした辞書・一覧）を入れる時だけ
+            if isinstance(x, ast.Name):
+                return x.id in params
+            if isinstance(x, ast.Dict):
+                return any(isinstance(v, ast.Name) and v.id in params for v in x.values)
+            if isinstance(x, (ast.List, ast.Tuple, ast.Set)):
+                return any(isinstance(v, ast.Name) and v.id in params for v in x.elts)
+            return False
+        return any(isinstance(y, ast.Name) and y.id in params for y in ast.walk(x))
+
+    for n in ast.walk(fn):
+        if isinstance(n, (ast.Assign, ast.AugAssign)) and n.value is not None and has_param(n.value):
+            targets = n.targets if isinstance(n, ast.Assign) else [n.target]
+            # _REG[name] = f / ns.attr = f / global _CBS; _CBS = _CBS + [f]
+            def reg_target(t: ast.AST) -> bool:
+                if isinstance(t, ast.Subscript):
+                    return not (isinstance(t.value, ast.Name) and t.value.id in params)
+                if isinstance(t, ast.Attribute):
+                    # 飾る関数自身の属性の設定（func.__module__ = ...）はラッパーの動作で登録ではない
+                    return not (isinstance(t.value, ast.Name) and t.value.id in params) and not t.attr.startswith("__")
+                return isinstance(t, ast.Name) and t.id in globals_
+            if any(reg_target(t) for t in targets):
+                return True
         if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) and n.func.attr in _REGISTER_ATTRS \
-                and any(isinstance(a, ast.Name) and a.id in params for a in list(n.args) + [k.value for k in n.keywords]):
-            return True  # _CBS.append(f) / registry.register(f)
+                and any(has_param(a) for a in list(n.args) + [k.value for k in n.keywords]):
+            return True  # _CBS.append(f) / registry.register(f) / _REG.update({k: f}) / _REG.__setitem__(k, f)
+        if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == "setattr" and len(n.args) >= 3 \
+                and has_param(n.args[2]):
+            return True  # setattr(ns, name, f)
     return False
 
 
@@ -907,6 +940,18 @@ class Program:
             elif isinstance(n, ast.Call):
                 f = n.func
                 nm = f.attr if isinstance(f, ast.Attribute) else (f.id if isinstance(f, ast.Name) else "")
+                if nm == "partial" and n.args and isinstance(n.args[0], (ast.Name, ast.Attribute)):
+                    # functools.partial(f, 'x', ...): f の呼び出し側（前から引数を埋める）
+                    pf = n.args[0]
+                    pnm = pf.attr if isinstance(pf, ast.Attribute) else pf.id
+                    plits = {i: a.value for i, a in enumerate(n.args[1:])
+                             if isinstance(a, ast.Constant) and isinstance(a.value, str)}
+                    if plits:
+                        info.calls.setdefault(pnm, []).append(
+                            (isinstance(pf, ast.Attribute), True if any(isinstance(a, ast.Starred) for a in n.args) else False,
+                             {}, plits, len(n.args) - 1 + 1, frozenset()))
+                    else:
+                        info.nonlit_calls.add(pnm)
                 if nm:
                     # 呼び出し側の文字列リテラル（引数の定数伝播: compute_reachability の literal_args 用）。
                     # 木は持たず、判定に要る形だけ残す
@@ -1606,6 +1651,23 @@ class _UnitWalker:
                 self.guard = g
         self.guard = saved
 
+    def _decorator_registers(self, d: ast.expr, sc, strict: bool = False) -> bool:
+        """デコレータ d が、飾る対象（関数・クラス）を入れ物に登録する形か（解析できるものは中身で、できないものは形で）。"""
+        if _decorator_last_name(d) in _TRANSPARENT_DECORATORS or _decorator_last_name(d) in _PLAIN_CLASS_DECORATOR_NAMES:
+            return False
+        target = d.func if isinstance(d, ast.Call) else d
+        r = self.p.ref_of_expr(self.info, target, sc)
+        if r is not None and r.module.split(".")[0] in _CLASS_TRANSFORM_LIBS:
+            return False  # attrs / dataclasses / pydantic 等のクラスを作り替えるデコレータ（登録ではない）
+        if r is not None and r.kind in ("function", "method") and not r.alts:
+            dinfo = self.p.get(r.module)
+            dnode = self.p.function_node(dinfo, r.target) if dinfo is not None else None
+            return dnode is not None and decorator_registers(dnode, strict=strict)
+        if r is not None and r.kind in ("derived", "unknown", "instance") and not r.alts and isinstance(target, ast.Name):
+            return True  # 関数が作って返したデコレータを名前に入れたもの（hook = make_registrar(); @hook）
+        return isinstance(target, ast.Attribute) and (target.attr in _REGISTRY_DECORATOR_NAMES
+                                                      or target.attr.startswith("on_"))
+
     def _import_presence_test(self, test: ast.expr, sc) -> bool | None:
         """`X is not None` / `X` / `X is None` / `not X` で、X が try/except ImportError の代替つきで
         import された名前（解析対象の環境に実在する）なら、元の環境での結果（True / False）。それ以外は None。"""
@@ -1667,6 +1729,9 @@ class _UnitWalker:
                 ev(k.value, "base", sc)
             q = self.info.class_qual_of.get(_pos(stmt), stmt.name)
             self._ev(Event("classdef", target=q, lineno=stmt.lineno))
+            if any(self._decorator_registers(d, sc, strict=True) for d in stmt.decorator_list):
+                # クラスを入れ物に登録するデコレータ（@backend('f') 等）: 本体とメソッドは実行されうる（第 6 回 K09 / P06）
+                self._ev(Event("class_escape", target=q, lineno=stmt.lineno))
             # クラス本体は定義時に実行される。本体内の名前（メソッド等）はクラス本体のスコープ
             cscope: dict[str, Ref | None] = dict(scope) if scope is not None else {}
             for s in stmt.body:
@@ -1842,6 +1907,14 @@ class _UnitWalker:
                     continue
                 if dnode is not None and decorator_registers(dnode):
                     registry = True
+            elif r is not None and r.kind == "method" and not r.alts:
+                # インスタンスのメソッドのデコレータ（@bus.listen）: 中身で登録を確かめる
+                dinfo = self.p.get(r.module)
+                dnode = self.p.function_node(dinfo, r.target) if dinfo is not None else None
+                if dnode is not None and decorator_registers(dnode):
+                    registry = True
+            elif r is not None and r.kind in ("derived", "unknown", "instance") and not r.alts and isinstance(target, ast.Name):
+                registry = True  # 関数が作って返したデコレータ（hook = make_registrar()）: 登録の仕組みとみなす
             elif isinstance(target, ast.Attribute) and (target.attr in _REGISTRY_DECORATOR_NAMES
                                                         or target.attr.startswith("on_")):
                 registry = True  # 解析できないデコレータ: X.register / app.route / bus.on_xxx の形（登録の仕組み）
@@ -1966,6 +2039,10 @@ class _UnitWalker:
                 ev(k, "store", sc)
             for v in e.values:
                 ev(v, "store", sc)
+                if isinstance(v, ast.Attribute) and not (isinstance(v.value, ast.Name) and v.value.id in ("self", "cls")) \
+                        and self.p.ref_of_expr(self.info, v, sc) is None:
+                    # 受け手の分からない束縛メソッドを値にした表: あとで呼ばれうる（間接呼び出し: 第 6 回 K13）
+                    self._ev(Event("method", name=v.attr, lineno=e.lineno, ctx="methodcaller"))
             return
         if isinstance(e, ast.Starred):
             ev(e.value, ctx if ctx in ("arg", "isinst", "except") else "store", sc)
@@ -2131,8 +2208,13 @@ class _UnitWalker:
             if fname == "hasattr":
                 hctx = "hasattr" if name_lit is not None else "unknown"
                 if name_lit is not None and base_ref is not None:
-                    # 無条件に束縛される名前だけ「ある」と扱える（条件付き束縛・del・globals()・サブモジュールは不可）
+                    # 無条件に束縛される名前だけ「ある」と扱える（条件付き束縛・del・globals()・サブモジュールは不可）。
+                    # dunder（__slots__ / 自作の dunder）はスタブが出さないので分からない（第 6 回 P01〜P03）
                     ok = False
+                    if name_lit.startswith("__") and name_lit.endswith("__"):
+                        base_ref = base_ref if base_ref.kind not in ("module", "class") else base_ref
+                        self._ev(Event("ref", ctx="hasattr_opaque", ref=base_ref, name=name_lit, lineno=e.lineno))
+                        name_lit = None
                     if not base_ref.alts and base_ref.kind == "module":
                         ok = self.p.name_always_bound(self.p.get(base_ref.module), name_lit)
                     elif not base_ref.alts and base_ref.kind == "class":
@@ -2150,7 +2232,10 @@ class _UnitWalker:
                 if name_lit is not None and base_ref is None:
                     self._ev(Event("attr", name=name_lit, lineno=e.lineno))
             elif fname == "getattr" and name_lit is not None:
-                if base_ref is not None:
+                if base_ref is not None and name_lit.startswith("__") and name_lit.endswith("__") and len(e.args) >= 3:
+                    # getattr(C, '__dunder__', 既定値): スタブは dunder を出さないので結果が変わりうる（P03）
+                    self._record(base_ref, "hasattr_opaque", e)
+                elif base_ref is not None:
                     self._record(self.p.extend(base_ref, (name_lit,)), ctx, e)
                 else:
                     ev(e.args[0], "read", sc)
@@ -2185,7 +2270,7 @@ class _UnitWalker:
             for k in e.keywords:
                 ev(k.value, "annot", sc)
             return
-        elif fname in (".methodcaller",) or fname == "methodcaller":
+        elif fname in (".methodcaller", "methodcaller", ".attrgetter", "attrgetter"):
             if e.args and isinstance(e.args[0], ast.Constant) and isinstance(e.args[0].value, str):
                 self._ev(Event("method", name=e.args[0].value, lineno=e.lineno, ctx="methodcaller"))
             for a in e.args:
@@ -2729,12 +2814,17 @@ def compute_reachability(
                 for uq in aci.methods["__init_subclass__"]:
                     reach((a[0], uq), "__init_subclass__")
                 return
-        info = program.get(module)
-        for k in ci.keywords:
-            if k.arg == "metaclass" and info is not None:
-                r = program.ref_of_expr(info, k.value, None)
-                if r is not None and r.kind == "class":
-                    instantiate(r.module, r.target)
+        # メタクラス（自分の指定か、基底から継承したもの）: 定義時にメタクラスが実行され、登録されうる
+        for a in [(module, qual)] + sorted(anc):
+            aci = class_info(*a)
+            ainfo = program.get(a[0])
+            if aci is None or ainfo is None:
+                continue
+            for k in aci.keywords:
+                if k.arg == "metaclass":
+                    r = program.ref_of_expr(ainfo, k.value, None)
+                    if r is not None and r.kind == "class":
+                        instantiate(r.module, r.target)
                     instantiate(module, qual)
                     return
 
@@ -2795,6 +2885,9 @@ def compute_reachability(
             return
         if ev.kind == "classdef":
             check_class_defined(unit.module, ev.target)
+            return
+        if ev.kind == "class_escape":
+            instantiate(unit.module, ev.target)  # 登録されたクラス: 本体（__init__ 等）とメソッドは実行されうる
             return
         if ev.kind == "family":
             add_family(unit.module, ev.target)
