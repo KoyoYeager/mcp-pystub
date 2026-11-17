@@ -495,6 +495,7 @@ class Program:
         self._tree_lru: OrderedDict[str, ModuleInfo] = OrderedDict()
         self._lines_lru: OrderedDict[str, list[str]] = OrderedDict()
         self.reparsed = 0
+        self._refs: dict = {}  # 参照の共有（Event.ref）
         self._depth = 0
         self._draining = False
         self._pending: list[ModuleInfo] = []
@@ -1551,6 +1552,13 @@ class _UnitWalker:
     # --- 文 ---
 
     def _ev(self, ev: Event) -> None:
+        if ev.ref is not None:
+            if ev.kind == "ref":
+                tops = ev.ref.touched_tops()
+                if tops and all(t in _STDLIB for t in tops):
+                    return  # 標準ライブラリだけを辿る参照: 到達にも使用の判定にも使わない（メモリ）
+            # 同じ参照（np.ndarray 等）は何千回も出る: 1 つのオブジェクトを共有する（メモリ）
+            ev.ref = self.p._refs.setdefault(ev.ref, ev.ref)
         if self.guard and not ev.guard:
             ev.guard = self.guard
         if self.branch and self.unit is not None and self.unit.qualname != "<module>":
