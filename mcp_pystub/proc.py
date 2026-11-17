@@ -175,8 +175,11 @@ def summarize_procs(procs: list[dict], recording: bool) -> dict:
 
 
 def rmtree_retry(p: Path) -> None:
-    for _ in range(5):
+    """一時フォルダを消す。Windows でファイルが掴まれていて消せない時は数秒やり直し、だめならプロセスの終了時にもう一度消す。"""
+    for _ in range(20):
         shutil.rmtree(p, ignore_errors=True)
         if not p.exists():
             return
-        time.sleep(0.2)
+        time.sleep(0.25)
+    import atexit
+    atexit.register(shutil.rmtree, p, True)
