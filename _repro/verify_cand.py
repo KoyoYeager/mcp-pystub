@@ -11,6 +11,7 @@ v = verify(E, python_path=SP, packages=pk, submodules=[], nofollow=[], run_entry
 r = {"scenario": n, "packages": pk, "s": round(time.time() - t, 1), "status_summary": v["status_summary"],
      "statuses": {k: (s["status"], (s.get("observed") or {}).get("state")) for k, s in v["statuses"].items()},
      "rejected": [(x["item"], x.get("reason"), (x.get("error") or "")[:200]) for x in v["rejected"]],
+     "unresolved": [(x["item"], x.get("reason"), (x.get("error") or "")[:200]) for x in v["unresolved"]], "verified_sets": v["verified_sets"],
      "baseline_failed": v.get("baseline_failed"), "entry_matched": v.get("entry_matched")}
 Path(out).write_text(json.dumps(r, ensure_ascii=False, indent=1), encoding="utf-8")
 print(json.dumps(r, ensure_ascii=False))

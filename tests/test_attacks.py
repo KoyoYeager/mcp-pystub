@@ -8,6 +8,8 @@
 """
 from __future__ import annotations
 
+import json
+
 import ast
 import os
 import re
@@ -158,4 +160,52 @@ def test_breaking_items_never_confirmed_run(script, tmp_path, monkeypatch):
     checks = [l.split() for l in out.splitlines() if l.startswith("TCHECK ")]
     assert len(checks) == TCHECK_COUNTS[script], len(checks)
     bad = [c for c in checks if c[3] != "SAME" and c[4].startswith("rec=confirmed_run")]
+    assert not bad, bad
+
+
+# 第 8 回: 動的な確認の穴（_check7 の F3 / N の写し）。どれも確認済み（実行）にならず、適用して壊れる（F3）組が 0 件
+F3_CASES = ["L1_stdout_tail_20000", "L1b_short_control", "P1_preimport_masking_tracefiles", "P1b_same_record_mode",
+            "S1_subset_of_passed", "N1_dataclass_generated_methods", "N2_exec_defined_function", "N3_namedtuple",
+            "N8_runtime_lazy_submodule_import", "N10_multiprocessing_worker"]
+F3_EXECUTED = {"N1_dataclass_generated_methods": "xdc", "N2_exec_defined_function": "xex", "N3_namedtuple": "xnt",
+               "N8_runtime_lazy_submodule_import": "xlz", "N10_multiprocessing_worker": "xmp"}
+
+
+def _run_args(script, tmp_path, args, timeout=1800):
+    env = dict(os.environ, PYSTUB_ATTACK_RUNS=str(tmp_path), PYTHONIOENCODING="utf-8")
+    r = subprocess.run([sys.executable, "-u", str(HERE / script), *args], cwd=str(HERE), capture_output=True, text=True,
+                       encoding="utf-8", errors="replace", env=env, timeout=timeout)
+    assert r.returncode == 0, r.stderr[-2000:]
+    return r.stdout
+
+
+def test_round8_dynamic_holes(tmp_path):
+    out = _run_args("f3_attacks.py", tmp_path, F3_CASES)
+    line = [l for l in out.splitlines() if l.startswith("SUMMARY ")]
+    assert line, out[-2000:]
+    rows = json.loads(line[0][len("SUMMARY "):])
+    assert [r[0] for r in rows] == F3_CASES
+    for name, observed, confirmed, f3 in rows:
+        assert confirmed == [], (name, confirmed)
+        assert f3 is False, name
+        if name in F3_EXECUTED:
+            assert observed[F3_EXECUTED[name]] == "executed", (name, observed)
+
+
+def test_round8_pth_startup(tmp_path):
+    """T1: .pth で起動時に読み込まれるパッケージは確認済み（実行）にならない"""
+    out = _run_args("t1_pth.py", tmp_path, [])
+    res = json.loads(out[out.index("{"):])
+    assert res["observed"] == "loaded_at_startup"
+    assert res["status"]["確認済み（実行）"] == []
+    assert "F3" not in res
+
+
+def test_round8_import_only_never_runs_entry(tmp_path):
+    """F4: エントリーを動かさない呼び出し（既定の verify を含む）で、エントリーのスクリプトが動かない（24 件）"""
+    out = _run_args("f4.py", tmp_path, [])
+    line = [l for l in out.splitlines() if l.startswith("SUMMARY ")][0]
+    res = json.loads(line[len("SUMMARY "):])
+    assert len(res) == 24
+    bad = {k: v for k, v in res.items() if v["top"] or v["main"]}
     assert not bad, bad

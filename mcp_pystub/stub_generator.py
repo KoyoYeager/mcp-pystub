@@ -917,14 +917,17 @@ def _all_submodule_stubs(pkg_dir: Path, package_name: str, have: dict, note: str
             continue
         if not all(x.isidentifier() for x in rel_parts[:-1]):
             continue
-        # 親がパッケージ（__init__.py がある）の時だけ
-        if not (f.parent / "__init__.py").exists():
-            continue
+        # 親が通常のパッケージ（__init__.py がある）か、パッケージの中の名前空間パッケージ（__init__.py の無いフォルダ。
+        # scipy._external 等: 第 8 回）の時。名前空間パッケージのフォルダには止まるだけの __init__.py を作る
         rel = "/".join(rel_parts[:-1] + (stem + ".py",))
         if rel in have or rel in out:
             continue
         mod = ".".join(rel_parts[:-1] + ((stem,) if stem != "__init__" else ()))
         out[rel] = _LOUD_HEADER.format(module=mod, note=note) + _NET_ALL
+        for i in range(len(package_name.split(".")) + 1, len(rel_parts)):
+            init = "/".join(rel_parts[:i]) + "/__init__.py"
+            if init not in have and init not in out:
+                out[init] = _LOUD_HEADER.format(module=".".join(rel_parts[:i]), note=note) + _NET_ALL
     return out
 
 

@@ -163,7 +163,7 @@ def _analyze(entry_point: str, python_path: str, max_depth: int, include_small_c
     result_dict = {"summary": _summary(result_dict, str(entry), python_path, required), **result_dict}
     result_dict["next_steps"] = [
         "手順 1: verify(entry_point, python_path, packages=[...], submodules=[...], nofollow=[...]) で、スタブに差し替えて "
-        "import できることを確かめてください（既定は import だけ。import だけの確認でも、各モジュールの直下のコード（import 時に実行されるコード）は動きます。エントリーの `if __name__ == \"__main__\":` の中は動きません。）。",
+        "import できることを確かめてください（既定は import だけ: グラフ上のモジュールの直下のコード（import 時に実行されるコード）は動きますが、エントリーのスクリプトはどの名前でも実行しません）。",
         "手順 2: スタブを適用してビルドし、普段のやり方で exe を試してください（スタブに触れたら原因を出して終了コード 70 で止まります）。",
         "任意: エントリーを動かしても安全な時（副作用が無い・試験用の引数や入力がある）だけ、run_entry=True や実行の記録"
         "（python -m mcp_pystub.trace）でより強く確かめられます。",
@@ -467,7 +467,7 @@ def _summary(rd: dict, entry: str, python_path: str, required: list) -> dict:
     py = f", python_path={python_path!r}" if python_path else ""
     steps = [
         f"1. verify({entry!r}{py}, packages=[...], submodules=['<サブモジュール>=><排除する C 拡張>']) で、スタブに差し替えて"
-        "import できることを確かめる（既定は import だけで、エントリー本体は動かさない。" + "import だけの確認でも、各モジュールの直下のコード（import 時に実行されるコード）は動きます。エントリーの `if __name__ == \"__main__\":` の中は動きません。" + "）",
+        "import できることを確かめる（既定は import だけ: グラフ上のモジュールの直下のコード（import 時のコード）は動くが、エントリーのスクリプトはどの名前でも実行しない（エントリーを間接に import するローカルのモジュールは import の対象から外し、結果の note に出す））",
         "2. スタブを適用してビルドし、普段のやり方で exe を試す（スタブに触れる経路を通ったら原因を出して終了コード 70 で止まる）",
         "（任意）エントリーを動かしても安全な時（副作用が無い・試験用の引数や入力がある）だけ、verify(..., run_entry=True) や"
         "実行の記録（python -m mcp_pystub.trace）でより強く確かめられる",

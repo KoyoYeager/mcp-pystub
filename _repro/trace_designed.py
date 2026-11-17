@@ -5,9 +5,11 @@ W = str(Path(__file__).resolve().parent.parent)
 sys.path.insert(0, W)
 from mcp_pystub.trace import load, observe  # noqa: E402
 D = Path(r"C:\tmp\pystub-e2e\designed")
-O = Path(r"C:\tmp\pystub-e2e\after_trace\designed")
+O = Path(sys.argv[1])
 O.mkdir(parents=True, exist_ok=True)
-PY = D / "venv" / "Scripts" / "python.exe"
+PY = Path(sys.argv[2]) if len(sys.argv) > 2 else D / "venv" / "Scripts" / "python.exe"
+import os
+ENV = dict(os.environ, PYTHONPATH=str(D / "venv" / "Lib" / "site-packages")) if len(sys.argv) > 2 else None
 SP = [str(D / "venv" / "Lib" / "site-packages")]
 EXPECT = {"proj": {"heavyframe": ("not_imported", "import_only"), "typesonly": ("not_imported", "import_only"),
                    "constlib": ("not_imported", "import_only"), "optaccel": ("not_imported", "import_only"),
@@ -19,7 +21,8 @@ ok = True
 for pj in ("proj", "proj_b"):
     tf = O / f"{pj}_trace.json"
     code = f"import sys; sys.path.append({W!r}); from mcp_pystub.trace import main; sys.exit(main(['--out', {str(tf)!r}, 'entry.py']))"
-    r = subprocess.run([str(PY), "-c", code], cwd=str(D / pj), capture_output=True, text=True)
+    r = subprocess.run([str(PY), "-c", code], cwd=str(D / pj), capture_output=True, text=True, env=ENV)
+    print(pj, "rc", r.returncode, r.stderr[-300:])
     t = load(str(tf))
     got = {p: observe(t, p, SP) for p in ["heavyframe", "typesonly", "constlib", "optaccel", "qtbig", "usedlib",
                                          "importtime", "optused", "libconv", "libconv.gui"]}

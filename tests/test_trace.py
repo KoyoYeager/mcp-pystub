@@ -195,16 +195,66 @@ def test_monitoring_tool_released():
     tr.stop(rec2)
 
 
-def test_setprofile_path(monkeypatch):
-    """3.12 より前の経路（sys.setprofile）"""
+def test_setprofile_path(monkeypatch, tmp_path):
+    """3.12 より前の経路（sys.setprofile）: 区分（import_only / executed）まで確かめる"""
+    sp, ep = _make(tmp_path)
     monkeypatch.setattr(tr.sys, "version_info", (3, 11, 0))
-
-    def f():
-        return 1
+    monkeypatch.syspath_prepend(str(sp))
+    for m in [m for m in sys.modules if m.split(".")[0] in ("usedpkg", "imponly", "selfinit", "otherinit", "caller")]:
+        monkeypatch.delitem(sys.modules, m)
     rec = tr.start("")
-    f()
+    import caller  # noqa: F401  import の途中で otherinit.setup() を呼ぶ
+    import imponly  # noqa: F401
+    import selfinit  # noqa: F401
+    import usedpkg
+    usedpkg.work(2)
     d = tr.stop(rec)
-    assert any(x[1].endswith("f") for x in d["executed"])
+    st = {p: tr.observe(d, p, [str(sp)])["state"] for p in ("usedpkg", "imponly", "selfinit", "otherinit", "caller", "absent")}
+    assert st == {"usedpkg": "executed", "imponly": "import_only", "selfinit": "import_only", "otherinit": "executed",
+                  "caller": "import_only", "absent": "not_imported"}, st
+
+
+def test_cli_relative_path_same_as_plain(tmp_path):
+    """N11: 相対パスで渡しても、__file__ / sys.argv[0] / __name__ / sys.path[0] が普段の python entry.py と同じ"""
+    sp, ep = _make(tmp_path)
+    probe = ep.parent / "probe.py"
+    probe.write_text("import os, sys\nprint(__file__, sys.argv[0], __name__, sys.path[0], sep='|')\n", encoding="utf-8")
+    env = {"PYTHONPATH": str(ROOT), "PYTHONIOENCODING": "utf-8", "SYSTEMROOT": __import__("os").environ.get("SYSTEMROOT", "")}
+    plain = subprocess.run([sys.executable, "probe.py"], capture_output=True, text=True, env=env, cwd=str(ep.parent))
+    out = tmp_path / "t.json"
+    traced = subprocess.run([sys.executable, "-m", "mcp_pystub.trace", "--out", str(out), "probe.py"], capture_output=True,
+                            text=True, env=env, cwd=str(ep.parent))
+    assert traced.returncode == 0, traced.stderr
+    assert traced.stdout == plain.stdout, (traced.stdout, plain.stdout)
+
+
+def test_cli_records_child_processes(tmp_path):
+    """子孫のプロセス（multiprocessing の spawn）の中の実行も記録する"""
+    sp, ep = _make(tmp_path)
+    ep2 = ep.parent / "mp.py"
+    ep2.write_text("import concurrent.futures as cf, usedpkg\nif __name__ == '__main__':\n"
+                   "    with cf.ProcessPoolExecutor(1) as ex:\n        print(list(ex.map(usedpkg.work, [1, 2])))\n",
+                   encoding="utf-8")
+    out = tmp_path / "t.json"
+    r = _trace(tmp_path, sp, [str(ep2)], out)
+    assert r.returncode == 0, r.stderr
+    t = tr.load(str(out))
+    assert t["child_processes"] >= 1 and t["untraced_child_processes"] == 0, t
+    assert tr.observe(t, "usedpkg", [str(sp)])["state"] == "executed"
+
+
+def test_verify_stdout_compared_in_full(tmp_path):
+    """L1: 標準出力の先頭の違い（2 万文字より前）も比べる"""
+    from mcp_pystub.verifier import verify
+    sp, ep = _make(tmp_path)
+    (sp / "reg").mkdir()
+    (sp / "reg" / "__init__.py").write_text("NAMES = set()\n", encoding="utf-8")
+    (sp / "xplug").mkdir()
+    (sp / "xplug" / "__init__.py").write_text("import reg\nreg.NAMES.add('x')\n", encoding="utf-8")
+    ep.write_text("import reg, xplug\nprint(sorted(reg.NAMES))\nfor i in range(3000):\n    print('row', i)\n",
+                  encoding="utf-8")
+    v = verify(str(ep), python_path=str(sp), packages=["xplug"], submodules=[], nofollow=[], run_entry=True, record=True)
+    assert "xplug" not in v["passed"]["packages"], v["rejected"]
 
 
 def test_generate_required_is_loud(tmp_path):

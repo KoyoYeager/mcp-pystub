@@ -7,7 +7,8 @@
   ヒントでは対象の C 拡張パッケージを import 不可にして、本当に要らないことを確かめる）
 - まずスタブ無しで同じ import を行い（基準）、スタブありで新たに失敗したものを「スタブが原因」とする
 - 失敗の原因になったスタブを外して繰り返し、検証を通った組を返す
-- エントリー本体の実行は run_entry=True のときだけ（出力・終了コードを基準と比べる）
+- エントリーの実行は run_entry=True のときだけ（標準出力の全体・終了コードを基準と比べる）。import だけの確認では、
+  エントリーのスクリプトはどの名前でも実行しない
 """
 
 from __future__ import annotations
@@ -26,39 +27,20 @@ from mcp_pystub.semantics import under
 from mcp_pystub.usage_analyzer import analyze_packages, get_semantics
 
 _CHILD = r'''
-import importlib, importlib.abc, importlib.machinery, importlib.util, io, json, os, runpy, sys, traceback
+import hashlib, importlib, io, json, os, runpy, sys, traceback
 cfg = json.load(open(sys.argv[1], encoding="utf-8"))
-STUBS = cfg["stubs"]            # module name -> stub file
-PREFIXES = cfg["prefixes"]      # stubbed prefixes (names under them come only from STUBS)
-BLOCK = cfg["block"]            # prefixes that must not be importable (nofollow / hint targets)
 out = open(cfg["out"], "a", encoding="utf-8")
-
-def _under(n, p):
-    return n == p or n.startswith(p + ".")
-
-class _Finder(importlib.abc.MetaPathFinder):
-    def find_spec(self, name, path=None, target=None):
-        for b in BLOCK:
-            if _under(name, b):
-                raise ModuleNotFoundError(f"No module named {name!r} (excluded by verify)", name=name)
-        f = STUBS.get(name)
-        if f:
-            if os.path.basename(f) == "__init__.py":
-                return importlib.util.spec_from_file_location(name, f, submodule_search_locations=[os.path.dirname(f)])
-            return importlib.util.spec_from_file_location(name, f)
-        for p in PREFIXES:
-            if _under(name, p):
-                raise ModuleNotFoundError(f"No module named {name!r} (not in stub)", name=name)
-        return None
-
-if STUBS or BLOCK:
-    sys.meta_path.insert(0, _Finder())
+# スタブの差し込み（meta path finder）と実行の記録は、インタープリタの起動時に sitecustomize（PYTHONPATH の先頭の
+# 一時フォルダ）が始めている。子孫のプロセス（multiprocessing の spawn・subprocess の python）にも同じものが効く
+BOOT = getattr(sys, "_pystub_boot", None)
 for d in reversed(cfg["sys_path"]):
     sys.path.insert(0, d)
 
 def emit(rec):
     out.write(json.dumps(rec, ensure_ascii=False) + "\n")
     out.flush()
+
+emit({"startup_loaded": (BOOT or {}).get("startup_loaded", []), "boot": BOOT is not None})
 
 def run_entry():
     emit({"start": "<entry>"})
@@ -88,24 +70,22 @@ def run_entry():
             os.chdir(saved_cwd)
         except OSError:
             pass
-    emit({"m": "<entry>", "ok": rc == 0, "rc": rc, "stdout": buf.getvalue()[-20000:], "err": err})
+    text = buf.getvalue()
+    # 比べるのは標準出力の全体（長さとハッシュ）。表示用に先頭と末尾だけ持つ（第 8 回 L1）
+    key = f"{len(text)}:{hashlib.sha256(text.encode('utf-8', 'surrogatepass')).hexdigest()}"
+    shown = text if len(text) <= 4000 else text[:2000] + "\n…\n" + text[-2000:]
+    emit({"m": "<entry>", "ok": rc == 0, "rc": rc, "stdout": shown, "stdout_key": key, "err": err})
 
-if cfg.get("entry_first") and cfg["run_entry"]:
-    # 実行の記録を取る時は、どの子プロセスもエントリーを先に動かす（普段の実行と同じく、グラフ上のモジュールを
-    # 先に import しない）。記録は基準（スタブなし）の実行の時だけ、エントリーの実行の間だけ取る
-    if cfg.get("trace_out"):
-        _spec = importlib.util.spec_from_file_location("_pystub_trace", cfg["trace_mod"])
-        _trm = importlib.util.module_from_spec(_spec)
-        _spec.loader.exec_module(_trm)
-        _rec = _trm.start(cfg["entry"])
-        try:
-            run_entry()
-        finally:
-            _data = _trm.stop(_rec)
+if cfg["run_entry"]:
+    # エントリーは常に先に動かす（普段の実行と同じく、グラフ上のモジュールを先に import しない: 第 8 回 P1）。
+    # 記録は基準（スタブなし）の実行の時だけ。起動時から始まっていて、エントリーの実行が終わったところで止める
+    try:
+        run_entry()
+    finally:
+        if cfg.get("trace_out") and BOOT and BOOT.get("rec") is not None:
+            _data = BOOT["trm"].stop(BOOT["rec"])
             with open(cfg["trace_out"], "w", encoding="utf-8") as _f:
                 json.dump(_data, _f, ensure_ascii=False)
-    else:
-        run_entry()
     cfg["run_entry"] = False
 
 for m in cfg["targets"]:
@@ -115,8 +95,6 @@ for m in cfg["targets"]:
         emit({"m": m, "ok": True})
     except BaseException as e:  # noqa
         emit({"m": m, "ok": False, "err": f"{type(e).__name__}: {e}"[:800], "tb": traceback.format_exc()[-3000:]})
-if cfg["run_entry"]:
-    run_entry()
 emit({"done": True})
 '''
 
@@ -149,10 +127,25 @@ def _run_child(py: str, cfg: dict, workdir: Path, timeout: float) -> tuple[list[
     child = workdir / "child.py"
     if not child.exists():
         child.write_text(_CHILD, encoding="utf-8")
+    from mcp_pystub import trace as _trace
+    boot_dir = workdir / "boot"
+    if not (boot_dir / "sitecustomize.py").exists():
+        boot_dir.mkdir(parents=True, exist_ok=True)
+        (boot_dir / "sitecustomize.py").write_text(_trace.BOOT, encoding="utf-8")
+    proc_dir = workdir / f"procs_{time.time_ns()}"
+    boot_cfg = {"stubs": cfg["stubs"], "prefixes": cfg["prefixes"], "block": cfg["block"], "watch": cfg.get("watch", []),
+                "entry": cfg["entry"], "entry_guard": not cfg["run_entry"], "extra_path": cfg.get("extra_path", []),
+                "proc_dir": str(proc_dir)}
+    if cfg.get("trace_out"):
+        boot_cfg["trace_mod"] = cfg["trace_mod"]
+    boot_path = workdir / f"boot_{time.time_ns()}.json"
+    boot_path.write_text(json.dumps(boot_cfg, ensure_ascii=False), encoding="utf-8")
     env = dict(os.environ)
     env.update({"PYTHONIOENCODING": "utf-8", "PYTHONDONTWRITEBYTECODE": "1", "MPLBACKEND": "Agg",
                 "QT_QPA_PLATFORM": "offscreen", "PYTHONNOUSERSITE": "1" if cfg.get("isolate_user") else ""})
-    env.pop("PYTHONPATH", None)
+    env["PYTHONPATH"] = str(boot_dir)
+    env["MCP_PYSTUB_BOOT"] = str(boot_path)
+    env["MCP_PYSTUB_ROOT"] = "1"
     timed_out = False
     try:
         cp = subprocess.run([py, "-X", "utf8", str(child), str(cfg_path)], cwd=str(workdir), env=env,
@@ -171,6 +164,10 @@ def _run_child(py: str, cfg: dict, workdir: Path, timeout: float) -> tuple[list[
                 recs.append(json.loads(line))
             except json.JSONDecodeError:
                 pass
+    _LAST_CHILD["startup_loaded"] = next((r["startup_loaded"] for r in recs if "startup_loaded" in r), [])
+    _LAST_CHILD["boot"] = next((r["boot"] for r in recs if "boot" in r), False)
+    _LAST_CHILD["procs"] = _trace.read_children(proc_dir)
+    shutil.rmtree(proc_dir, ignore_errors=True)
     return recs, timed_out
 
 
@@ -316,14 +313,33 @@ def verify(
     # import する対象: グラフ上のモジュール（エントリー本体とテスト用モジュールは除く）
     entry_mod = sem.entry_module
     order = sorted(graph.nodes.items(), key=lambda kv: (kv[1].depth, kv[0]))
+    entry_norm = os.path.normcase(str(Path(entry).resolve()))
+    importers: dict[str, set[str]] = {}
+    for e in graph.edges:
+        importers.setdefault(e.to_module, set()).add(e.from_module)
+    seeds = {n for n, node in graph.nodes.items()
+             if n == entry_mod or (node.file_path and os.path.normcase(str(Path(node.file_path).resolve())) == entry_norm)}
+    excluded_entry: set[str] = set(seeds)
+    todo = list(seeds)
+    while todo:
+        n = todo.pop()
+        for f in importers.get(n, ()):
+            node = graph.nodes.get(f)
+            if f not in excluded_entry and node is not None and node.classification == "local":
+                excluded_entry.add(f)
+                todo.append(f)
     targets = [
         name for name, node in order
-        if name != entry_mod and node.classification in ("local", "third_party") and node.file_path
+        if name not in excluded_entry and node.classification in ("local", "third_party") and node.file_path
         and not _is_test_module(name)
     ]
+    excluded_entry_shown = sorted(x for x in excluded_entry if x != entry_mod and x in graph.nodes)
     sys_path = [str(Path(entry).parent)]
     if python_path:
         sys_path.append(str(Path(python_path).resolve()))
+
+    watch = sorted({p for it in items.values() for p in it["prefixes"] + it["block"]})
+    extra_path = [str(Path(python_path).resolve())] if python_path else []
 
     def cfg_for(keys: list[str], tgts: list[str]) -> dict:
         stubs: dict[str, str] = {}
@@ -333,7 +349,7 @@ def verify(
             stubs.update(stub_map[k])
             prefixes += items[k]["prefixes"]
             block += items[k]["block"]
-        return {**_BASE_EXTRA, "entry_first": bool(record and run_entry), "stubs": stubs, "prefixes": prefixes,
+        return {**_BASE_EXTRA, "stubs": stubs, "prefixes": prefixes, "watch": watch, "extra_path": extra_path,
                 "block": block, "targets": tgts, "sys_path": sys_path,
                 "entry": str(entry), "run_entry": run_entry, "entry_args": list(entry_args or []),
                 "cwd": str(Path(cwd).resolve()) if cwd else str(Path(entry).parent)}
@@ -368,6 +384,10 @@ def verify(
     base, base_hung = run_all([], targets)
     _BASE_EXTRA.clear()
     base_child = dict(_LAST_CHILD)  # 基準の子プロセス全体の終了コード・標準エラー（エントリーの後の atexit も含む）
+    base_startup = set(base_child.get("startup_loaded") or [])
+    base_procs = list(base_child.get("procs") or [])
+    for pr in base_procs:
+        base_startup |= set(pr.get("startup_loaded") or [])
     ok_targets = [m for m in targets if base.get(m, {}).get("ok")]
     base_entry = base.get("<entry>")
     entry_note = ""
@@ -429,12 +449,12 @@ def verify(
         if run_entry and base_entry is not None:
             er = res.get("<entry>")
             if er is not None and _LAST_CHILD.get("rc") != base_child.get("rc") \
-                    and er.get("rc") == base_entry.get("rc") and er.get("stdout") == base_entry.get("stdout"):
+                    and er.get("rc") == base_entry.get("rc") and er.get("stdout_key") == base_entry.get("stdout_key"):
                 why = (_LAST_CHILD.get("stderr") or "").strip()
                 fl.append({"m": "<entry>", "entry_mismatch": True, "err": (
                     f"エントリーの後（atexit 等）で子プロセスの終了コードが変わった: 基準 {base_child.get('rc')} → "
                     f"{_LAST_CHILD.get('rc')}: " + (why.splitlines()[-1] if why else "標準エラーなし"))})
-            elif er is None or er.get("rc") != base_entry.get("rc") or er.get("stdout") != base_entry.get("stdout"):
+            elif er is None or er.get("rc") != base_entry.get("rc") or er.get("stdout_key") != base_entry.get("stdout_key"):
                 if er is None:
                     why = _LAST_CHILD.get("stderr", "") or ""
                     er = {"m": "<entry>", "err": (
@@ -497,6 +517,16 @@ def verify(
             trace_data = json.loads(trace_path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             trace_data = None
+    if trace_data is not None:
+        # 基準の実行の子孫のプロセスの記録を足す（記録の取れなかった子孫は数える）
+        runs0 = trace_data.get("runs", 1)
+        for pr in base_procs:
+            if pr.get("trace"):
+                trace_data = _trace.merge(trace_data, pr["trace"])
+            else:
+                trace_data["untraced_child_processes"] = int(trace_data.get("untraced_child_processes", 0)) + 1
+        trace_data["runs"] = runs0
+        trace_data["child_processes"] = len(base_procs)
     if trace_files:
         trace_data = _trace.merge(trace_data, _trace.load(trace_files)) if trace_data else _trace.load(trace_files)
     site_dirs = [str(Path(python_path).resolve())] if python_path else [str(p) for p in resolver._site_packages]
@@ -507,13 +537,42 @@ def verify(
         if it["kind"] == "submodule" and obs is not None:
             obs["targets"] = {t: _trace.observe(trace_data, t, site_dirs)["state"] for t in it.get("targets", [])}
         ok = k in active
-        if ok and run_entry and obs is not None and obs["state"] in ("not_imported", "import_only"):
+        why: list[str] = []
+        if any(under(x, q) or under(q, x) for x in base_startup for q in it["prefixes"] + it["block"]) or \
+                (obs is not None and obs.get("loaded_at_startup")):
+            why.append("起動時（.pth など）に読み込まれるため未確認（スタブの差し込みより前に本物が読み込まれる）")
+        if base_procs and trace_data is not None and (int(trace_data.get("untraced_child_processes", 0)) > 0):
+            why.append("子プロセスが起動されたため、その中の使用は確かめていない（記録の取れなかった子プロセスがある）")
+        elif base_procs and trace_data is None:
+            why.append("子プロセスが起動された（記録が無い）")
+        if ok and run_entry and obs is not None and obs["state"] in ("not_imported", "import_only") and not why:
             st = "confirmed_run"  # 記録で未実行、かつエントリーの差し替え実行を通った
         elif ok:
             st = "confirmed_import"  # import（と、指定があればエントリーの実行）を通った。実行の記録での確認は無い
         else:
             st = "unconfirmed"
-        statuses[name] = {"status": st, "observed": obs, "entry_run_passed": bool(ok and run_entry)}
+        statuses[name] = {"status": st, "observed": obs, "entry_run_passed": bool(ok and run_entry), "_key": k,
+                          "why_not_confirmed_run": why}
+    # まとめて確かめた組と項目ごとの状態の食い違い（第 8 回 S1）: 確認済み（実行）の項目だけの組でもう 1 回確かめる
+    verified_sets: list[dict] = []
+    if active:
+        verified_sets.append({"items": [statuses[n]["_key"] for n in statuses if statuses[n]["_key"] in active],
+                              "result": "passed", "with_entry": run_entry})
+    cand_keys = [v["_key"] for v in statuses.values() if v["status"] == "confirmed_run"]
+    if cand_keys and len(cand_keys) < len(active):
+        f_s, _r_s, m_s = failures(cand_keys)
+        good = not f_s and not m_s
+        verified_sets.append({"items": cand_keys, "result": "passed" if good else "failed", "with_entry": True,
+                              "for": "確認済み（実行）の項目だけの組",
+                              "error": "" if good else ((f_s[0].get("err") or "出力が変わった") if f_s else
+                                                        f"import されなかったモジュール: {', '.join(m_s[:3])}")})
+        if not good:
+            for v in statuses.values():
+                if v["status"] == "confirmed_run":
+                    v["status"] = "confirmed_import"
+                    v["why_not_confirmed_run"].append("確認済み（実行）の項目だけの組では、エントリーの結果が変わった・失敗した")
+    for v in statuses.values():
+        v.pop("_key", None)
     for r in rejected + unresolved:
         statuses.setdefault(r["item"], {"status": "unconfirmed", "observed": None, "entry_run_passed": False})
     labels = {"confirmed_run": "確認済み（実行）", "confirmed_import": "import 確認済み", "unconfirmed": "未確認"}
@@ -535,6 +594,12 @@ def verify(
         "passed": passed,
         "status_summary": status_summary,
         "statuses": statuses,
+        "verified_sets": verified_sets,
+        "verified_sets_note": ("確かめた組をそのまま適用してください。一部だけを適用するなら、その組で verify を回し直してください"
+                               "（組ごとに結果が変わることがあります）。"),
+        "child_processes": len(base_procs),
+        "startup_loaded": sorted(base_startup),
+        "excluded_from_import": excluded_entry_shown,
         "traced": trace_data is not None,
         "status_note": ("確認済み（実行）= 実行の記録で未実行（not_imported / import_only）かつ run_entry=True の差し替え実行を通った。"
                         "import 確認済み = スタブに差し替えた import（と、run_entry=True ならエントリーの実行）を通ったが、"
@@ -548,18 +613,22 @@ def verify(
         "baseline_hung": base_hung,
         "run_entry": run_entry,
         "entry_matched": (None if not run_entry or base_entry is None else (
-            bool(active) and last_res.get("<entry>", {}).get("stdout") == (base_entry or {}).get("stdout")
+            bool(active) and last_res.get("<entry>", {}).get("stdout_key") == (base_entry or {}).get("stdout_key")
         )),
         "entry_note": entry_note if run_entry else
         "run_entry=False のため、エントリーの実行（出力の一致）は確かめていません。import だけを確かめました。",
         "rounds": rounds,
         "elapsed_s": round(time.monotonic() - t0, 1),
         "python_note": py_note,
-        "note": "verify は import（と run_entry=True ならエントリーの 1 回の実行）で確かめるだけで、"
+        "note": ("" if not excluded_entry_shown else
+                 "エントリーを（間接に）import するローカルのモジュールは、エントリーを動かさないため import の対象から外しました: "
+                 + ", ".join(excluded_entry_shown) + "。")
+                + "verify は import（と run_entry=True ならエントリーの 1 回の実行）で確かめるだけで、"
                 "全ての実行経路の保証ではありません。ビルド後の実行確認も行ってください。"
-                + ("" if run_entry else "run_entry=False（既定）は import だけの確認で、各モジュールの直下のコードは動きますが、"
-                   "エントリーの if __name__ == \"__main__\": の中は動きません。")
-                + "比べるのはエントリーの標準出力（実行中に sys.stdout へ書いたもの）と終了コード（エントリーと子プロセス全体）"
+                + ("" if run_entry else "run_entry=False（既定）は import だけの確認で、グラフ上のモジュールの直下のコード"
+                   "（import 時のコード）は動きますが、エントリーのスクリプトはどの名前でも実行しません（エントリーを import する"
+                   "ローカルのモジュールは対象から外し、それでも import されそうになったら止めます）。")
+                + "比べるのはエントリーの標準出力の全体（実行中に sys.stdout へ書いたもの。長さとハッシュ）と終了コード（エントリーと子プロセス全体）"
                 "だけで、標準エラー・ファイルへの出力・import 時に掴まれた stdout への出力は比べません。"
                 "エントリーは sys.argv = [エントリー] + entry_args、作業フォルダ cwd（既定はエントリーのあるフォルダ）で実行します。",
     }
