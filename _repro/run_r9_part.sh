@@ -1,0 +1,20 @@
+#!/bin/bash
+# 第 9 回の測定を直列で（空きメモリが 4 GB 未満なら待つ）。出力は after_round9 だけ
+cd "$(dirname "$0")/.."
+export UV_LINK_MODE=copy UV_CACHE_DIR=C:/tmp/pystub-e2e/uvcache
+O=/c/tmp/pystub-e2e/after_round9
+case "$O" in */after_round9) ;; *) echo "bad out $O"; exit 1;; esac
+mkdir -p $O/cand
+wait_mem() { while [ "$(powershell -Command "[int]((Get-CimInstance Win32_OperatingSystem).FreePhysicalMemory/1024)" | tr -d '\r')" -lt 4096 ]; do sleep 30; done; }
+step() { [ -f "$O/.done_$1" ]; }
+mark() { touch "$O/.done_$1"; }
+step timeout || { wait_mem; echo "timeout $(date +%T)"; python _repro/timeout9.py $O/timeout.json > $O/timeout.log 2>&1; mark timeout; }
+step designed || { echo "designed $(date +%T)"; python _repro/trace_designed.py 'C:\tmp\pystub-e2e\after_round9\designed_313' > $O/designed_313.log 2>&1
+  python _repro/trace_designed.py 'C:\tmp\pystub-e2e\after_round9\designed_311' /c/tmp/pystub-e2e/check_trace/py311/venv/Scripts/python.exe > $O/designed_311.log 2>&1; mark designed; }
+step tcheck || { wait_mem; echo "tcheck $(date +%T)"; PYTHONIOENCODING=utf-8 TCHECK_OUT=$O/attacks TCHECK_RUNS=C:/tmp/pystub-e2e/after_round9/tcheck_runs bash _repro/run_tcheck.sh > $O/tcheck.log 2>&1; mark tcheck; }
+for s in 01_tqdm 02_openpyxl 03_networkx 04_plotly 07_pandas 08_matplotlib 11_sklearn 12_asammdf 13_seaborn 15_pillow real_acc; do
+  step "real_$s" || { wait_mem; echo "trace $s $(date +%T)"; python -u _repro/trace10.py $O/real $s >> $O/real_trace10.log 2>&1; mark "real_$s"; }
+done
+
+
+echo ALLDONE
