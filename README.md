@@ -24,7 +24,7 @@ exe の出力が元と一致することと、site-packages の復元が元と�
 | 12_asammdf | 240.1 MB | **36.9 MB** | 確認済み（実行）の `asammdf.gui`（PySide6・lxml を排除）だけ |
 | 12_asammdf | 240.1 MB | **25.1 MB** | 静的解析の候補を全部（pandas + asammdf.gui） |
 | 03_networkx | 76.7 MB | **40.8 MB** | scipy（記録からの候補）・fontTools・pandas |
-| 01_tqdm | 47.7 MB | **32.7 MB** | pandas・fontTools・PIL（記録からの候補） |
+| 01_tqdm | 47.7 MB | **33.2 MB** | pandas・fontTools・PIL（記録からの候補）。仕上げの回で stubbable の pandas も止まるスタブにしたため、以前の 32.7 MB から +0.5 MB（スタブの各モジュールに止まる仕組みの本体が入るため） |
 | 02_openpyxl | 26.2 MB | **20.3 MB** | openpyxl.drawing.image（PIL を排除） |
 | 15_pillow | 25.7 MB | **14.4 MB** | numpy |
 
