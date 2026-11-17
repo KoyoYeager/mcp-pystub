@@ -64,8 +64,18 @@ submodule hints:    asammdf.gui → PySide6 (523 MB) 排除可能 — 50 hints �
 **条件付き**（`conditional` / `conditional_submodule_hints`） — 安全は示せないが、列挙した機能を使わないなら外せる候補。
 stubbable には混ざりません。各候補に、推定の削減量・条件（壊れる入口と、プロジェクトが呼ぶ公開 API からの経路）・
 証明できなかった理由（名前だけの振り分け / 引数に渡したクラス / 登録デコレータ / 入力次第の分岐）・確認方法
-（`verify(..., run_entry=True)` の呼び出し）が付きます。条件付きのスタブは、条件の機能に到達すると
-`PystubConditionalStubError: mcp-pystub のスタブです。…` で落ちます（黙って結果が変わりません）。
+（`verify(..., run_entry=True)` の呼び出し）と `confidence`（high / low）が付きます。
+
+条件付きのスタブは、条件の機能に到達した時点（呼び出し・添字・真偽・書式・比較・反復・未知の属性のどれでも）で、
+標準エラーに `[mcp-pystub] PystubConditionalStubError: mcp-pystub のスタブです。…` と原因を書いて
+**終了コード 70 で即終了**します（`except` で握りつぶせません）。`MCP_PYSTUB_STRICT=0` を付けた時だけ
+`PystubConditionalStubError` を投げる動作になります（この場合、呼び出し元の `except Exception` 等で
+握りつぶされうる箇所は条件の `may_be_swallowed` に出ます）。
+
+`analyze` の結果の先頭には `summary`（証明済みの推定削減 MB・conditional(high) の MB と件数・推奨の一覧・次の手順）が
+付きます。1 MB 未満の条件付き候補は既定で省き（`conditional_omitted_small` に件数）、`include_small_conditional=True`
+で全件を出します。推定サイズ（`estimated_size_mb` / `estimated_savings_mb`）は**インストール済みのファイルの大きさ**で、
+exe の削減量ではありません（実際の削減は PyInstaller の同梱範囲と圧縮で変わります）。
 
 ## できること / What It Can Do
 
@@ -78,21 +88,30 @@ stubbable には混ざりません。各候補に、推定の削減量・条件�
 - **スタブコード自動生成**: 参照シンボルのみの最小スタブ + ビルド手順（バックアップ・復元・検証）
 - **C 拡張の自動検出**: .pyd / .so を含むパッケージは直接スタブ化不可と判定
 - **C 拡張の間接排除** *(v0.2 new)*: C拡張パッケージを import しているサブモジュールが未使用なら、そのサブモジュールをスタブ化して C拡張を排除可能。PySide6 (523 MB) → asammdf.gui スタブで **exe 40% 削減**を実証
-- **復元安全設計** *(v0.2 new)*: バックアップ + バージョン固定 pip + 検証コマンドの 3 重安全策
+- **復元安全設計**: 元ファイルは site-packages の外の `_pystub_bak/<項目名>/` へ移動（pip uninstall しない）。
+  項目ごとの領域なので、パッケージ全体とサブモジュールのスタブを重ねても元ファイルを失いません（内側が適用中なら
+  外側の適用は断ります）。二重適用・中断にも耐え、復元後は verify_commands が `__file__` と RECORD のハッシュで確かめます
 - **PyInstaller フック情報**: 無効化が必要なフックファイルを通知
 
 ## できないこと・制限事項 / Limitations
 
 - **C 拡張パッケージ**（.pyd / .so）は直接スタブ化すると C 拡張が欠落するため required 判定。ただし `generate_submodule` で**間接排除が可能**（v0.2 で対応）
-- **動的 import**（`importlib.import_module(変数)`）は静的解析で追跡不可（warnings で通知）
+- **動的 import**（`importlib.import_module(変数)` / `__import__(変数)`）は静的解析で追跡不可。プロジェクトのコードに
+  あれば安全側（required）、依存ライブラリの中なら warnings にモジュールと行を出し、判定の前提とします（仕様 5 節）
 - **PyInstaller カスタムフック**: スタブと衝突する場合がありフックの手動無効化が必要
 - **遅延初期化パターン**: `__init__` で直接呼ばず後のメソッドで使うパッケージは検出精度が下がる（安全側で required に判定）
 - **pip 名と import 名の不一致**: `python-dateutil` → `dateutil` 等のマッピングは未対応
-- **ランタイムの条件分岐**: `if sys.version < (3,11)` 内の import は静的解析で判定不可
+- **ランタイムの条件分岐**: `if sys.version_info < (3, 11)` 等の実行環境で決まる分岐は、両方の枝を「確実に実行される」
+  側に倒します（安全側。削減を取りこぼすことがあります）
 
 ### 安全性の設計方針 / Safety Policy
 
-「stubbable と判定したが実は必要だった」は**絶対に起こさない設計**。判定に迷う場合は required（安全側）に倒す。逆方向の誤判定（本当は stubbable なのに required）は許容する。
+証明済みの段（stubbable / nofollow / submodule_stub_hints）は、[仕様](docs/STUB_SAFETY_SPEC.md)の **5 節の前提**
+（import の副作用が無い・ビルド時に実行されない・解析した環境とビルドする環境が同じ・依存ライブラリの中の定数でない
+動的 import は解析の外）のもとで、静的解析で示せたものだけです。判定に迷う場合は required（安全側）に倒し、
+逆方向の誤判定（本当は stubbable なのに required）は許容します。条件付きの段は安全の証明ではありません
+（条件を破ると上のとおり終了コード 70 で止まります）。前提の外の使い方に備えて、適用前に `verify(..., run_entry=True)`、
+ビルド後に実行結果の比較を行ってください。
 
 ## 解析アルゴリズム / Analysis Algorithm
 
@@ -176,6 +195,21 @@ mcp-pystub
 
 > 出力例の数値は再測定中です。
 
+#### verify
+
+```
+入力 / Input:
+  entry_point, python_path, packages=["pandas"], submodules=["asammdf.gui=>PySide6"], nofollow=[],
+  run_entry=True, timeout=120
+
+出力 / Output（抜粋）:
+  {"passed": {"packages": [...], "submodules": [...], "nofollow": [...]},
+   "rejected": [{"item": "...", "reason": "...", "module": "...", "error": "..."}],
+   "unresolved": [...],          # 原因を特定できなかった項目（passed には入れない）
+   "entry_matched": true,        # run_entry=True のとき、エントリーの出力が元と一致したか
+   "note": "..."}                # run_entry=False では import だけを確かめ、実行は確かめていないこと
+```
+
 #### generate
 
 ```
@@ -193,9 +227,11 @@ mcp-pystub
     "stub_file_count": 266,
     "stub_total_bytes": 209530,
     "build_instructions": {
-      "install_commands": ["pip uninstall -y pandas", "# cp stubs to site-packages"],
-      "uninstall_commands": ["pip install pandas"],
-      "hook_disable": ["# hook-pandas*.py → .disabled"]
+      "backup_commands": ["# 元ファイルを .../Lib/_pystub_bak/pandas/ へ移動", "..."],
+      "install_commands": ["# _stubs/ のスタブを配置", "..."],
+      "uninstall_commands": ["# 方法1: バックアップから復元", "...", "# 方法2: pip install --force-reinstall --no-deps pandas==<版>"],
+      "verify_commands": ["python -c \"import pandas; ...__file__...\"", "# RECORD のハッシュ照合"],
+      "hook_disable": ["# リネームして無効化: hook-pandas*.py → .disabled"]
     }
   }
 ```
@@ -219,15 +255,17 @@ mcp-pystub
     "original_size_bytes": 5907331,
     "stub_size_bytes": 144,
     "build_instructions": {
-      "backup_commands": ["cp -r .../asammdf/gui .../asammdf/gui.bak"],
-      "install_commands": ["rm -rf .../asammdf/gui", "cp -r _stubs/asammdf/gui/ .../asammdf/gui/"],
-      "uninstall_commands": ["mv .../asammdf/gui.bak .../asammdf/gui"],
-      "verify_commands": ["python -c \"import asammdf; print('OK')\""]
+      "backup_commands": ["# .../asammdf/gui を .../Lib/_pystub_bak/asammdf.gui/ へ移動（親のスタブが適用中なら何もしない）"],
+      "install_commands": ["# _stubs/asammdf/gui を配置"],
+      "uninstall_commands": ["# バックアップから戻す（この項目の領域があるときだけ）"],
+      "verify_commands": ["python -c \"import asammdf; ...__file__...\"", "# RECORD のハッシュ照合"]
     }
   }
 ```
 
 ## パフォーマンス / Performance
+
+> **再測定中**: 下の表は判定を 2 段に分ける前（v0.2.0）の値です。
 
 | プロジェクト規模 | 解析時間 | ノード数 |
 |-----------------|---------|---------|

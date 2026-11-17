@@ -30,11 +30,14 @@ def _write(root: Path, files: dict) -> None:
             p.write_text(textwrap.dedent(code), encoding="utf-8")
 
 
-def _run(proj: Path, site: Path, entry: Path) -> tuple[int, str]:
+def _run(proj: Path, site: Path, entry: Path, strict: str | None = None) -> tuple[int, str]:
     code = ("import sys; sys.path[:0]=%r; import runpy; runpy.run_path(%r, run_name='__main__')"
             % ([str(proj), str(site)], str(entry)))
     import os
     env = dict(os.environ, PYTHONIOENCODING="utf-8")
+    env.pop("MCP_PYSTUB_STRICT", None)
+    if strict is not None:
+        env["MCP_PYSTUB_STRICT"] = strict
     r = subprocess.run([sys.executable, "-S", "-c", code], capture_output=True, text=True, timeout=60,
                        encoding="utf-8", errors="replace", env=env)
     return r.returncode, (r.stdout + r.stderr).strip()

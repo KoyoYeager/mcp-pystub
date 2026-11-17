@@ -159,6 +159,7 @@ def verify(
     submodules: list[str] | None = None,
     nofollow: list[str] | None = None,
     run_entry: bool = False,
+    timeout: float = 900.0,
 ) -> dict:
     """スタブに差し替えた状態を、対象環境の python で実際に import して確かめます（任意実行）。
 
@@ -172,13 +173,15 @@ def verify(
         packages: 確かめるスタブ化パッケージ（省略時は analyze の stubbable）
         submodules: 確かめるサブモジュール（"asammdf.gui=>PySide6" の形で対象の C 拡張も指定。省略時は analyze のヒント）
         nofollow: 除外して確かめるパッケージ（省略時は analyze の nofollow）
-        run_entry: True ならエントリー本体も実行して出力を元と比べる
+        run_entry: True ならエントリー本体も実行して出力を元と比べる（False では import だけを確かめる）
+        timeout: 子プロセス 1 回あたりの制限時間（秒）
 
     Returns:
-        passed: 検証を通った組 / rejected: 外した項目と失敗の原文
+        passed: 検証を通った組 / rejected: 外した項目と失敗の原文 / unresolved: 原因を特定できなかった項目
+        （passed には入れない）/ entry_matched・entry_note: エントリーの出力の一致（確かめていない時はその旨）
     """
     from mcp_pystub.verifier import verify as _verify
-    return _verify(entry_point, python_path, packages, submodules, nofollow, run_entry)
+    return _verify(entry_point, python_path, packages, submodules, nofollow, run_entry, timeout=timeout)
 
 
 def main() -> None:

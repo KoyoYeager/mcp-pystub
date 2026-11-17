@@ -27,11 +27,11 @@ def test_confidence_high_when_project_does_not_use_entry(tmp_path):
     _write(c.proj, {"main.py": "import sig, other\nprint('ok', sig.Signal(3).value(), other.show(sig.Signal(4)) if False else 0)\n"})
     res = analyze(str(c.proj / "main.py"), python_path=str(c.sp), include_small_conditional=True)
     cond = {p["package_name"]: p for p in res["conditional"]}
-    if "gx" in cond:
-        g = cond["gx"]
-        assert g["confidence"] in ("high", "low")
-        for x in g["conditions"]:
-            assert "project_uses_count" in x and "project_note" in x
+    assert "gx" in cond, res["conditional"]  # 候補が出ないなら失敗（黙って通さない）
+    g = cond["gx"]
+    assert g["confidence"] == "high", g
+    for x in g["conditions"]:
+        assert x["project_uses_count"] == 0 and "project_note" in x
 
 
 def test_confidence_low_when_project_uses_entry_name(tmp_path):
@@ -80,7 +80,12 @@ def test_swallowed_stub_error_is_still_reported_on_stderr(tmp_path):
     g = [p for p in c.res["conditional"] if p["package_name"] == "gx"][0]
     assert g["conditions"][0]["may_be_swallowed"] is True
     site = c.apply(packages=["gx"])
+    # 既定: 握りつぶせない（標準エラーに原因を書いて終了コード 70）
     rc, out = _run(c.proj, site, c.proj / "violate.py")
+    assert rc == 70 and "PystubConditionalStubError" in out and "mcp-pystub のスタブです" in out
+    assert "fallback" not in out
+    # MCP_PYSTUB_STRICT=0: 例外を投げる（握りつぶされても標準エラーには出る）
+    rc, out = _run(c.proj, site, c.proj / "violate.py", strict="0")
     assert "fallback" in out and "mcp-pystub のスタブです" in out
 
 
@@ -116,7 +121,8 @@ def test_overlapping_package_and_submodule_stub_restore(tmp_path):
             f.write_text(code, encoding="utf-8")
 
     def sh(lines):
-        r = subprocess.run([bash, "-c", "\n".join(lines)], cwd=stage, capture_output=True, text=True)
+        r = subprocess.run([bash, "-c", "\n".join(lines)], cwd=stage, capture_output=True, text=True,
+                           encoding="utf-8", errors="replace")
         assert r.returncode == 0, r.stderr
 
     def method1(bi):

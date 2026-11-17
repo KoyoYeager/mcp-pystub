@@ -147,16 +147,21 @@ def build_import_graph(
         graph.warnings.append(f"エントリーポイントが見つかりません: {entry_point}")
         return graph
 
-    # スクリプトのディレクトリは sys.path[0]
-    resolver.add_local_root(entry.parent)
-
-    # エントリーポイントのモジュール名を推定
-    entry_module = _path_to_module_name(entry, entry.parent)
+    # スクリプトのディレクトリは sys.path[0]。パッケージの中のエントリー（python -m pkg 形式）なら
+    # パッケージの外側が起点で、モジュール名は pkg.__main__ 等（相対 import を正しく解決する: 仕様 4 節）
+    entry_module, pkg_root = entry_module_name(entry)
+    resolver.add_local_root(pkg_root)
     graph.entry_module = entry_module
+    graph.entry_packages = _parents(entry_module)  # type: ignore[attr-defined]  # -m で先に実行される親パッケージ
 
     # BFS キュー: (file_path, module_name, depth)
     queue: deque[tuple[str, str, int]] = deque()
     queue.append((str(entry), entry_module, 0))
+    # -m 形式: 親パッケージの __init__.py も（エントリーより先に）実行される
+    for i, parent in enumerate(graph.entry_packages):  # type: ignore[attr-defined]
+        init = pkg_root.joinpath(*parent.split("."), "__init__.py")
+        if init.is_file():
+            queue.append((str(init), parent, 1))
 
     # 訪問済みファイルパス
     visited: set[str] = set()
@@ -165,7 +170,7 @@ def build_import_graph(
     while queue:
         file_path, module_name, depth = queue.popleft()
 
-        normalized = str(Path(file_path).resolve())
+        normalized = _resolved(file_path)
         if normalized in visited:
             continue
         visited.add(normalized)
@@ -237,7 +242,7 @@ def build_import_graph(
 
                 # 解決先ファイルがあれば BFS キューに追加
                 if resolution.file_path:
-                    resolved = str(Path(resolution.file_path).resolve())
+                    resolved = _resolved(resolution.file_path)
                     if resolved not in visited and (
                         resolved.endswith((".py", ".pyw")) or is_extension_file(resolved)
                     ):
@@ -253,6 +258,55 @@ def build_import_graph(
         )
     graph.warnings.extend(w for w in resolver.warnings if w not in graph.warnings)
     return graph
+
+
+_RESOLVED: dict[str, str] = {}
+
+
+def _resolved(path: str) -> str:
+    """Path.resolve() の結果を覚える（同じファイルへの import が何万回も出る）。"""
+    r = _RESOLVED.get(path)
+    if r is None:
+        r = str(Path(path).resolve())
+        if len(_RESOLVED) > 200000:
+            _RESOLVED.clear()
+        _RESOLVED[path] = r
+    return r
+
+
+def _parents(module: str) -> list[str]:
+    parts = module.split(".")
+    return [".".join(parts[:i]) for i in range(1, len(parts))]
+
+
+def entry_module_name(entry: Path) -> tuple[str, Path]:
+    """エントリーのモジュール名と、sys.path に入る起点のディレクトリ。
+
+    エントリーが __init__.py のあるディレクトリにあり、`__main__.py` であるか相対 import を含む場合は
+    `python -m pkg.mod` で実行されるものとして扱う（そうでなければ相対 import は実行時に失敗する）。
+    """
+    d = entry.parent
+    parts: list[str] = []
+    while (d / "__init__.py").is_file() and d.name.isidentifier():
+        parts.insert(0, d.name)
+        if d.parent == d:
+            break
+        d = d.parent
+    if parts:
+        as_module = entry.name == "__main__.py"
+        if not as_module:
+            try:
+                import ast as _ast
+                from mcp_pystub.import_extractor import parse_file
+                tree, _err = parse_file(str(entry))
+                as_module = tree is not None and any(
+                    isinstance(n, _ast.ImportFrom) and (n.level or 0) > 0 for n in _ast.walk(tree))
+            except Exception:  # noqa: BLE001
+                as_module = False
+        if as_module:
+            stem = entry.stem
+            return ".".join(parts + ([stem] if stem != "__init__" else [])), d
+    return entry.stem, entry.parent
 
 
 def _path_to_module_name(file_path: Path, project_root: Path) -> str:

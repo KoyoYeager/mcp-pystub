@@ -14,6 +14,8 @@
 from __future__ import annotations
 
 import ast
+import tokenize
+from collections import OrderedDict
 import builtins
 import re
 import sys
@@ -60,6 +62,31 @@ _REACH_CTX: frozenset[str] = frozenset({
 })
 
 
+_AST = ast.AST
+
+
+def _fast_walk(tree: ast.AST):
+    """ast.walk と同じ全ノード（順序は異なる）。iter_child_nodes の生成器を使わないので速い。"""
+    stack = [tree]
+    pop = stack.pop
+    push = stack.append
+    ext = stack.extend
+    AST = _AST
+    while stack:
+        n = pop()
+        yield n
+        for f in n._fields:
+            v = getattr(n, f, None)
+            if v.__class__ is list:
+                ext([x for x in v if isinstance(x, AST)])
+            elif isinstance(v, AST):
+                push(v)
+
+
+def _pos(node: ast.AST) -> tuple[int, int]:
+    return (getattr(node, "lineno", 0), getattr(node, "col_offset", 0))
+
+
 def under(module: str, prefix: str) -> bool:
     """module が prefix（パッケージ名またはサブモジュール名）配下か。"""
     return module == prefix or module.startswith(prefix + ".")
@@ -74,7 +101,7 @@ def is_external_module(name: str) -> bool:
 # ---------------------------------------------------------------------------
 
 
-@dataclass
+@dataclass(slots=True)  # 件数が多い（メモリ）
 class Binding:
     kind: str  # module | from | def | class | literal | alias | call | unknown
     target: str = ""  # module 名（module / from）
@@ -83,18 +110,20 @@ class Binding:
     qualname: str = ""
     conditional: bool = False
     fallback: bool = False  # `except ImportError:` の中の束縛（元の環境では import が成功するので実行されない）
+    pos: tuple = ()  # def / class: (lineno, col_offset)。木そのものは持たない（メモリ）
 
 
 @dataclass
 class ClassInfo:
     module: str
     qualname: str
-    node: ast.ClassDef
+    node: ast.ClassDef | None  # 木は持たない（メモリ）
     methods: dict[str, list[str]] = field(default_factory=dict)  # name -> unit qualnames
     properties: set[str] = field(default_factory=set)
     attrs: dict[str, list[Binding]] = field(default_factory=dict)  # クラス本体の束縛
     bases: list[ast.expr] = field(default_factory=list)
     keywords: list[ast.keyword] = field(default_factory=list)
+    decorators: list[str] = field(default_factory=list)  # デコレータの末尾の名前
 
 
 @dataclass
@@ -111,19 +140,26 @@ class ModuleInfo:
     has_getattr: bool = False
     future_annotations: bool = False
     classes: dict[str, ClassInfo] = field(default_factory=dict)
-    functions: dict[str, ast.AST] = field(default_factory=dict)  # qualname -> def node
+    # qualname -> (lineno, col_offset, 開始行（デコレータ込み）, 終了行)。本体の木は持たず、必要な時に
+    # その行だけを読み直して構文解析する（Program.function_node）
+    functions: dict[str, tuple[int, int, int, int]] = field(default_factory=dict)
     func_class: dict[str, str] = field(default_factory=dict)  # qualname -> 所属クラス qualname
-    qual_of: dict[int, str] = field(default_factory=dict)  # id(def node) -> qualname
-    class_qual_of: dict[int, str] = field(default_factory=dict)
+    qual_of: dict[tuple[int, int], str] = field(default_factory=dict)  # (lineno, col) of def -> qualname
+    class_qual_of: dict[tuple[int, int], str] = field(default_factory=dict)
     all_names: list[str] | None = None  # __all__（リテラルの場合）
+    dynamic_globals: bool = False  # globals()[...] / globals().update 等で名前が増減しうる
     mutated: set[str] = field(default_factory=set)  # 変更されうる名前（global / 属性・添字への代入 / メソッド呼び出し）
     attr_stores: set[str] = field(default_factory=set)  # `x.NAME = ...` で書き込まれる属性名
     global_names: set[str] = field(default_factory=set)  # 関数内で global 宣言された名前
     mutations_done: bool = False
     unit_built: bool = False
+    # 呼び出しの索引（読み込み時）: 名前 → 文字列リテラルを含む呼び出し / リテラルを含まない呼び出しのある名前
+    calls: dict[str, list[tuple]] = field(default_factory=dict)
+    nonlit_calls: set[str] = field(default_factory=set)
+    src_size: int = 0
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)  # 件数が多い（メモリ）
 class Ref:
     """解決済みの参照。
 
@@ -187,7 +223,7 @@ class Ref:
         return out
 
 
-@dataclass
+@dataclass(slots=True)  # 件数が多い（メモリ）
 class Event:
     kind: str  # ref | import | method | attr | dynamic | classdef | family | subclasses | entry_points | unanalyzable
     ctx: str = ""
@@ -205,7 +241,7 @@ class Event:
     broad: bool = False  # `except Exception` / `except:` で囲まれている（例外が握りつぶされうる）
 
 
-@dataclass
+@dataclass(slots=True)  # 件数が多い（メモリ）
 class Unit:
     module: str
     qualname: str  # "<module>" = モジュール本体
@@ -213,6 +249,8 @@ class Unit:
     cls: str = ""  # メソッドならクラスの qualname
     events: list[Event] = field(default_factory=list)
     escaped_units: list[str] = field(default_factory=list)  # 登録されうる関数（未知・登録デコレータ）
+    certain_escaped: set[str] = field(default_factory=set)  # 登録が確実に実行される（atexit.register 等）
+    unknown_calls: bool = False  # 中身の分からない呼び出し（ループ変数・添字の呼び出し）がある
 
     @property
     def key(self) -> tuple[str, str]:
@@ -274,6 +312,49 @@ def literal_source(node: ast.AST | None) -> str | None:
 
 def _is_mutable_literal(node: ast.AST | None) -> bool:
     return isinstance(node, (ast.List, ast.Dict, ast.Set))
+
+
+_STUB_ERROR_CATCHERS = frozenset({"Exception", "BaseException", "RuntimeError"})
+
+
+def _catches_stub_error(t: ast.expr | None) -> bool:
+    """except 節（の型）が条件付きスタブの例外（RuntimeError の派生）を捕まえうるか。"""
+    if t is None:
+        return True
+    if isinstance(t, ast.Tuple):
+        return any(_catches_stub_error(x) for x in t.elts)
+    name = t.id if isinstance(t, ast.Name) else (t.attr if isinstance(t, ast.Attribute) else "")
+    return name in _STUB_ERROR_CATCHERS
+
+
+_ENV_NAMES = frozenset({"version_info", "platform", "name", "byteorder", "maxsize", "implementation",
+                        "hexversion", "TYPE_CHECKING", "PY2", "PY3", "PY37", "PY38", "PY39", "PY310", "PY311",
+                        "PY312", "PY313", "IS_WIN", "WINDOWS", "IS_WINDOWS"})
+_ENV_CALLS = frozenset({"system", "python_implementation", "machine", "python_version"})
+
+
+def _env_only_test(test: ast.expr) -> bool:
+    """`sys.version_info >= (3, 8)` / `sys.platform == 'win32'` / `os.name == 'nt'` のように、実行環境だけで
+    決まる判定か（入力に依らない: 両方の枝を「確実」側に倒す = 安全側）。"""
+    for n in ast.walk(test):
+        if isinstance(n, (ast.Compare, ast.BoolOp, ast.UnaryOp, ast.Constant, ast.Tuple, ast.cmpop, ast.boolop,
+                          ast.unaryop, ast.expr_context, ast.Subscript, ast.Slice)):
+            continue
+        if isinstance(n, ast.Attribute):
+            if n.attr in _ENV_NAMES or n.attr in _ENV_CALLS or n.attr in ("sys", "os", "platform"):
+                continue
+            return False
+        if isinstance(n, ast.Name):
+            if n.id in ("sys", "os", "platform") or n.id in _ENV_NAMES:
+                continue
+            return False
+        if isinstance(n, ast.Call):
+            f = n.func
+            if isinstance(f, ast.Attribute) and f.attr in _ENV_CALLS and not n.args:
+                continue
+            return False
+        return False
+    return True
 
 
 def _decorator_last_name(dec: ast.expr) -> str:
@@ -411,21 +492,69 @@ class Program:
         self._names_cache: dict[str, tuple] = {}
         self._pkg_store_names: dict[str, set[bytes]] = {}
         self._pkg_dyn_store: set[str] = set()
+        self._tree_lru: OrderedDict[str, ModuleInfo] = OrderedDict()
+        self._lines_lru: OrderedDict[str, list[str]] = OrderedDict()
+        self.reparsed = 0
+        self._depth = 0
+        self._draining = False
+        self._pending: list[ModuleInfo] = []
+        self._prescanned: set[str] = set()
+        self.eager_units = False  # True: 読み込み直後にモジュール本体のユニットを作る（get_semantics が設定）
+        self.introspecting_tops: set[str] = set()  # 注釈を実行時に取り出すコードのある top-level（"<project>" も）
+        self._tree_bytes = 0
 
     # --- 読み込み ---
 
     def register(self, name: str, path: str | None) -> None:
         if name in self.modules and self.modules[name] is not None:
             return
-        self.modules[name] = self._load(name, path)
+        self._depth += 1
+        try:
+            self.modules[name] = self._load(name, path)
+        finally:
+            self._depth -= 1
+        self._drain()
 
     def get(self, name: str) -> ModuleInfo | None:
         if name in self.modules:
             return self.modules[name]
         path = self.resolver.find_module_file(name)
-        info = self._load(name, path) if path else None
-        self.modules[name] = info
+        self._depth += 1
+        try:
+            info = self._load(name, path) if path else None
+            self.modules[name] = info
+        finally:
+            self._depth -= 1
+        self._drain()
         return info
+
+    def prescan(self, name: str, path: str | None) -> None:
+        """属性への書き込みの検出（_note_stores）を、構文解析より前に全モジュールぶん済ませる。
+
+        モジュール本体のユニットを読み込み直後に作る（木を読み直さないため）ので、定数の判定に使う
+        「パッケージ内で書き込まれる属性名」は、先に全部そろえておく必要がある。
+        """
+        if not path or name in self._prescanned:
+            return
+        try:
+            data = Path(path).read_bytes()
+        except OSError:
+            return
+        self._prescanned.add(name)
+        self._note_stores(name, data)
+
+    def _drain(self) -> None:
+        """読み込んだモジュールの本体のユニットを、木が手元にあるうちに作る（新しく読み込んだものから）。"""
+        if self._depth or self._draining or not self.eager_units:
+            return
+        self._draining = True
+        try:
+            while self._pending:
+                info = self._pending.pop()
+                if not info.unit_built:
+                    self.build_module_unit(info)
+        finally:
+            self._draining = False
 
     def _load(self, name: str, path: str | None) -> ModuleInfo | None:
         if not path:
@@ -441,7 +570,12 @@ class Program:
         tree, error = parse_file(str(p))
         info = ModuleInfo(name=name, path=str(p), is_package=is_pkg, tree=tree)
         try:
-            self._note_stores(name, p.read_bytes())
+            if name in self._prescanned:
+                info.src_size = p.stat().st_size
+            else:
+                data = p.read_bytes()
+                info.src_size = len(data)
+                self._note_stores(name, data)
         except OSError:
             pass
         if tree is None:
@@ -449,7 +583,127 @@ class Program:
             info.parse_error = error
             return info
         self._collect_module(info)
+        self._collect_mutations(info)
+        self._keep_tree(info)
+        if self.eager_units:
+            self._pending.append(info)
         return info
+
+    # --- 構文木の保持（メモリ: 全モジュールの木を同時に持たない） ---
+
+    _TREE_BUDGET = 600_000  # 保持する木のソースの合計バイト（木はソースの約 30 倍のメモリ）。本体のユニットは読み込み直後に作るので小さくてよい
+    _LINES_LRU = 64
+
+    def _keep_tree(self, info: ModuleInfo) -> None:
+        lru = self._tree_lru
+        if info.name not in lru:
+            self._tree_bytes += info.src_size
+        lru[info.name] = info
+        lru.move_to_end(info.name)
+        while self._tree_bytes > self._TREE_BUDGET and len(lru) > 1:
+            _n, old = lru.popitem(last=False)
+            self._tree_bytes -= old.src_size
+            old.tree = None
+            old.__dict__.pop("_def_index", None)
+
+    def tree_of(self, info: ModuleInfo) -> ast.Module | None:
+        """モジュールの構文木（手放していれば読み直す）。読めないモジュールは None。"""
+        if info.opaque or not info.path:
+            return None
+        if info.tree is None:
+            tree, _err = parse_file(info.path)
+            if tree is None:
+                return None
+            info.tree = tree
+            self.reparsed += 1
+        self._keep_tree(info)
+        return info.tree
+
+    def _source_lines(self, path: str) -> list[str] | None:
+        lru = self._lines_lru
+        lines = lru.get(path)
+        if lines is None:
+            try:
+                with tokenize.open(path) as f:
+                    lines = f.read().split("\n")
+            except (OSError, SyntaxError, UnicodeDecodeError, LookupError):
+                return None
+            lru[path] = lines
+            while len(lru) > self._LINES_LRU:
+                lru.popitem(last=False)
+        else:
+            lru.move_to_end(path)
+        return lines
+
+    def function_node(self, info: ModuleInfo, qual: str) -> ast.AST | None:
+        """関数 qual の def の木。その関数の行だけを読み直して構文解析する（位置は元のまま）。"""
+        span = info.functions.get(qual)
+        if span is None or info.opaque or not info.path:
+            return None
+        lineno, col, start, end = span
+        node = None
+        if info.tree is not None:
+            idx = info.__dict__.get("_def_index")
+            if idx is None or idx[0] is not info.tree:
+                idx = (info.tree, {_pos(n): n for n in ast.walk(info.tree)
+                                   if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))})
+                info.__dict__["_def_index"] = idx
+            node = idx[1].get((lineno, col))
+        lines = self._source_lines(info.path)
+        if node is None:
+            if lines is not None and end <= len(lines):
+                # 行番号を元と同じにするため、前を空行で埋める（increment_lineno より速い）
+                seg = "\n".join(lines[start - 1:end]) + "\n"
+                try:
+                    if col > 0:
+                        t = ast.parse("\n" * (start - 2) + "if 1:\n" + seg)
+                        cand = t.body[0].body[0] if t.body and isinstance(t.body[0], ast.If) else None
+                    else:
+                        t = ast.parse("\n" * (start - 1) + seg)
+                        cand = t.body[0] if t.body else None
+                except (SyntaxError, ValueError, RecursionError):
+                    cand = None
+                if isinstance(cand, (ast.FunctionDef, ast.AsyncFunctionDef)) \
+                        and cand.lineno == lineno and cand.col_offset == col:
+                    node = cand
+            if node is None:  # 行だけでは読めない（まれ）: モジュール全体を読み直す
+                tree = self.tree_of(info)
+                node = self._find_def(tree, lineno, col) if tree is not None else None
+        if node is not None and lines is not None and end <= len(lines):
+            node._pystub_walrus = any(":=" in ln for ln in lines[start - 1:end])  # type: ignore[attr-defined]
+        return node
+
+    @staticmethod
+    def _find_def(tree: ast.AST, lineno: int, col: int) -> ast.AST | None:
+        for n in ast.walk(tree):
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.lineno == lineno and n.col_offset == col:
+                return n
+        return None
+
+    def submodules_on_disk(self, package: str, recursive: bool = False) -> list[str]:
+        """パッケージのディレクトリにあるサブモジュール（pkgutil.iter_modules / walk_packages の列挙）。"""
+        info = self.get(package)
+        if info is None or not info.is_package or not info.path:
+            return []
+        p = Path(info.path)
+        d = p if p.is_dir() else p.parent
+        out: list[str] = []
+        try:
+            entries = sorted(d.iterdir())
+        except OSError:
+            return []
+        for f in entries:
+            name = f.name.split(".")[0]
+            if not name.isidentifier() or name == "__init__":
+                continue
+            if f.is_dir():
+                if (f / "__init__.py").exists():
+                    out.append(f"{package}.{name}")
+                    if recursive:
+                        out.extend(self.submodules_on_disk(f"{package}.{name}", True))
+            elif f.suffix in (".py", ".pyw") or is_extension_file(f):
+                out.append(f"{package}.{name}")
+        return out
 
     def submodule(self, info: ModuleInfo, name: str) -> str | None:
         """info がパッケージで name がサブモジュールならその絶対名。"""
@@ -467,7 +721,12 @@ class Program:
         sub = f"{info.name}.{name}"
         self._sub_cache[ck] = sub
         if sub not in self.modules or self.modules[sub] is None:
-            self.modules[sub] = self._load(sub, f)
+            self._depth += 1
+            try:
+                self.modules[sub] = self._load(sub, f)
+            finally:
+                self._depth -= 1
+            self._drain()
         return sub
 
     # --- モジュールレベルの束縛 ---
@@ -517,11 +776,11 @@ class Program:
                     self._add(out, alias.asname or alias.name,
                               Binding("from", target=base, name=alias.name, conditional=cond))
             elif isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                self._add(out, stmt.name, Binding("def", node=stmt, qualname=qual_prefix + stmt.name, conditional=cond))
+                self._add(out, stmt.name, Binding("def", pos=_pos(stmt), qualname=qual_prefix + stmt.name, conditional=cond))
                 if is_module and stmt.name == "__getattr__":
                     info.has_getattr = True
             elif isinstance(stmt, ast.ClassDef):
-                self._add(out, stmt.name, Binding("class", node=stmt, qualname=qual_prefix + stmt.name, conditional=cond))
+                self._add(out, stmt.name, Binding("class", pos=_pos(stmt), qualname=qual_prefix + stmt.name, conditional=cond))
             elif isinstance(stmt, ast.Assign):
                 for target in stmt.targets:
                     self._bind_target(target, stmt.value, out, cond)
@@ -588,18 +847,20 @@ class Program:
             elif isinstance(value, ast.Call):
                 self._add(out, target.id, Binding("call", node=value, conditional=cond))
             else:
-                self._add(out, target.id, Binding("unknown", node=value, conditional=cond))
+                self._add(out, target.id, Binding("unknown", conditional=cond))  # 値の木は使わない（メモリ）
         elif isinstance(target, (ast.Tuple, ast.List, ast.Starred)):
             for n in ast.walk(target):
                 if isinstance(n, ast.Name):
                     self._add(out, n.id, Binding("unknown", conditional=True))
 
     def _collect_mutations(self, info: ModuleInfo) -> None:
-        if info.mutations_done or info.tree is None:
+        if info.mutations_done:
             return
         info.mutations_done = True
-        tree = info.tree
-        for n in ast.walk(tree):
+        tree = self.tree_of(info)
+        if tree is None:
+            return
+        for n in _fast_walk(tree):
             if isinstance(n, ast.Global):
                 info.mutated.update(n.names)
                 info.global_names.update(n.names)
@@ -614,10 +875,31 @@ class Program:
                         elif isinstance(x, ast.Subscript) and isinstance(x.ctx, (ast.Store, ast.Del)):
                             if isinstance(x.value, ast.Name):
                                 info.mutated.add(x.value.id)
+                            if isinstance(x.value, ast.Call) and isinstance(x.value.func, ast.Name) \
+                                    and x.value.func.id in ("globals", "vars"):
+                                info.dynamic_globals = True
             elif isinstance(n, ast.Call):
                 f = n.func
+                nm = f.attr if isinstance(f, ast.Attribute) else (f.id if isinstance(f, ast.Name) else "")
+                if nm:
+                    # 呼び出し側の文字列リテラル（引数の定数伝播: compute_reachability の literal_args 用）。
+                    # 木は持たず、判定に要る形だけ残す
+                    lits = [(i, a.value) for i, a in enumerate(n.args)
+                            if isinstance(a, ast.Constant) and isinstance(a.value, str)]
+                    klits = {k.arg: k.value.value for k in n.keywords
+                             if k.arg and isinstance(k.value, ast.Constant) and isinstance(k.value.value, str)}
+                    if lits or klits:
+                        star = any(isinstance(a, ast.Starred) for a in n.args) or any(k.arg is None for k in n.keywords)
+                        info.calls.setdefault(nm, []).append(
+                            (isinstance(f, ast.Attribute), star, klits, dict(lits), len(n.args),
+                             frozenset(k.arg for k in n.keywords if k.arg)))
+                    else:
+                        info.nonlit_calls.add(nm)
                 if isinstance(f, ast.Attribute) and isinstance(f.value, ast.Name):
                     info.mutated.add(f.value.id)  # NAME.append(...) 等（不変値なら後で無視）
+                if isinstance(f, ast.Attribute) and isinstance(f.value, ast.Call) and isinstance(f.value.func, ast.Name) \
+                        and f.value.func.id in ("globals", "vars") and f.attr in ("update", "pop", "setdefault", "clear"):
+                    info.dynamic_globals = True
                 if isinstance(f, ast.Name) and f.id in ("setattr", "delattr") and len(n.args) >= 2:
                     a = n.args[1]
                     if isinstance(a, ast.Constant) and isinstance(a.value, str):
@@ -636,8 +918,9 @@ class Program:
                 while key in info.functions:
                     n += 1
                     key = f"{qual}#{n}"
-                info.functions[key] = stmt
-                info.qual_of[id(stmt)] = key
+                start = min([stmt.lineno] + [d.lineno for d in stmt.decorator_list])
+                info.functions[key] = (stmt.lineno, stmt.col_offset, start, stmt.end_lineno or stmt.lineno)
+                info.qual_of[_pos(stmt)] = key
                 if cls is not None:
                     info.func_class[key] = cls.qualname
                     cls.methods.setdefault(stmt.name, []).append(key)
@@ -651,11 +934,12 @@ class Program:
                 while key in info.classes:
                     n += 1
                     key = f"{qual}#{n}"
-                ci = ClassInfo(module=info.name, qualname=key, node=stmt, bases=list(stmt.bases),
-                               keywords=list(stmt.keywords))
+                ci = ClassInfo(module=info.name, qualname=key, node=None, bases=list(stmt.bases),
+                               keywords=list(stmt.keywords),
+                               decorators=[_decorator_last_name(d) for d in stmt.decorator_list])
                 self._collect_bindings(info, stmt.body, ci.attrs, qual + ".", False, False)
                 info.classes[key] = ci
-                info.class_qual_of[id(stmt)] = key
+                info.class_qual_of[_pos(stmt)] = key
                 self._collect_defs(info, stmt.body, qual + ".", ci)
             else:
                 for field_name in ("body", "orelse", "finalbody", "handlers"):
@@ -733,6 +1017,58 @@ class Program:
             ok = False
         self._const_cache[key] = ok
         self._const_cache[("#n", "")] = len(self.modules)  # type: ignore[assignment]
+        return ok
+
+    def name_always_bound(self, info: ModuleInfo | None, name: str) -> bool:
+        """モジュールの name が、無条件のトップレベルで 1 回だけ束縛され、del・globals() で変わらないか。
+
+        hasattr / `try: from X import Y` の有無の判定を安全とみなせるのはこの場合だけ（第 4 回 方針 2）。
+        """
+        if info is None or info.opaque or info.dynamic_globals:
+            return False
+        blist = info.bindings.get(name)
+        if blist is None or len(blist) != 1 or blist[0].conditional or blist[0].fallback:
+            return False
+        return True
+
+    def class_attr_always_bound(self, module: str, qual: str, name: str) -> bool:
+        info = self.get(module)
+        ci = info.classes.get(qual) if info is not None else None
+        if ci is None:
+            return False
+        blist = ci.attrs.get(name)
+        return blist is not None and len(blist) == 1 and not blist[0].conditional
+
+    _ISINST_HOOKS = frozenset({"__instancecheck__", "__subclasscheck__", "__subclasshook__"})
+    _PLAIN_CLASS_DECORATORS = frozenset({"dataclass", "total_ordering", "final", "unique"})
+
+    def class_isinstance_safe(self, module: str, qual: str, depth: int = 0) -> bool:
+        """isinstance / issubclass / except の相手として、スタブのクラスで結果が変わらない「普通のクラス」か。
+
+        metaclass なし・__instancecheck__ / __subclasscheck__ / __subclasshook__ なし・Protocol / ABC でない
+        （基底が object・組み込みの型・同じ条件を満たす解析対象のクラスだけ）（第 4 回 方針 1）。
+        """
+        key = ("#isinst", module, qual)
+        cached = self._plain_cache.get(key)  # type: ignore[arg-type]
+        if cached is not None:
+            return cached
+        self._plain_cache[key] = False  # type: ignore[index]
+        info = self.get(module)
+        ci = info.classes.get(qual) if info is not None else None
+        ok = ci is not None and not ci.keywords and depth < 50 \
+            and not (self._ISINST_HOOKS & set(ci.methods)) \
+            and all(d in self._PLAIN_CLASS_DECORATORS for d in ci.decorators)
+        if ok:
+            for b in ci.bases:  # type: ignore[union-attr]
+                if isinstance(b, ast.Name) and b.id in vars(builtins) and isinstance(vars(builtins)[b.id], type) \
+                        and type(vars(builtins)[b.id]) is type and (b.id not in info.bindings):  # type: ignore[union-attr]
+                    continue
+                r = self.ref_of_expr(info, b, None)  # type: ignore[arg-type]
+                if r is None or r.kind != "class" or r.alts \
+                        or not self.class_isinstance_safe(r.module, r.target, depth + 1):
+                    ok = False
+                    break
+        self._plain_cache[key] = ok  # type: ignore[index]
         return ok
 
     def class_is_plain(self, module: str, qual: str, depth: int = 0) -> bool:
@@ -818,12 +1154,12 @@ class Program:
                 return Ref("unknown", mod, chain, trace)
             return self.resolve(b.target, (b.name,) + rest, trace, depth + 1)
         if b.kind == "def":
-            q = info.qual_of.get(id(b.node), b.qualname)
+            q = info.qual_of.get(b.pos, b.qualname)
             if rest:
                 return Ref("unknown", mod, chain, trace)
             return Ref("function", mod, chain, trace, target=q)
         if b.kind == "class":
-            q = info.class_qual_of.get(id(b.node), b.qualname)
+            q = info.class_qual_of.get(b.pos, b.qualname)
             return self._resolve_class_attr(info, q, (head,), rest, trace)
         if b.kind == "literal":
             if self.binding_is_const(info, head, blist):
@@ -887,7 +1223,7 @@ class Program:
                             and not self._class_attr_stored(finfo, attr):
                         return Ref("classconst", info.name, chain + rest, trace, target=cls_qual)
                     if ab.kind == "class":
-                        q = finfo.class_qual_of.get(id(ab.node), ab.qualname)
+                        q = finfo.class_qual_of.get(ab.pos, ab.qualname)
                         return self._resolve_class_attr(finfo, q, chain + (attr,), rest[1:], trace)
         return Ref("classattr", info.name, chain + rest, trace, target=cls_qual)
 
@@ -970,6 +1306,8 @@ class Program:
                 return None
             if base.kind == "class" and not base.alts:
                 return replace(base, kind="instance", marks=base.marks + ((len(base.trace), ("()",)),))
+            if base.kind == "external" and base.chain[-1:] in (("import_module",), ("__import__",), ("reload",)):
+                return None  # 定数でない import の結果は任意のモジュール（その属性の呼び出しは名前で振り分ける）
             if base.kind == "external":
                 return replace(base, kind="external_value", chain=base.chain + ("()",),
                                marks=base.marks + ((len(base.trace), ("()",)),))
@@ -999,7 +1337,7 @@ class Program:
     # --- コード単位 ---
 
     def build_module_unit(self, info: ModuleInfo) -> None:
-        if info.unit_built or info.opaque or info.tree is None:
+        if info.unit_built or info.opaque or self.tree_of(info) is None:
             info.unit_built = True
             return
         info.unit_built = True
@@ -1053,7 +1391,7 @@ class _UnitWalker:
     # --- 入口 ---
 
     def run_module(self) -> None:
-        tree = self.info.tree
+        tree = self.p.tree_of(self.info)
         assert tree is not None
         unit = Unit(self.info.name, "<module>", tree)
         self.p.units[unit.key] = unit
@@ -1063,10 +1401,16 @@ class _UnitWalker:
             for q in self.info.functions:
                 if q == "__getattr__" or q.startswith("__getattr__#"):
                     unit.escaped_units.append(q)
+        unit.node = None  # 歩き終えた木は持たない（メモリ）
 
     def run_function(self, qual: str) -> Unit:
-        node = self.info.functions[qual]
+        node = self.p.function_node(self.info, qual)
         cls_qual = self.info.func_class.get(qual, "")
+        if node is None:
+            u = Unit(self.info.name, qual, None, cls=cls_qual)
+            u.events.append(Event("unanalyzable", name=f"{self.info.name}:{qual}"))
+            self.p.units[u.key] = u
+            return u
         u = Unit(self.info.name, qual, node, cls=cls_qual)
         self.p.units[u.key] = u
         self.unit = u
@@ -1074,6 +1418,7 @@ class _UnitWalker:
         scope, unique = self._function_scope(node)
         self.unique = unique
         self._walk_body(node.body, scope, None, protected=False, protect_ok=False)
+        u.node = None  # 歩き終えた木は持たない（メモリ）
         return u
 
     # --- スコープ ---
@@ -1093,7 +1438,9 @@ class _UnitWalker:
         globals_: set[str] = set()
         counts: dict[str, int] = {}
         pending_alias: list[tuple[str, ast.expr]] = []
-        for n in self._iter_own_nodes(node.body):
+        walrus = getattr(node, "_pystub_walrus", True)
+        it = self._iter_own_nodes(node.body) if walrus else self._iter_own_stmts(node.body)
+        for n in it:
             if isinstance(n, (ast.Global, ast.Nonlocal)):
                 globals_.update(n.names)
             elif isinstance(n, ast.Import):
@@ -1112,7 +1459,7 @@ class _UnitWalker:
                     scope[nm] = self.p.resolve(base, (alias.name,))
             elif isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
                 counts[n.name] = counts.get(n.name, 0) + 1
-                q = self.info.qual_of.get(id(n)) if not isinstance(n, ast.ClassDef) else self.info.class_qual_of.get(id(n))
+                q = self.info.qual_of.get(_pos(n)) if not isinstance(n, ast.ClassDef) else self.info.class_qual_of.get(_pos(n))
                 if q and isinstance(n, ast.ClassDef):
                     scope[n.name] = Ref("class", self.info.name, (n.name,), ((self.info.name, (n.name,)),), target=q)
                 elif q:
@@ -1171,6 +1518,26 @@ class _UnitWalker:
                 scope[name] = r
         return scope, unique
 
+    _STMT_FIELDS = ("body", "orelse", "finalbody", "handlers", "cases")
+
+    @classmethod
+    def _iter_own_stmts(cls, body: list[ast.stmt]):
+        """関数の本体の文（入れ子の def / class の中には入らない）と except 節。式の中は辿らない
+        （内包表記の変数は内包表記の中だけのスコープ。:= がある関数は _iter_own_nodes を使う）。"""
+        stack: list[ast.AST] = list(reversed(body))
+        while stack:
+            n = stack.pop()
+            yield n
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                continue
+            kids: list = []
+            for f in cls._STMT_FIELDS:
+                v = getattr(n, f, None)
+                if v:
+                    kids.extend(v)
+            if kids:
+                stack.extend(reversed(kids))
+
     @staticmethod
     def _iter_own_nodes(body: list[ast.stmt]):
         stack: list[ast.AST] = list(reversed(body))
@@ -1205,6 +1572,39 @@ class _UnitWalker:
                 self.guard = g
         self.guard = saved
 
+    def _import_presence_test(self, test: ast.expr, sc) -> bool | None:
+        """`X is not None` / `X` / `X is None` / `not X` で、X が try/except ImportError の代替つきで
+        import された名前（解析対象の環境に実在する）なら、元の環境での結果（True / False）。それ以外は None。"""
+        neg = False
+        if isinstance(test, ast.UnaryOp) and isinstance(test.op, ast.Not):
+            test, neg = test.operand, True
+        name = None
+        expect = True
+        if isinstance(test, ast.Name):
+            name = test.id
+        elif isinstance(test, ast.Compare) and len(test.ops) == 1 and isinstance(test.left, ast.Name) \
+                and isinstance(test.comparators[0], ast.Constant) and test.comparators[0].value is None \
+                and isinstance(test.ops[0], (ast.Is, ast.IsNot)):
+            name = test.left.id
+            expect = isinstance(test.ops[0], ast.IsNot)
+        if name is None or (sc is not None and name in sc):
+            return None
+        blist = self.info.bindings.get(name, [])
+        real = [b for b in blist if not b.fallback]
+        if not real or len(real) == len(blist) or not all(b.kind in ("module", "from") for b in real):
+            return None
+        for b in real:
+            if b.kind == "module":
+                if self.p.get(b.target) is None:
+                    return None
+            else:
+                r = self.p.resolve(b.target, (b.name,))
+                if r.kind in ("missing", "unknown", "opaque", "multi"):
+                    return None
+                if isinstance(test, ast.Name) and r.kind not in ("module", "class", "function"):
+                    return None  # 真偽が値次第
+        return expect != neg
+
     def _bind_ctx(self, name: str, scope: dict[str, Ref | None] | None, cls_scope) -> str:
         """`name = <式>` の右辺の文脈。束縛が一意で無条件なら bind（A）、それ以外は store（C）。"""
         if cls_scope is not None:
@@ -1231,14 +1631,14 @@ class _UnitWalker:
                 ev(b, "base", sc)
             for k in stmt.keywords:
                 ev(k.value, "base", sc)
-            q = self.info.class_qual_of.get(id(stmt), stmt.name)
+            q = self.info.class_qual_of.get(_pos(stmt), stmt.name)
             self._ev(Event("classdef", target=q, lineno=stmt.lineno))
             # クラス本体は定義時に実行される。本体内の名前（メソッド等）はクラス本体のスコープ
             cscope: dict[str, Ref | None] = dict(scope) if scope is not None else {}
             for s in stmt.body:
                 if isinstance(s, (ast.FunctionDef, ast.AsyncFunctionDef)):
                     self._walk_def(s, scope, cscope)
-                    mq = self.info.qual_of.get(id(s))
+                    mq = self.info.qual_of.get(_pos(s))
                     if mq:
                         cscope[s.name] = Ref("function", self.info.name, (s.name,),
                                              ((self.info.name, (s.name,)),), target=mq)
@@ -1287,10 +1687,17 @@ class _UnitWalker:
             if is_type_checking_test(stmt.test):
                 self._walk_body(stmt.orelse, scope, cls_scope, protected, protect_ok)
                 return
-            self.branch += 1
+            det = self._import_presence_test(stmt.test, sc)
+            if det is None and _env_only_test(stmt.test):
+                det = "env"  # 実行環境で決まる: どちらの枝も入力次第ではない（確実側）
+            # 元の環境で import が成功していれば結果が決まる判定（`if X is not None:` 等）の枝は条件付きでない
+            b1 = 0 if det in (True, "env") else 1
+            b2 = 0 if det in (False, "env") else 1
+            self.branch += b1
             self._walk_body(stmt.body, scope, cls_scope, protected, protect_ok)
+            self.branch += b2 - b1
             self._walk_body(stmt.orelse, scope, cls_scope, protected, protect_ok)
-            self.branch -= 1
+            self.branch -= b2
         elif isinstance(stmt, ast.While):
             ev(stmt.test, "truth", sc)
             self._walk_body(stmt.body, scope, cls_scope, protected, protect_ok)
@@ -1303,16 +1710,16 @@ class _UnitWalker:
         elif isinstance(stmt, (ast.With, ast.AsyncWith)):
             for item in stmt.items:
                 ev(item.context_expr, "with", sc)
+            # contextlib.suppress(Exception / RuntimeError ...) はスタブの例外を握りつぶしうる
+            sup = any(isinstance(it.context_expr, ast.Call) and _decorator_last_name(it.context_expr.func) == "suppress"
+                      and any(_catches_stub_error(a) for a in it.context_expr.args) for it in stmt.items)
+            self.broad += 1 if sup else 0
             self._walk_body(stmt.body, scope, cls_scope, protected, protect_ok)
+            self.broad -= 1 if sup else 0
         elif isinstance(stmt, (ast.Try, getattr(ast, "TryStar", ast.Try))):
             prot = handlers_catch_import_error(stmt.handlers)  # type: ignore[arg-type]
             simple = prot and self._simple_protection(stmt)
-            broad_h = any(
-                h.type is None or (isinstance(h.type, ast.Name) and h.type.id in ("Exception", "BaseException"))
-                or (isinstance(h.type, ast.Tuple) and any(isinstance(x, ast.Name) and x.id in ("Exception", "BaseException")
-                                                           for x in h.type.elts))
-                for h in stmt.handlers
-            )
+            broad_h = any(_catches_stub_error(h.type) for h in stmt.handlers)
             self.broad += 1 if broad_h else 0
             self._walk_body(stmt.body, scope, cls_scope, protected or prot, (protect_ok or not protected) and simple
                             if prot else protect_ok)
@@ -1395,7 +1802,7 @@ class _UnitWalker:
             # 解析対象の関数で、引数を逃がさないと示せたものだけ透明（S10）
             if r is not None and r.kind == "function" and not r.alts:
                 dinfo = self.p.get(r.module)
-                dnode = dinfo.functions.get(r.target) if dinfo is not None else None
+                dnode = self.p.function_node(dinfo, r.target) if dinfo is not None else None
                 if dnode is not None and not decorator_escapes(dnode):
                     continue
             escaped = True
@@ -1411,10 +1818,14 @@ class _UnitWalker:
             if node.returns is not None:
                 self._expr(node.returns, "annot", sc)
         if escaped:
-            qual = self.info.qual_of.get(id(node), "")
+            qual = self.info.qual_of.get(_pos(node), "")
             if qual:
                 assert self.unit is not None
                 self.unit.escaped_units.append(qual)
+                for d in node.decorator_list:
+                    dr = self.p.ref_of_expr(self.info, d.func if isinstance(d, ast.Call) else d, sc)
+                    if dr is not None and not dr.alts and dr.module == "atexit" and dr.chain[-1:] == ("register",):
+                        self.unit.certain_escaped.add(qual)  # 終了時に必ず呼ばれる（C08）
 
     def _target(self, t: ast.expr, sc: dict[str, Ref | None] | None, ctx: str = "store") -> None:
         # `P.x = 1` / `P.d[k] = v` は P のオブジェクトの変更（C）。`self.x = ...` 等は無関係
@@ -1434,6 +1845,12 @@ class _UnitWalker:
     def _record(self, ref: Ref | None, ctx: str, node: ast.AST) -> None:
         if ref is None:
             return
+        if ctx in ("isinst", "except"):
+            # 相手が「普通のクラス」と示せない（metaclass・__instancecheck__・Protocol・ABC 等）なら判別は安全でない
+            for rr in ref.all_refs():
+                if rr.kind == "class" and not rr.alts and not self.p.class_isinstance_safe(rr.module, rr.target):
+                    ctx = ctx + "_opaque"
+                    break
         self._ev(Event("ref", ctx=ctx, ref=ref, lineno=getattr(node, "lineno", 0)))
 
     def _receiver_is_builtin(self, value: ast.expr, sc) -> bool:
@@ -1462,6 +1879,9 @@ class _UnitWalker:
             if isinstance(e, ast.Attribute):
                 # 受け手が解決できない属性: 同名のメソッド・property を名前で到達させる
                 if not self._receiver_is_builtin(e.value, sc):
+                    if e.attr == "__annotations__":
+                        self.p.introspecting_tops.add(
+                            "<project>" if self.info.name in self.p.local_modules else self.info.name.split(".")[0])
                     kind = "method" if ctx in ("call", "decorator", "arg", "store", "return") else "attr"
                     on_self = isinstance(e.value, ast.Name) and e.value.id in ("self", "cls") and \
                         self.unit is not None and bool(self.unit.cls)
@@ -1524,7 +1944,8 @@ class _UnitWalker:
             return
         if isinstance(e, ast.Subscript):
             if ctx == "annot":
-                ev(e.value, "annot", sc)
+                # 評価される注釈の添字 X[...] は X.__class_getitem__ / __getitem__ の実行（方針 4）
+                ev(e.value, "annot_subscript", sc)
                 ev(e.slice, "annot", sc)
                 return
             self._subscript_special(e, sc)
@@ -1627,6 +2048,35 @@ class _UnitWalker:
             return
 
         ev(func, "call" if ctx != "decorator" else "decorator", sc)
+        if self.unit is not None and not self.unit.unknown_calls and (isinstance(func, ast.Subscript) or (
+                isinstance(func, ast.Name) and not fname and (
+                    (fr_u := self.p.ref_of_expr(self.info, func, sc)) is None
+                    or fr_u.kind in ("unknown", "derived", "multi", "opaque", "missing")))):
+            self.unit.unknown_calls = True  # 登録された関数を呼びうる（第 4 回: 登録の実行）
+
+        if fname in (".iter_modules", "iter_modules", ".walk_packages", "walk_packages") and e.args:
+            # pkgutil でパッケージ自身の中を列挙する: そのパッケージの全サブモジュールを読み込みうる（方針 3）
+            a0 = e.args[0]
+            target = None
+            if isinstance(a0, ast.Attribute) and a0.attr == "__path__":
+                target = self.p.ref_of_expr(self.info, a0.value, sc)
+            elif isinstance(a0, ast.Name) and a0.id == "__path__" and self.info.is_package:
+                target = Ref("module", self.info.name, (), ((self.info.name, ()),))
+            if target is not None and target.kind == "module" and not target.alts:
+                self._ev(Event("package_scan", name=target.module, lineno=e.lineno,
+                               ctx="walk" if "walk" in fname else ""))
+            else:
+                self.p.warnings.append(f"{self.info.name}:{e.lineno}: pkgutil の列挙の対象を特定できません（仕様 5 節の前提）")
+
+        introspect = fname in ("get_type_hints", ".get_type_hints", "get_annotations", ".get_annotations") or (
+            fname in ("signature", ".signature") and any(k.arg == "eval_str" for k in e.keywords))
+        if not introspect and fname in ("fields", ".fields", "asdict", ".asdict", "astuple", ".astuple"):
+            fr0 = self.p.ref_of_expr(self.info, func, sc)
+            introspect = fr0 is not None and fr0.module.split(".")[0] in ("dataclasses", "attr", "attrs")
+        if introspect:
+            # 注釈を実行時に取り出す（方針 4）
+            self.p.introspecting_tops.add(
+                "<project>" if self.info.name in self.p.local_modules else self.info.name.split(".")[0])
 
         if fname in ("isinstance", "issubclass") and len(e.args) >= 2:
             ev(e.args[0], "operand", sc)
@@ -1637,7 +2087,24 @@ class _UnitWalker:
             base_ref = self.p.ref_of_expr(self.info, e.args[0], sc)
             name_lit = self._literal_name(e.args[1], sc) if len(e.args) >= 2 else None
             if fname == "hasattr":
-                ev(e.args[0], "hasattr" if name_lit is not None else "unknown", sc)
+                hctx = "hasattr" if name_lit is not None else "unknown"
+                if name_lit is not None and base_ref is not None:
+                    # 無条件に束縛される名前だけ「ある」と扱える（条件付き束縛・del・globals()・サブモジュールは不可）
+                    ok = False
+                    if not base_ref.alts and base_ref.kind == "module":
+                        ok = self.p.name_always_bound(self.p.get(base_ref.module), name_lit)
+                    elif not base_ref.alts and base_ref.kind == "class":
+                        ok = self.p.class_attr_always_bound(base_ref.module, base_ref.target, name_lit)
+                    elif base_ref.kind in ("const", "constattr", "classconst", "external", "external_module",
+                                           "builtin_value", "external_value"):
+                        ok = True
+                    if not ok:
+                        hctx = "hasattr_opaque"
+                if base_ref is not None and name_lit is not None:
+                    # 調べる名前も残す（import の副作用の判定に使う）
+                    self._ev(Event("ref", ctx=hctx, ref=base_ref, name=name_lit, lineno=e.lineno))
+                else:
+                    ev(e.args[0], hctx, sc)
                 if name_lit is not None and base_ref is None:
                     self._ev(Event("attr", name=name_lit, lineno=e.lineno))
             elif fname == "getattr" and name_lit is not None:
@@ -1849,6 +2316,9 @@ class _UnitWalker:
             package = e.args[1]
         relative = prefix.startswith(".") or (package is not None)
         self._ev(Event("dynamic_import", name=prefix, lineno=e.lineno, ctx="relative" if relative else ""))
+        self.p.warnings.append(
+            f"{self.info.name}:{e.lineno}: 定数でない import_module / __import__（接頭辞 {prefix or 'なし'!r}）は"
+            "解決できません（仕様 5 節の前提）")
         for a in e.args:
             self._expr(a, "operand", sc)
 
@@ -1863,6 +2333,8 @@ class Reachability:
     reached: set[tuple[str, str]] = field(default_factory=set)
     loaded_modules: set[str] = field(default_factory=set)
     instantiated: set[tuple[str, str]] = field(default_factory=set)  # (module, class qual)
+    inst_srcs: dict = field(default_factory=dict)  # クラス → インスタンス化しうるユニットの集合
+    mro: dict = field(default_factory=dict)  # クラス → MRO（解析で求めた範囲）
     called_names: set[str] = field(default_factory=set)
     attr_names: set[str] = field(default_factory=set)
     dynamic_modules: set[tuple[str, str]] = field(default_factory=set)
@@ -1875,6 +2347,9 @@ class Reachability:
     # 到達の辺: (呼び出し元, 到達先, 印, 辺を作ったイベント)。印は precise か、過大近似の種類
     # （name: 名前だけの振り分け / argclass: 引数に渡したクラス / decorator: 登録デコレータ / branch: 入力次第の分岐）
     edges: list[tuple] = field(default_factory=list)
+    # 名前での振り分けの呼び出し元: 名前 → {(呼び出し元ユニット, 印): イベント}。2 回目以降の呼び出し元は
+    # edges に入らない（同名のメソッド全てへの辺を張ると件数が爆発する）ので、ここから辺を補う
+    name_callers: dict[str, dict] = field(default_factory=dict)
     roots: list[tuple[str, str]] = field(default_factory=list)
     # モジュール → そのモジュールの到達コードが import するモジュール
     module_imports: dict[str, set[str]] = field(default_factory=dict)
@@ -2018,6 +2493,26 @@ def compute_reachability(
         st.why[key] = (current[0][0], reason or current[0][1])
         work.append(key)
 
+    def reach_module_getattr(module: str) -> None:
+        info = program.get(module)
+        if info is None:
+            return
+        load_module(module)
+        for q in list(info.functions):
+            if q == "__getattr__" or q.startswith("__getattr__#"):
+                reach((module, q), "module __getattr__")
+
+    def module_getattr(rr: Ref) -> None:
+        """モジュールに無い名前の参照: そのモジュールの __getattr__ が呼ばれる（遅延 import の確実な実行）。"""
+        for mod, chain in rr.trace:
+            if not chain:
+                continue
+            info = program.get(mod)
+            if info is not None and info.has_getattr and chain[0] not in info.bindings \
+                    and program.submodule(info, chain[0]) is None:
+                reach_module_getattr(mod)
+                return
+
     def load_module(name: str) -> None:
         if name in st.loaded_modules:
             return
@@ -2040,7 +2535,7 @@ def compute_reachability(
     methods_by_name: dict[str, list[tuple[str, str]]] = {}
     dyn_by_class: dict[tuple[str, str], set[str]] = {}
     family_roots: set[tuple[str, str]] = set()
-    mro_cache: dict[tuple[str, str], frozenset[tuple[str, str]]] = {}
+    mro_cache: dict[tuple[str, str], frozenset[tuple[str, str]]] = st.mro
     classes_seen: list[tuple[str, str]] = []
 
     def mro_of(module: str, qual: str, depth: int = 0) -> frozenset[tuple[str, str]]:
@@ -2078,6 +2573,7 @@ def compute_reachability(
             inst_tags.add((key, tag[0]))
             first = key not in st.instantiated
             st.instantiated.add(key)
+            st.inst_srcs.setdefault(key, set()).add(current[0][0])
             ci = class_info(module_, qual_)
             if ci is None:
                 continue
@@ -2085,6 +2581,24 @@ def compute_reachability(
                 for mname, quals in ci.methods.items():
                     for uq in quals:
                         methods_by_name.setdefault(mname, []).append((module_, uq))
+                mro_k = mro_of(module_, qual_)
+                for anc in mro_k:
+                    inst_by_anc.setdefault(anc, []).append(key)
+                saved_cur, saved_tag = current[0], tag[0]
+                names_k: set = set()
+                for anc in mro_k:
+                    aci = class_info(*anc)
+                    if aci is not None:
+                        names_k.update(aci.methods)
+                for mname in names_k & set(self_callers):
+                    for src_key, ckey in list(self_callers[mname]):
+                        if ckey not in mro_k:
+                            continue
+                        current[0] = (src_key, "self")
+                        tag[0] = saved_tag
+                        for k in family_methods(ckey, key, mname):
+                            reach(k, f"self.{mname}")
+                current[0], tag[0] = saved_cur, saved_tag
             info = program.get(module_)
             hooks = framework_hook_names(program, ci) if info is not None else frozenset()
             dyn_prefixes = [pfx for (m, pfx) in st.dynamic_modules if m == module_]
@@ -2117,10 +2631,38 @@ def compute_reachability(
                             stack.append((rr.module, rr.target))
 
     seen_name_tags: set = set()
+    self_callers: dict[str, set] = {}
+
+    inst_by_anc: dict = {}  # クラス → それを MRO に含むインスタンス化されたクラス
+    fam_cache: dict = {}
+
+    def family_methods(ckey: tuple[str, str], inst: tuple[str, str], name: str):
+        fk = (inst, name)
+        got = fam_cache.get(fk)
+        if got is None:
+            got = []
+            for anc in mro_of(*inst):
+                ci = class_info(*anc)
+                if ci is not None and name in ci.methods:
+                    for uq in ci.methods[name]:
+                        got.append((anc[0], uq))
+            fam_cache[fk] = got
+        return got
+
+    def self_dispatch(unit: Unit, name: str) -> None:
+        """self.name(...): 呼び出し元のクラスを含む（インスタンス化された）クラスの MRO にある name だけに確実な辺。"""
+        ckey = (unit.module, unit.cls)
+        self_callers.setdefault(name, set()).add((unit.key, ckey))
+        for inst in list(inst_by_anc.get(ckey, ())):
+            for k in family_methods(ckey, inst, name):
+                reach(k, f"self.{name}")
 
     def on_method_name(name: str, attr_only: bool) -> None:
         target = st.attr_names if attr_only else st.called_names
         nt = (name, attr_only, tag[0])
+        src0 = current[0][0]
+        if src0 is not None and tag[0] != "precise":
+            st.name_callers.setdefault(name, {}).setdefault((src0, tag[0]), current[0][1])
         if name in target and nt in seen_name_tags:
             return
         target.add(name)
@@ -2195,10 +2737,13 @@ def compute_reachability(
                         if sub:
                             imports.add(sub)
                             load_module(sub)
+                        elif info.has_getattr and n not in info.bindings:
+                            reach_module_getattr(ev.from_base)  # from M import N で M.__getattr__ が呼ばれる
             return
         if ev.kind == "method":
-            if ev.ctx != "self":
-                tag[0] = "name"  # 受け手が分からない: 名前だけの振り分け
+            if ev.ctx == "self" and unit.cls:
+                self_dispatch(unit, ev.name)
+            tag[0] = "name"  # 受け手が分からない（self でも族の外の同名メソッド）: 名前だけの振り分け
             on_method_name(ev.name, attr_only=False)
             return
         if ev.kind == "attr":
@@ -2234,6 +2779,23 @@ def compute_reachability(
             return
         if ev.kind == "presence_check":
             st.presence_checked.add(ev.name)
+            return
+        if ev.kind == "package_scan":
+            for sub in program.submodules_on_disk(ev.name, recursive=(ev.ctx == "walk")):
+                load_module(sub)
+                sinfo = program.get(sub)
+                if sinfo is None:
+                    continue
+                for q in list(sinfo.functions):
+                    if "." in q:
+                        continue
+                    fn = q.split("#")[0]
+                    methods_by_name.setdefault(fn, []).append((sub, q))
+                    if fn in st.called_names or fn in st.attr_names:
+                        saved = tag[0]
+                        tag[0] = "name"
+                        reach((sub, q), f"name {fn} (pkgutil)")
+                        tag[0] = saved
             return
         if ev.kind == "unanalyzable":
             st.unanalyzable.append((unit.module, ev.name, ev.lineno))
@@ -2295,6 +2857,8 @@ def compute_reachability(
         for rr in ref.all_refs():
             if rr.alts:
                 continue
+            if rr.kind == "unknown":
+                module_getattr(rr)
             if rr.kind in ("function", "method"):
                 if ev.ctx in _REACH_CTX:
                     reach((rr.module, rr.target))
@@ -2325,31 +2889,25 @@ def compute_reachability(
 
     deferred: list[tuple[Unit, Event]] = []
     applied_names: dict[int, set[str]] = {}
-    call_index: dict[str, list[ast.Call]] = {}
+    call_index: dict[str, list[tuple]] = {}
+    nonlit_names: set[str] = set()
     indexed_modules: set = set()
 
     def index_calls() -> None:
+        """読み込んだモジュールの呼び出しの索引（読み込み時に作ったもの）を名前ごとに集める。"""
         wanted = {u.qualname.split(".")[-1].split("#")[0] for u, _ in deferred}
-        wanted_b = [w.encode() for w in wanted]
         for m in list(st.loaded_modules):
-            if (m, frozenset(wanted)) in indexed_modules:
+            if m in indexed_modules:
                 continue
-            indexed_modules.add((m, frozenset(wanted)))
+            indexed_modules.add(m)
             info = program.get(m)
-            if info is None or info.tree is None or not info.path:
+            if info is None or info.opaque:
                 continue
-            try:
-                data = Path(info.path).read_bytes()
-            except OSError:
-                continue
-            if not any(w in data for w in wanted_b):
-                continue
-            for n in ast.walk(info.tree):
-                if isinstance(n, ast.Call):
-                    f = n.func
-                    nm = f.attr if isinstance(f, ast.Attribute) else (f.id if isinstance(f, ast.Name) else "")
-                    if nm in wanted and n not in call_index.setdefault(nm, []):
-                        call_index[nm].append(n)
+            for nm, recs in info.calls.items():
+                call_index.setdefault(nm, []).extend(recs)
+            for nm in info.nonlit_calls:
+                nonlit_names.add(nm)
+        del wanted
 
     def literal_args(unit: Unit, ev: Event) -> set[str] | None:
         """関数 unit の引数（ev.target = "位置:名前"）に、全呼び出し側が渡す文字列リテラル。1 つでも不明なら None。"""
@@ -2358,25 +2916,27 @@ def compute_reachability(
         fname = unit.qualname.split(".")[-1].split("#")[0]
         is_method = bool(unit.cls)
         out: set[str] = set()
+        if fname in nonlit_names:
+            return None  # 文字列リテラルを渡さない呼び出しがある
         calls = call_index.get(fname, [])
         if not calls:
             return None
-        for c in calls:
-            if any(isinstance(a, ast.Starred) for a in c.args) or any(k.arg is None for k in c.keywords):
+        for is_attr, star, klits, plits, nargs, kwnames in calls:
+            if star:
                 return None
-            val = None
-            for k in c.keywords:
-                if k.arg == pname:
-                    val = k.value
-            if val is None and pos >= 0:
-                idx = pos - (1 if is_method and isinstance(c.func, ast.Attribute) else 0)
-                if 0 <= idx < len(c.args):
-                    val = c.args[idx]
-            if val is None:
+            if pname in kwnames:
+                if pname not in klits:
+                    return None
+                out.add(klits[pname])
+                continue
+            if pos < 0:
+                return None
+            idx = pos - (1 if is_method and is_attr else 0)
+            if not (0 <= idx < nargs):
                 return None  # 既定値（静的に見ない）
-            if not (isinstance(val, ast.Constant) and isinstance(val.value, str)):
+            if idx not in plits:
                 return None
-            out.add(val.value)
+            out.add(plits[idx])
         return out
 
     def run_deferred() -> bool:
@@ -2431,7 +2991,11 @@ def compute_reachability(
             unit = program.units[key]
             current[0] = (key, "")
             for qual in unit.escaped_units:
-                tag[0] = "decorator"  # 登録デコレータ（関数を保持して後で呼びうる）
+                # 登録デコレータ（関数を保持して後で呼びうる）。ただし atexit.register と、登録したモジュールの
+                # 本体が登録先を呼び出す（ループ変数・添字の呼び出しがある）場合は確実に実行される（C07 / C08）
+                certain_reg = qual in unit.certain_escaped or (
+                    unit.qualname == "<module>" and unit.unknown_calls)
+                tag[0] = "precise" if certain_reg else "decorator"
                 reach((unit.module, qual), "escaped (decorator)")
                 tag[0] = "precise"
             for ev in unit.events:
@@ -2454,10 +3018,15 @@ def compute_reachability(
 # ---------------------------------------------------------------------------
 
 
+def all_edges(st: Reachability):
+    """到達の辺（名前での振り分けの 2 回目以降の呼び出し元は Reachability.name_callers にある）。"""
+    yield from st.edges
+
+
 def certain_units(st: Reachability) -> set[tuple[str, str]]:
     """起点（エントリー・ビルド時の起点）から、確実な辺（precise）だけで届くコード単位。"""
     adj: dict = {}
-    for src, dst, t, _ev in st.edges:
+    for src, dst, t, _ev in all_edges(st):
         if t == "precise":
             adj.setdefault(src, []).append(dst)
     seen: set = set()
@@ -2481,7 +3050,7 @@ def entry_paths(st: Reachability, certain: set) -> dict:
     確実な集合から、全ての辺で幅優先に辿り、最初に確実な集合を出た辺を「入口」とする。
     """
     adj: dict = {}
-    for src, dst, t, ev in st.edges:
+    for src, dst, t, ev in all_edges(st):
         adj.setdefault(src, []).append((dst, t, ev))
     out: dict = {}
     q: deque = deque()

@@ -47,9 +47,12 @@ def parse_file(file_path: str) -> tuple[ast.Module | None, str | None]:
             result = (None, f"構文エラー: {file_path}: {e}")
         except RecursionError:
             result = (None, f"構文エラー: {file_path}: AST が深すぎます")
-    if len(_PARSE_CACHE) > 20000:
-        _PARSE_CACHE.clear()
-    _PARSE_CACHE[key] = result
+    # 木はここでは保持しない（全モジュールの木を同時に持つとメモリが数 GB になる: 第 3 回の検証）。
+    # 構文エラーの結果だけを覚える
+    if result[0] is None:
+        if len(_PARSE_CACHE) > 20000:
+            _PARSE_CACHE.clear()
+        _PARSE_CACHE[key] = result
     return result
 
 

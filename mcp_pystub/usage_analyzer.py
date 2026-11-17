@@ -32,8 +32,11 @@ from mcp_pystub.models import (
     SubmoduleStubHint,
 )
 from mcp_pystub.module_resolver import EXTENSION_SUFFIXES, ModuleResolver, is_extension_file
+from collections import deque
+from dataclasses import replace
 from mcp_pystub.semantics import (
-    Event, Program, Reachability, Ref, Unit, certain_units, compute_reachability, entry_paths, under,
+    Event, Program, Reachability, Ref, Unit, all_edges, certain_units, compute_reachability, entry_paths, under,
+    is_external_module,
 )
 
 
@@ -100,10 +103,19 @@ def get_semantics(graph: ImportGraph) -> Semantics:
     if resolver is None:
         resolver = ModuleResolver(project_root=graph.project_root or ".")
         if graph.entry_point:
-            resolver.add_local_root(Path(graph.entry_point).resolve().parent)
+            from mcp_pystub.import_graph import entry_module_name
+            resolver.add_local_root(entry_module_name(Path(graph.entry_point).resolve())[1])
     program = Program(resolver)
     entry_module = getattr(graph, "entry_module", "") or ""
     graph_modules: list[str] = []
+    # 先に: プロジェクトのモジュールの一覧と、属性への書き込みの検出（モジュール本体のユニットを読み込み直後に
+    # 作るので、順序に依らない情報を先にそろえる）
+    for name, node in graph.nodes.items():
+        if node.file_path and node.classification in ("local", "third_party"):
+            if node.classification == "local":
+                program.local_modules.add(name)
+            program.prescan(name, node.file_path)
+    program.eager_units = True
     for name, node in graph.nodes.items():
         if node.file_path and node.classification in ("local", "third_party"):
             program.register(name, node.file_path)
@@ -118,6 +130,10 @@ def get_semantics(graph: ImportGraph) -> Semantics:
         m for m in hooks
         if m in graph.nodes and graph.nodes[m].classification == "third_party" and graph.nodes[m].file_path
     )
+    # python -m pkg 形式: エントリーの親パッケージ（pkg/__init__.py）がエントリーより先に実行される
+    for parent in getattr(graph, "entry_packages", []) or []:
+        if parent not in build_roots:
+            build_roots.insert(0, parent)
     reach = (
         compute_reachability(program, entry_module, build_roots=build_roots, graph_modules=graph_modules)
         if entry_module else Reachability()
@@ -148,12 +164,21 @@ def get_semantics(graph: ImportGraph) -> Semantics:
             if node is not None and node.classification == "local":
                 unparsed_local.append(info.path or name)
     sem = Semantics(program, reach, entry_module, dict(events_by_top), unparsed_local, graph,
-                    {m: hooks[m] for m in build_roots})
+                    {m: hooks[m] for m in build_roots if m in hooks})
     sem.certain = certain_units(reach)
     sem.entries = entry_paths(reach, sem.certain)
-    for src, dst, t, _ev in reach.edges:
-        if t == "precise" and dst in sem.certain and dst not in sem.precise_parent and src != dst:
+    sem.__dict__["_parent_ev"] = pev = {}
+    for src, dst, t, _ev in all_edges(reach):
+        if t == "precise" and dst in sem.certain and dst not in sem.precise_parent and src != dst \
+                and (src is None or src in sem.certain):
             sem.precise_parent[dst] = src
+            pev[dst] = _ev
+    # 解析中の注意（定数でない動的 import・pkgutil の列挙の対象不明など: 仕様 5 節の前提）を結果の warnings へ
+    seen_w = set(graph.warnings)
+    for w in program.warnings:
+        if w not in seen_w:
+            seen_w.add(w)
+            graph.warnings.append(w)
     graph._semantics = sem  # type: ignore[attr-defined]
     return sem
 
@@ -227,6 +252,7 @@ def prefix_usage(sem: Semantics, prefix: str, exclude: tuple[str, ...] = ()) -> 
     top = prefix.split(".")[0]
     out = PrefixUsage()
     skip = (prefix,) + tuple(exclude)
+    intro = sem.program.introspecting_tops
     for unit, ev in sem.events_by_top.get(top, []):
         if any(under(unit.module, x) for x in skip):
             continue
@@ -235,7 +261,22 @@ def prefix_usage(sem: Semantics, prefix: str, exclude: tuple[str, ...] = ()) -> 
                 ev.from_base and any(under(f"{ev.from_base}.{n}", prefix) for n in ev.names if n != "*")
             ) or (ev.from_base and under(ev.from_base, prefix)):
                 out.imports.append((unit, ev))
+                # `try: from X import Y / except ImportError` は Y の有無の判定（方針 2）: Y が X で無条件に
+                # 束縛される（またはサブモジュール）と示せなければ、スタブでは結果が変わりうる
+                if ev.protected and ev.from_base and under(ev.from_base, prefix):
+                    finfo = sem.program.get(ev.from_base)
+                    for n in ev.names:
+                        if n == "*" or (finfo is not None and sem.program.submodule(finfo, n)):
+                            continue
+                        if not sem.program.name_always_bound(finfo, n):
+                            out.uses.append((unit, replace(ev, ctx="presence_import"), f"{ev.from_base}.{n}<有無>"))
             continue
+        if ev.kind == "ref" and ev.ctx == "annot" and intro:
+            # 注釈を実行時に取り出すコード（get_type_hints / dataclasses.fields 等）が、注釈のあるモジュールと
+            # 同じパッケージかプロジェクトにあれば、注釈は実行時に使われうる（方針 4）
+            utop = "<project>" if unit.module in sem.program.local_modules else unit.module.split(".")[0]
+            if utop in intro or "<project>" in intro or utop == "<project>":
+                ev = replace(ev, ctx="annot_introspected")
         if ev.kind == "dynamic":
             if ev.ref is not None and ev.ref.touches(prefix):
                 out.uses.append((unit, ev, _symbol_name(ev.ref, prefix) + ".<getattr>"))
@@ -517,6 +558,16 @@ def _analyze_single_package(
     usage = prefix_usage(sem, package_name)
     gateways = _gateways(usage.uses, sem.reach.reached)
 
+    side = _import_side_effect(sem, package_name)
+    if side:
+        return PackageAnalysis(
+            verdict="required",
+            reason=f"{package_name} の import 時に {side} が読み込まれ、外のコードがその有無を調べています"
+            "（import の副作用で別パッケージの属性が変わるため安全側判定）。",
+            gateway_functions=gateways,
+            **common,
+        )
+
     pending: dict | None = None
     certain_uses = [(u, ev, sym) for u, ev, sym in usage.uses if is_certain_use(sem, u, ev)]
     if usage.uses and not certain_uses:
@@ -605,6 +656,7 @@ def _analyze_single_package(
             gateway_functions=gateways,
             conditions=pending["conditions"],
             conditions_total=pending["total"],
+            conditions_complete=pending.get("complete", True),
             unproven_because=pending["because"],
             confidence=pending["confidence"],
             **common,
@@ -639,6 +691,36 @@ def _analyze_single_package(
 # ---------------------------------------------------------------------------
 # サブモジュールによる間接排除（仕様 6 節）
 # ---------------------------------------------------------------------------
+
+
+def _import_side_effect(sem: Semantics, package_name: str) -> str:
+    """package_name の到達済みモジュール本体が別パッケージ Q のサブモジュール Q.y を import し、
+    package_name の外の到達可能なコードが Q の属性の有無を動的に調べる（hasattr 等）なら Q.y。"""
+    subs: set[str] = set()
+    for (m, q) in sem.reach.reached:
+        if q != "<module>" or not under(m, package_name):
+            continue
+        for x in sem.reach.module_imports.get(m, ()):
+            top = x.split(".")[0]
+            if "." in x and top != package_name.split(".")[0] and not is_external_module(x):
+                subs.add(x)
+    if not subs:
+        return ""
+    for x in sorted(subs):
+        parent, last = x.rsplit(".", 1)
+        ptop = parent.split(".")[0]
+        for unit, ev in sem.events_by_top.get(ptop, []):
+            if under(unit.module, package_name) or under(unit.module, ptop) or ev.ref is None:
+                continue
+            on_parent = any(rr.kind == "module" and rr.module == parent for rr in ev.ref.all_refs())
+            if not on_parent:
+                continue
+            if ev.ctx in ("hasattr", "hasattr_opaque") and ev.name == last:
+                return x  # hasattr(Q, 'y'): y はこの import の副作用でだけ付く
+            local = unit.module in sem.program.local_modules
+            if local and (ev.kind == "dynamic" or ev.ctx == "unknown"):
+                return x  # プロジェクトのコードが Q の属性を名前の分からない形で調べる
+    return ""
 
 
 def find_submodule_hints(
@@ -724,6 +806,7 @@ def find_submodule_hints(
             conditional=bool(cond_info),
             conditions=(ci or {}).get("conditions", []),
             conditions_total=(ci or {}).get("total", 0),
+            conditions_complete=(ci or {}).get("complete", True),
             target_package=T,
             parent_package=cand.split(".")[0],
             submodule=cand,
@@ -829,21 +912,149 @@ def _public_route(sem: Semantics, caller: tuple[str, str] | None, limit: int = 8
     return api, route
 
 
+MAX_ENTRIES_ENUM = 50  # 入口がこれより多ければ列挙を打ち切る（high にしない。conditions_total は下限）
+
+
+def _rev_index(sem: Semantics):
+    """逆向きの辺と、名前での振り分けの呼び出し元を（確実 / 確実でない）に分けた索引（1 回だけ作る）。"""
+    idx = sem.__dict__.get("_rev_index")
+    if idx is not None:
+        return idx
+    rev: dict = {}
+    for src, dst, t, ev in all_edges(sem.reach):
+        if src is not None:
+            rev.setdefault(dst, []).append((src, t, ev))
+    by_name_certain: dict = {}  # 名前 → {印: (呼び出し元, イベント)}（確実な呼び出し元の代表）
+    by_name_other: dict = {}  # 名前 → [確実でない呼び出し元]
+    for name, callers in sem.reach.name_callers.items():
+        for (src, t), ev in callers.items():
+            if src in sem.certain:
+                by_name_certain.setdefault(name, {}).setdefault(t, (src, ev))
+            else:
+                by_name_other.setdefault(name, []).append((src, t, ev))
+    idx = (rev, by_name_certain, by_name_other)
+    sem.__dict__["_rev_index"] = idx
+    return idx
+
+
+def _region_entries_multi(sem: Semantics, keys: list) -> tuple[dict, bool]:
+    """確実でないユニット群 keys のどれかに届く全ての入口（多始点の逆向き探索）。
+
+    戻り値: {(入口のユニット, 辺の印): (辺のイベント, 確実側の呼び出し元, 使用までの距離, 由来の使用ユニット)}, 列挙しきれたか
+    """
+    rev, by_name_certain, by_name_other = _rev_index(sem)
+    out: dict = {}
+    origin = {k: k for k in keys}
+    dist = {k: 0 for k in keys}
+    q = deque(keys)
+    names_done: set[str] = set()
+    complete = True
+    while q:
+        k = q.popleft()
+        preds = rev.get(k, ())
+        nm = k[1].split(".")[-1].split("#")[0] if k[1] != "<module>" else ""
+        if nm:
+            for t, (src, ev) in by_name_certain.get(nm, {}).items():
+                if src != k and _instance_from_certain(sem, k):
+                    ek = (k, t)
+                    if ek not in out:
+                        out[ek] = (ev, src, dist[k], origin[k])
+            if nm not in names_done:
+                names_done.add(nm)
+                preds = list(preds) + by_name_other.get(nm, [])
+        for src, t, ev in preds:
+            if src in sem.certain:
+                if t == "name" and not _instance_from_certain(sem, k):
+                    continue  # 名前の振り分け先のクラスのインスタンスは、この範囲に入らないと作られない
+                ek = (k, t)
+                if ek not in out:
+                    out[ek] = (ev, src, dist[k], origin[k])
+            elif src not in dist:
+                dist[src] = dist[k] + 1
+                origin[src] = origin[k]
+                q.append(src)
+        if len(out) > MAX_ENTRIES_ENUM:
+            complete = False
+            break
+    return out, complete
+
+
+def _region_entries(sem: Semantics, key: tuple[str, str]) -> tuple[list, bool]:
+    """互換: 1 つのユニットに届く入口の一覧。"""
+    out, complete = _region_entries_multi(sem, [key])
+    return [(k, t, ev, src, d) for (k, t), (ev, src, d, _o) in out.items()], complete
+
+
+def _instance_from_certain(sem: Semantics, key: tuple[str, str]) -> bool:
+    """メソッド key のクラス（またはその派生）が、確実なコードからインスタンス化されうるか。"""
+    unit = sem.program.units.get(key)
+    if unit is None or not unit.cls:
+        return True  # 関数（モジュールの属性）: 名前で呼ばれうる
+    ckey = (unit.module, unit.cls)
+    cache = sem.__dict__.setdefault("_inst_certain", {})
+    if ckey in cache:
+        return cache[ckey]
+    ok = False
+    for inst, srcs in sem.reach.inst_srcs.items():
+        if ckey == inst or ckey in sem.reach.mro.get(inst, ()):
+            if any(s is None or s in sem.certain for s in srcs):
+                ok = True
+                break
+    cache[ckey] = ok
+    return ok
+
+
+def _swallowed_on_path(sem: Semantics, src: tuple[str, str] | None, ev) -> bool:
+    """入口の辺のイベントか、確実側の呼び出し元から起点までの呼び出しのどれかが、例外を握りつぶしうる枠の中か。"""
+    if getattr(ev, "broad", False):
+        return True
+    k = src
+    seen = set()
+    while k is not None and k not in seen:
+        seen.add(k)
+        parent = sem.precise_parent.get(k)
+        if parent is None:
+            break
+        if getattr(sem.__dict__.get("_parent_ev", {}).get(k), "broad", False):
+            return True
+        k = parent
+    return False
+
+
+def _edges_between(sem: Semantics, a, b) -> list:
+    idx = sem.__dict__.get("_edges_ab")
+    if idx is None:
+        idx = {}
+        for src, dst, t, ev in all_edges(sem.reach):
+            idx.setdefault((src, dst), []).append((src, dst, t, ev))
+        sem.__dict__["_edges_ab"] = idx
+    return idx.get((a, b), [])
+
+
 def build_conditions(sem: Semantics, uses: list, prefix: str) -> dict | None:
     """使用（全て確実ではない）から「これを使うと壊れる」入口を組み立てる。入口が分からなければ None。"""
     groups: dict = {}
     because: set[str] = set()
+    complete_all = True
+    sym_of: dict = {}
+    region_keys: list = []
+    flat: list = []
     for unit, ev, sym in uses:
         if unit.key in sem.certain and ev.cond:
-            ekey, tag, eev, caller = unit.key, "branch", ev, unit.key
+            flat.append((unit.key, "branch", ev, unit.key, 0, [(ev, sym)], unit.key))
         else:
-            info = sem.entries.get(unit.key)
-            if info is None:
-                return None
-            ekey, tag, eev, caller = info
-            if tag == "precise":
-                # 確実な辺の先が確実でない（起点から外れた）: 区別できない
-                return None
+            if unit.key not in sym_of:
+                region_keys.append(unit.key)
+            sym_of.setdefault(unit.key, []).append((ev, sym))
+    if region_keys:
+        found, complete_all = _region_entries_multi(sem, region_keys)
+        if not found:
+            return None  # 入口を特定できない: 区別できない
+        for (k, t), (eev, src, d, orig) in found.items():
+            flat.append((k, t, eev, src, d, sym_of.get(orig, []), orig))
+    for ekey, tag, eev, caller, dist, evsyms, orig in flat:
+        if tag == "precise":
+            return None  # 確実な辺の先が確実でない（起点から外れた）: 区別できない
         because.add(tag)
         g = groups.setdefault((ekey, tag), {
             "entry": _api_name(sem, ekey),
@@ -852,25 +1063,31 @@ def build_conditions(sem: Semantics, uses: list, prefix: str) -> dict | None:
             "dispatch_name": (getattr(eev, "name", "") if tag == "name" else ""),
             "called_from": _api_name(sem, caller) if caller is not None else "",
             "uses": [],
-            "path": _path_to(sem, unit.key, ekey),
+            "path": _path_to(sem, orig, ekey),
             "may_be_swallowed": False,
+            "_key": ekey,
+            "_tag": tag,
+            "_dist": dist,
         })
+        g["_dist"] = min(g["_dist"], dist)
         if "public_api" not in g:
             api, route = _public_route(sem, caller)
             g["public_api"] = api  # プロジェクトのコードが呼ぶ、条件の入口に至る依存ライブラリの関数
             g["route_from_project"] = route
-        if len(g["uses"]) < 5 and sym not in g["uses"]:
-            g["uses"].append(sym)
-        if ev.broad or getattr(eev, "broad", False):
+        for uev, sym in evsyms[:5]:
+            if len(g["uses"]) < 5 and sym not in g["uses"]:
+                g["uses"].append(sym)
+            if uev.broad:
+                g["may_be_swallowed"] = True
+        if not g["may_be_swallowed"] and _swallowed_on_path(sem, caller, eev):
             g["may_be_swallowed"] = True
-    conds = sorted(groups.values(), key=lambda g: (-len(g["uses"]), g["entry"]))
-    tags_of: dict[int, str] = {}
-    for (ekey, tag), g in groups.items():
-        tags_of[id(g)] = tag
+    conds = sorted(groups.values(), key=lambda g: (g["_dist"], -len(g["uses"]), g["entry"]))
     all_project_zero = True
     for g in conds:
+        ekey, tag = g.pop("_key"), g.pop("_tag")
+        g["distance_to_use"] = g.pop("_dist")
         name = g["entry"].rstrip("()").split(".")[-1] if not g["entry"].startswith("import ") else ""
-        hits = project_name_uses(sem, name) if name else []
+        hits = project_entry_uses(sem, ekey, name)
         g["project_uses_count"] = len(hits)
         g["project_uses"] = hits[:10]
         if hits:
@@ -878,20 +1095,50 @@ def build_conditions(sem: Semantics, uses: list, prefix: str) -> dict | None:
             g["project_note"] = f"プロジェクトのコードに `{name}` の呼び出し・参照が {len(hits)} 件あります（照らしてください）"
         else:
             g["project_note"] = (f"プロジェクトのコードは `{name}` を直接使っていません"
-                                 + ("（到達は依存ライブラリ内の名前の一致による推定だけ）" if tags_of[id(g)] == "name" else ""))
-    confidence = "high" if (all_project_zero and "branch" not in because) else "low"
+                                 + ("（到達は依存ライブラリ内の名前の一致による推定だけ）" if tag == "name" else ""))
     total = len(conds)
+    confidence = "high" if (all_project_zero and "branch" not in because and complete_all
+                            and 0 < total <= MAX_CONDITIONS) else "low"
     shown = conds[:MAX_CONDITIONS]
     for g in shown:
         if g["may_be_swallowed"]:
-            g["note"] = "呼び出し元が except Exception（または except:）で囲まれており、スタブの例外が握りつぶされることがあります"
+            g["note"] = ("呼び出し元が except Exception / RuntimeError（または except: / contextlib.suppress）で囲まれており、"
+                         "MCP_PYSTUB_STRICT=0 のときはスタブの例外が握りつぶされることがあります（既定では終了コード 70 で止まります）")
     summary = ", ".join(g["entry"] for g in shown[:3]) + (f" ほか {total - 3} 件" if total > 3 else "")
     return {"conditions": shown, "total": total, "because": sorted(_TAG_TEXT.get(t, t) for t in because),
-            "summary": summary, "confidence": confidence}
+            "summary": summary, "confidence": confidence, "complete": complete_all}
+
+
+def project_entry_uses(sem: Semantics, ekey: tuple[str, str], name: str) -> list[str]:
+    """プロジェクト自身のコード（到達済みの local ユニット）で、入口 ekey を指す参照（解決した参照）と、
+    受け手の分からない同名のメソッド呼び出し（名前の一致で届きうるもの）の場所（ファイル:行）。"""
+    idx = sem.__dict__.get("_local_ref_index")
+    if idx is None:
+        by_target: dict = {}
+        by_name: dict = {}
+        prog = sem.program
+        for key in sorted(k for k in sem.reach.reached if k[0] in prog.local_modules):
+            unit = prog.units.get(key)
+            info = prog.modules.get(key[0])
+            if unit is None or info is None:
+                continue
+            for ev in unit.events:
+                where = f"{info.path}:{ev.lineno}"
+                if ev.ref is not None:
+                    for rr in ev.ref.all_refs():
+                        if rr.kind in ("function", "method", "class"):
+                            by_target.setdefault((rr.module, rr.target), []).append(where)
+                elif ev.kind in ("method", "attr") and ev.ctx != "self":
+                    by_name.setdefault(ev.name, []).append(where)  # 受け手が分からない呼び出し
+        idx = (by_target, by_name)
+        sem.__dict__["_local_ref_index"] = idx
+    by_target, by_name = idx
+    hits = list(dict.fromkeys(by_target.get(ekey, []) + (by_name.get(name, []) if name else [])))
+    return hits
 
 
 def project_name_uses(sem: Semantics, name: str) -> list[str]:
-    """プロジェクト自身のコード（local 分類のファイル）での、その名前の呼び出し・属性参照（ファイル:行）。"""
+    """互換（未使用）: プロジェクトのコードでの、その名前の呼び出し・属性参照（ファイル:行）。"""
     cache = sem.__dict__.setdefault("_name_hits", {})
     if name in cache:
         return cache[name]
@@ -899,9 +1146,10 @@ def project_name_uses(sem: Semantics, name: str) -> list[str]:
     hits: list[str] = []
     for m in sorted(sem.program.local_modules):
         info = sem.program.modules.get(m)
-        if info is None or info.tree is None:
+        tree = sem.program.tree_of(info) if info is not None else None
+        if tree is None:
             continue
-        for n in _ast.walk(info.tree):
+        for n in _ast.walk(tree):
             if (isinstance(n, _ast.Attribute) and n.attr == name) or (
                 isinstance(n, _ast.Name) and n.id == name and isinstance(n.ctx, _ast.Load)
             ):

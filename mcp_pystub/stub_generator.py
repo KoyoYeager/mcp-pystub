@@ -40,8 +40,8 @@ class _M(type):
         raise AttributeError(n)
     def __call__(c, *a, **k): raise RuntimeError(c.__name__ + " (stub)")
     __getitem__ = lambda c, i: c
-def _g(n):
-    return _M(n, (), {{"_pystub_known": ()}})
+def _g(n, t=False):
+    return _M(n, (), {{"_pystub_known": (), "_pystub_truthy": t}})
 """
 
 # 条件付き候補のスタブ: 呼ばれたら「mcp-pystub のスタブ」と分かる例外で落ちる
@@ -50,26 +50,56 @@ class PystubConditionalStubError(RuntimeError):
     pass
 _PYSTUB_NOTE = {note!r}
 def _raise(n):
+    # 既定: 標準エラーに原因を書いて終了コード 70 で即終了（except で握りつぶせない）。
+    # MCP_PYSTUB_STRICT=0 のときだけ例外を投げる
     m = "mcp-pystub のスタブです。" + _PYSTUB_NOTE + "（呼ばれたもの: " + n + "）"
     import os, sys
     try:
-        sys.stderr.write("[mcp-pystub] " + m + "\\n")  # 呼び出し元の except で握りつぶされても分かるように
+        sys.stderr.write("[mcp-pystub] PystubConditionalStubError: " + m + "\\n")
         sys.stderr.flush()
     except Exception:
         pass
-    if os.environ.get("MCP_PYSTUB_STRICT") == "1":
+    if os.environ.get("MCP_PYSTUB_STRICT", "1") != "0":
+        try:
+            sys.stdout.flush()
+        except Exception:
+            pass
         os._exit(70)
     raise PystubConditionalStubError(m)
 class _M(type):
+    # 代わりのオブジェクト: 呼び出し・添字・真偽・書式・比較・反復・演算・未知の属性のどれでも止まる
     def __getattr__(c, n):
         k = c.__dict__.get("_pystub_known")
-        if n[:2] != "__" and (k is None or n in k):
+        if n[:2] == "__":
+            raise AttributeError(n)
+        if k is not None and n in k:
             return _M(n, (), {{"_pystub_known": ()}})
-        raise AttributeError(n)
+        _raise(c.__name__ + "." + n)
     def __call__(c, *a, **k): _raise(c.__name__)
-    __getitem__ = lambda c, i: c
-def _g(n):
-    return _M(n, (), {{"_pystub_known": ()}})
+    def __getitem__(c, i): _raise(c.__name__ + "[...]")
+    def __iter__(c): _raise(c.__name__ + " の反復")
+    def __len__(c): _raise("len(" + c.__name__ + ")")
+    def __contains__(c, x): _raise(c.__name__ + " の in")
+    def __bool__(c):
+        if c.__dict__.get("_pystub_truthy"):
+            return True  # 元はモジュール・クラス・関数（常に真）
+        _raise(c.__name__ + " の真偽")
+    def __str__(c): _raise("str(" + c.__name__ + ")")
+    def __format__(c, spec): _raise(c.__name__ + " の書式")
+    def __eq__(c, o): _raise(c.__name__ + " の比較")
+    def __ne__(c, o): _raise(c.__name__ + " の比較")
+    def __lt__(c, o): _raise(c.__name__ + " の比較")
+    def __le__(c, o): _raise(c.__name__ + " の比較")
+    def __gt__(c, o): _raise(c.__name__ + " の比較")
+    def __ge__(c, o): _raise(c.__name__ + " の比較")
+    def __add__(c, o): _raise(c.__name__ + " の演算")
+    __radd__ = __sub__ = __rsub__ = __mul__ = __rmul__ = __truediv__ = __rtruediv__ = __add__
+    __mod__ = __rmod__ = __floordiv__ = __pow__ = __neg__ = __pos__ = __abs__ = __add__
+    def __int__(c): _raise("int(" + c.__name__ + ")")
+    __float__ = __index__ = __int__
+    __hash__ = type.__hash__
+def _g(n, t=False):
+    return _M(n, (), {{"_pystub_known": (), "_pystub_truthy": t}})
 """
 
 _NET_KNOWN = """_PYSTUB_KNOWN = {known}
@@ -318,7 +348,9 @@ class _StubBuilder:
                 defs.append(self._func_stub(name, module + "." + name))
                 return
             else:
-                defs.append(f"{name} = _g({name!r})\n")
+                real = {x.kind for x in leaves if not x.fallback}
+                truthy = bool(real) and real <= {"module", "external_module", "class", "function"}
+                defs.append(f"{name} = _g({name!r}{', True' if truthy else ''})\n")
                 return
         kind = r.kind
         if kind in ("module", "external_module"):
@@ -331,12 +363,12 @@ class _StubBuilder:
                         self.need(target)
                 tail.append(
                     f"try:\n    {name} = __import__({target!r}, None, None, ['_'])\n"
-                    f"except ImportError:\n    {name} = _g({name!r})\n"
+                    f"except ImportError:\n    {name} = _g({name!r}, True)\n"
                 )
             else:
                 tail.append(
                     f"try:\n    {name} = __import__({target!r}, None, None, ['_'])\n"
-                    f"except ImportError:\n    {name} = _g({name!r})\n"
+                    f"except ImportError:\n    {name} = _g({name!r}, True)\n"
                 )
             return
         if kind == "external":
@@ -666,11 +698,12 @@ def generate_stubs(
     package_name: str,
     python_path: str = "",
     max_depth: int = 10,
+    _prepared: tuple | None = None,
 ) -> dict:
-    """パッケージのスタブコードを生成する。"""
+    """パッケージのスタブコードを生成する（_prepared: verify が作ったグラフを使い回す時だけ渡す）。"""
     if not _valid_dotted(package_name) or "." in package_name:
         return {"error": f"パッケージ名が不正です: {package_name!r}（トップレベルのパッケージ名を指定）"}
-    prepared, err = _prepare(entry_point, python_path, max_depth)
+    prepared, err = (_prepared, None) if _prepared is not None else _prepare(entry_point, python_path, max_depth)
     if err:
         return err
     entry, resolver, graph = prepared
@@ -718,7 +751,14 @@ def generate_stubs(
             for i in range(1, len(parts) - 1):
                 init = "/".join(parts[:i]) + "/__init__.py"
                 if init not in files:
-                    files[init] = _HEADER.format(module=".".join(parts[:i]))
+                    files[init] = (_LOUD_HEADER.format(module=".".join(parts[:i]), note=note) + _NET_ALL) if note \
+                        else _HEADER.format(module=".".join(parts[:i]))
+        if note:
+            # 条件付きのスタブ: 元にある全てのサブモジュールと公開名を import できるようにし、使った時点で止める
+            # （第 4 回 条件付きの段 5: `from fontTools import subset` の ImportError を無くす）
+            pkg_dir = main if main.is_dir() else main.parent
+            if (pkg_dir / "__init__.py").exists():
+                files.update(_all_submodule_stubs(pkg_dir, package_name, files, note))
 
     for rel, code in files.items():
         compile(code, rel, "exec")  # 生成物は必ず構文として正しい
@@ -748,6 +788,33 @@ def generate_stubs(
         "conditional": bool(conditional_info),
         "conditions": (conditional_info or {}).get("conditions", []),
     }
+
+
+def _all_submodule_stubs(pkg_dir: Path, package_name: str, have: dict, note: str) -> dict:
+    """パッケージのディレクトリにある全てのモジュール（.py / 拡張モジュール）の、止まるだけのスタブ。"""
+    out: dict = {}
+    try:
+        paths = sorted(pkg_dir.rglob("*"))
+    except OSError:
+        return out
+    for f in paths:
+        if "__pycache__" in f.parts or not f.is_file():
+            continue
+        rel_parts = f.relative_to(pkg_dir.parents[len(package_name.split(".")) - 1]).parts
+        stem = f.name.split(".")[0]
+        if not (f.suffix in (".py", ".pyw") or is_extension_file(f)) or not stem.isidentifier():
+            continue
+        if not all(x.isidentifier() for x in rel_parts[:-1]):
+            continue
+        # 親がパッケージ（__init__.py がある）の時だけ
+        if not (f.parent / "__init__.py").exists():
+            continue
+        rel = "/".join(rel_parts[:-1] + (stem + ".py",))
+        if rel in have or rel in out:
+            continue
+        mod = ".".join(rel_parts[:-1] + ((stem,) if stem != "__init__" else ()))
+        out[rel] = _LOUD_HEADER.format(module=mod, note=note) + _NET_ALL
+    return out
 
 
 def _conditional_note(graph, sem: Semantics, prefix: str, is_package: bool) -> tuple[str, dict | None]:
@@ -830,6 +897,36 @@ def _get_pip_name(package_name: str) -> str:  # 互換
     return package_name
 
 
+def _verify_import_cmd(m: str, import_root: Path) -> str:
+    """復元後の import 確認。中身の消えたパッケージは名前空間パッケージとして import できてしまう
+    （__file__ が None）ので、元がファイルを持つモジュールなら __file__ も確かめる。"""
+    mrel = Path(*m.split("."))
+    has_file = (import_root / mrel / "__init__.py").exists() or (import_root / mrel).with_suffix(".py").exists()
+    if not has_file:
+        return f'python -c "import {m}; print(\'{m} OK\')"'
+    msg = f"{m} は中身の無い名前空間パッケージとして読み込まれました（元ファイルが失われています）"
+    return (f'python -c "import {m}; f = getattr({m}, \'__file__\', None); '
+            f'assert f, \'{msg}\'; print(\'{m} OK\', f)"')
+
+
+_RECORD_CHECK = (
+    "import importlib.metadata as m, hashlib, base64, sys\n"
+    "d = m.distribution(sys.argv[1]); bad = []\n"
+    "for f in (d.files or []):\n"
+    "    if not f.hash or f.hash.mode != 'sha256': continue\n"
+    "    try: h = base64.urlsafe_b64encode(hashlib.sha256(open(f.locate(), 'rb').read()).digest()).rstrip(b'=').decode()\n"
+    "    except OSError: h = None\n"
+    "    if h != f.hash.value: bad.append(str(f))\n"
+    "assert not bad, 'RECORD と異なる・欠けたファイル: %d 件 %s' % (len(bad), bad[:5])\n"
+    "print('files OK', sys.argv[1], len(d.files or []))"
+)
+
+
+def _verify_record_cmd(dist: str) -> str:
+    """配布物の RECORD の sha256 と実ファイルを照合する（復元で元ファイルが揃ったことの確認）。"""
+    return "python -c " + shlex.quote(_RECORD_CHECK) + " " + shlex.quote(dist)
+
+
 def _generate_build_instructions(
     name: str,
     moves: list[Path],
@@ -857,29 +954,30 @@ def _generate_build_instructions(
         if not _is_within(mp, import_root) or mp == import_root or mp == site_root:
             raise ValueError(f"site-packages の外は扱いません: {mp}")
         rel_moves.append(mp.relative_to(import_root))
-    bak_of = {rel: backup_root / (import_root / rel).relative_to(site_root) for rel in rel_moves}
+    # 項目ごとに専用のバックアップ領域 <_pystub_bak>/<項目名>/ を使う（仕様 7 節）。
+    # 項目の領域があること＝その項目が適用中であること。領域を共有すると、重ねて適用した時に
+    # 内側の項目のバックアップと外側の移動がぶつかり、元ファイルを失う（第 3 回の検証で再現）。
+    item_root = backup_root / name
+    bak_of = {rel: item_root / (import_root / rel).relative_to(site_root) for rel in rel_moves}
 
-    # 重なりの防御: 親パッケージが既に（別のスタブとして）丸ごとバックアップ領域へ移されていれば、
-    # この項目はその中に含まれるので適用・復元とも何もしない（仕様 7 節）。
-    # 判定は親の __init__.py がバックアップ側にあるかで行う。親の「ディレクトリ」の有無で判定すると、
-    # この項目自身のバックアップ（bak/<親>/<子>.py）で親ディレクトリが作られた時点で
-    # 誤って skip し、元ファイルを退避したままスタブを置かない事故になる（第 3 回 e2e で発生）。
-    anc_checks = []
-    parts = Path(name.replace(".", "/")).parts
-    for i in range(1, len(parts)):
-        anc_rel = Path(*parts[:i])
-        anc_bak = backup_root / (import_root / anc_rel).relative_to(site_root)
-        anc_checks.append(f"[ -e {_q(anc_bak / '__init__.py')} ]")
-    covered = " || ".join(anc_checks)
-    skip = (f"if {covered}; then echo 'skip: {name} は親パッケージのスタブに含まれます'; exit 0; fi") if anc_checks else ""
-    backup_cmds = ["# === 元ファイルをバックアップ領域へ移動（必ず最初に実行。既にあれば何もしない） ==="]
+    parts = name.split(".")
+    anc_dirs = [backup_root / ".".join(parts[:i]) for i in range(1, len(parts))]
+    covered = " || ".join(f"[ -d {_q(d)} ]" for d in anc_dirs)
+    # 親の項目が適用中なら、この項目はその中に含まれるので何もしない
+    skip = (f"if {covered}; then echo 'skip: {name} は親パッケージのスタブに含まれます（先に親を復元してください）'; exit 0; fi"
+            if anc_dirs else "")
+    # 内側の項目が適用中なら、外側（この項目）は適用しない（先に内側を復元させる）
+    inner = (f"for d in {_q(backup_root)}/{name}.*; do if [ -d \"$d\" ]; then "
+             f"echo \"refuse: 内側のスタブ $(basename \"$d\") が適用中です。先にそれを復元してください\" >&2; exit 1; fi; done")
+    backup_cmds = ["# === 元ファイルをバックアップ領域へ移動（必ず最初に実行。既に移した物は動かさない） ==="]
     if skip:
         backup_cmds.append(skip)
+    backup_cmds.append(inner)
     for rel in rel_moves:
         src = import_root / rel
         dst = bak_of[rel]
         backup_cmds.append(
-            f"if [ ! -e {_q(dst)} ]; then mkdir -p {_q(dst.parent)} && mv {_q(src)} {_q(dst)}; fi  # .bak 相当"
+            f"if [ ! -e {_q(dst)} ] && [ -e {_q(src)} ]; then mkdir -p {_q(dst.parent)} && mv {_q(src)} {_q(dst)}; fi  # .bak 相当"
         )
 
     stub_top = name.replace(".", "/")
@@ -887,23 +985,36 @@ def _generate_build_instructions(
     is_file = str(main_rel).endswith(".py") or (import_root / main_rel).suffix == ".py"
     target = import_root / (main_rel if is_file else Path(stub_top))
     src_stub = Path(stub_root_hint) / (main_rel if is_file else Path(stub_top))
-    guard = " && ".join(f"[ -e {_q(bak_of[r])} ]" for r in rel_moves) or "true"
+    guard = " && ".join(f"[ -e {_q(bak_of[r])} ]" for r in rel_moves) or "false"
     install_cmds = [
         "# スタブを配置（生成された files を _stubs/ に書き出してから。バックアップが無ければ中止）:",
     ] + ([skip] if skip else []) + [
+        inner,
         f"if {guard}; then rm -rf {_q(target)} && cp -r {_q(src_stub)} {_q(target)}; "
         f"else echo 'backup missing: run backup_commands first' >&2; exit 1; fi",
     ]
 
-    uninstall_cmds = ["# === 方法1: バックアップから復元（推奨・高速・確実） ==="] + ([skip] if skip else [])
-    uninstall_cmds.append(f"if {guard}; then rm -rf {_q(target)}; fi")
+    # 復元はこの項目の領域があるときだけ行う（無ければ適用されていない＝何もしない）
+    uninstall_cmds = ["# === 方法1: バックアップから復元（推奨・高速・確実） ==="]
+    # スタブの撤去は、元ファイルがバックアップ側に揃っている時だけ（中断した適用で元を消さない）
+    restore_parts = [f"if {guard}; then rm -rf {_q(target)}; fi"] if rel_moves else []
     for rel in rel_moves:
-        uninstall_cmds.append(
-            f"if [ -e {_q(bak_of[rel])} ]; then rm -rf {_q(import_root / rel)} && mv {_q(bak_of[rel])} {_q(import_root / rel)}; fi"
+        restore_parts.append(
+            f"if [ -e {_q(bak_of[rel])} ]; then rm -rf {_q(import_root / rel)} && mkdir -p {_q((import_root / rel).parent)} "
+            f"&& mv {_q(bak_of[rel])} {_q(import_root / rel)}; fi"
         )
-    # 空になったバックアップ領域を消す（復元後の環境を元と同じにする: 仕様 7 節）
     uninstall_cmds.append(
-        f"if [ -d {_q(backup_root)} ]; then find {_q(backup_root)} -depth -type d -empty -delete 2>/dev/null || true; fi"
+        f"if [ -d {_q(item_root)} ]; then " + "; ".join(restore_parts or ["true"]) + "; fi"
+    )
+    # 空になった領域を消す（復元後の環境を元と同じにする。空でなければ残る＝要確認）
+    uninstall_cmds.append(
+        f"if [ -d {_q(item_root)} ]; then find {_q(item_root)} -depth -type d -empty -delete 2>/dev/null || true; fi"
+    )
+    uninstall_cmds.append(
+        f"if [ -d {_q(item_root)} ]; then echo 'warning: {name} のバックアップ領域にファイルが残っています: {item_root}' >&2; fi"
+    )
+    uninstall_cmds.append(
+        f"if [ -d {_q(backup_root)} ]; then rmdir {_q(backup_root)} 2>/dev/null || true; fi"
     )
     uninstall_cmds.append("")
     uninstall_cmds.append("# === 方法2: pip で再インストール（バックアップ消失時のフォールバック。対象環境の python で実行） ===")
@@ -914,7 +1025,11 @@ def _generate_build_instructions(
     uninstall_cmds.append("python -m pip install --force-reinstall --no-deps " + " ".join(_q(s) for s in specs))
 
     imports = verify_imports or [name]
-    verify_cmds = [f'python -c "import {m}; print(\'{m} OK\')"' for m in imports]
+    verify_cmds = [_verify_import_cmd(m, import_root) for m in imports]
+    # 配布物の RECORD にある全ファイルが元のハッシュで揃っているか（欠落・スタブの置き忘れを検出）
+    dist_names = [n for n, _v in pip_name] if isinstance(pip_name, list) else ([pip_name] if version else [])
+    for n in dist_names:
+        verify_cmds.append(_verify_record_cmd(n))
     if isinstance(pip_name, list):
         for n, v in pip_name:
             verify_cmds.append(
@@ -968,6 +1083,7 @@ def generate_submodule_stubs(
     submodule: str,
     python_path: str = "",
     max_depth: int = 10,
+    _prepared: tuple | None = None,
 ) -> dict:
     """サブモジュール単位のスタブを生成する。
 
@@ -983,7 +1099,7 @@ def generate_submodule_stubs(
     if len(submod_parts) < 2 or submod_parts[0] != parent_package:
         return {"error": f"サブモジュール '{submodule}' は '{parent_package}' に属していません"}
 
-    prepared, err = _prepare(entry_point, python_path, max_depth)
+    prepared, err = (_prepared, None) if _prepared is not None else _prepare(entry_point, python_path, max_depth)
     if err:
         return err
     entry, resolver, graph = prepared
@@ -1018,6 +1134,11 @@ def generate_submodule_stubs(
         if sub_main.is_file() and m == submodule:
             rel = "/".join(submod_parts) + ".py"
         files[rel] = c
+    sub_dir = sub_main if sub_main.is_dir() else sub_main.parent
+    if note and (sub_main.is_dir() or sub_main.name == "__init__.py") and (sub_dir / "__init__.py").exists():
+        # 条件付き: サブモジュールの中の全てのモジュールを import できるようにし、使った時点で止める
+        extra_files = _all_submodule_stubs(sub_dir, submodule, files, note)
+        files.update({k: v for k, v in extra_files.items() if k.startswith("/".join(submod_parts) + "/")})
     for rel, code in files.items():
         compile(code, rel, "exec")
 

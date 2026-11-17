@@ -13,6 +13,7 @@ C拡張パッケージ（qtlib = PySide6相当）の間接排除を検証する�
 from __future__ import annotations
 
 import logging
+import re
 from pathlib import Path
 
 import pytest
@@ -286,10 +287,15 @@ class TestReductionLogging:
             logger.info(msg)
         print(msg)  # pytest -s で確認可能
 
-        # 基本アサーション
-        # 398 バイトの小さな試験用モジュールでは、元の AST に忠実なスタブ（例外の基底・
-        # 元にある名前の一覧）の方が大きくなる。削減量の意味がある大きさの時だけ比べる
-        assert stub < original or original < 4096, "スタブが元より大きい"
+        # スタブは対象の C 拡張パッケージを import しない（排除できている）こと、元が数えられていること、
+        # スタブ自身が構文として正しく、元の公開名を持つこと（大きさの比較は試験用の小さなモジュールでは意味がない）
+        assert "error" not in result, result
+        assert original > 0 and stub > 0
+        assert result.get("eliminated_packages"), result
+        for rel, code in result["files"].items():
+            compile(code, rel, "exec")
+            for target in result["eliminated_packages"]:
+                assert not re.search(rf"^\s*(import|from)\s+{re.escape(target)}\b", code, re.M), (rel, target)
 
     def test_log_full_analysis_reduction(self, caplog):
         """analyze 結果の全体的な削減可能性をログ出力"""

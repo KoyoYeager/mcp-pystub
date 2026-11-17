@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import importlib.machinery
 import shutil
+import os
 import subprocess
 import sys
 import textwrap
@@ -36,7 +37,7 @@ def _run(proj: Path, site: Path, entry: Path) -> tuple[int, str]:
     code = ("import sys; sys.path[:0]=%r; import runpy; runpy.run_path(%r, run_name='__main__')"
             % ([str(proj), str(site)], str(entry)))
     r = subprocess.run([sys.executable, "-S", "-c", code], capture_output=True, text=True, timeout=60,
-                       encoding="utf-8", errors="replace")
+                       encoding="utf-8", errors="replace", env=dict(os.environ, PYTHONIOENCODING="utf-8"))
     return r.returncode, (r.stdout + r.stderr).strip()
 
 

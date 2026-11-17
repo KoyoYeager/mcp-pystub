@@ -10,6 +10,7 @@ from __future__ import annotations
 import importlib.machinery
 import shlex
 import shutil
+import os
 import subprocess
 import sys
 import textwrap
@@ -79,7 +80,8 @@ class Scenario:
             % ([str(self.proj), str(site)], self.entry)
         )
         r = subprocess.run(
-            [sys.executable, "-S", "-c", code], capture_output=True, text=True, timeout=60
+            [sys.executable, "-S", "-c", code], capture_output=True, text=True, timeout=60,
+            encoding="utf-8", errors="replace", env=dict(os.environ, PYTHONIOENCODING="utf-8"),
         )
         return r.returncode, (r.stdout + r.stderr).strip()
 
@@ -517,7 +519,8 @@ class TestInstructions:
         rc0, out0 = s.run()
         for _ in range(2):
             for key in ("backup_commands", "install_commands", "backup_commands", "install_commands"):
-                r = subprocess.run([bash, "-c", "\n".join(bi[key])], cwd=stage, capture_output=True, text=True)
+                r = subprocess.run([bash, "-c", "\n".join(bi[key])], cwd=stage, capture_output=True, text=True,
+                                   encoding="utf-8", errors="replace")
                 assert r.returncode == 0, r.stderr
             rc, out = s.run()
             assert (rc, out) == (rc0, out0)
@@ -526,7 +529,8 @@ class TestInstructions:
                 if "方法2" in line:
                     break
                 lines.append(line)
-            r = subprocess.run([bash, "-c", "\n".join(lines)], cwd=stage, capture_output=True, text=True)
+            r = subprocess.run([bash, "-c", "\n".join(lines)], cwd=stage, capture_output=True, text=True,
+                               encoding="utf-8", errors="replace")
             assert r.returncode == 0, r.stderr
             assert self._tree(s.sp) == before
 
@@ -535,7 +539,8 @@ class TestInstructions:
         g = generate_stubs(s.entry, "heavyy", python_path=str(s.sp))
         assert list(g["files"]) == ["heavyy.py"]
         cmds = "\n".join(g["build_instructions"]["backup_commands"] + g["build_instructions"]["install_commands"])
-        assert "heavyy.py" in cmds and "/heavyy " not in cmds
+        sp_q = str(s.sp.resolve()).replace("\\", "/")
+        assert "heavyy.py" in cmds and sp_q + "/heavyy " not in cmds  # 存在しない heavyy/ ディレクトリを動かさない
         self._apply_restore_twice(s, g)
 
     def test_l1_no_pip_uninstall_and_backup_outside_site_packages(self, tmp_path):

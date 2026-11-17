@@ -34,7 +34,19 @@ def analyze(
         AnalysisResult を辞書化したもの
     """
     start = time.monotonic()
+    import gc
+    gc_was = gc.isenabled()
+    gc.disable()  # 解析中は循環参照の回収を止める（数百万の構文木ノードを何度も走査して遅くなる）
+    try:
+        return _analyze(entry_point, python_path, max_depth, include_small_conditional, start)
+    finally:
+        if gc_was:
+            gc.enable()
+        gc.collect()
 
+
+def _analyze(entry_point: str, python_path: str, max_depth: int, include_small_conditional: bool,
+             start: float) -> dict:
     entry = Path(entry_point).resolve()
     if not entry.is_file():
         return asdict(AnalysisResult(
@@ -123,6 +135,18 @@ def analyze(
             d["how_to_check"] = (f"verify({str(entry)!r}{py_arg}, packages=[], "
                                  f"submodules=[{(h.submodule + '=>' + h.target_package)!r}], nofollow=[], run_entry=True)")
             chints.append(d)
+    # 同じパッケージに全体とサブモジュールの両方を提案しない（全体が出るならサブは出さない: 仕様 7 節）
+    whole = {a["package_name"] for a in result_dict["stubbable"]} | {d["package_name"] for d in conditional}
+    dropped = []
+    for lst in (result_dict["submodule_stub_hints"], chints):
+        keep = [h for h in lst if not any(h["submodule"] == w or h["submodule"].startswith(w + ".") for w in whole)]
+        dropped += [h["submodule"] for h in lst if h not in keep]
+        lst[:] = keep
+    # 条件が 1 件も無い条件付きヒントは出さない（どの機能を使わない前提なのか示せない）
+    chints[:] = [h for h in chints if h.get("conditions")]
+    if dropped:
+        result_dict["warnings"] = list(result_dict.get("warnings", [])) + [
+            "パッケージ全体のスタブと重なるため出さなかったサブモジュールのヒント: " + ", ".join(sorted(set(dropped)))]
     rank = {"high": 0, "low": 1, "": 2}
     conditional.sort(key=lambda d: (rank.get(d.get("confidence", ""), 2), -d["estimated_savings_mb"]))
     chints.sort(key=lambda d: (rank.get(d.get("confidence", ""), 2), -d["estimated_savings_mb"]))
@@ -337,7 +361,7 @@ def _build_import_chains(
 def _cond_text(conds: list[dict], total: int) -> tuple[str, int]:
     ents = [c.get("entry", "") for c in conds[:3]]
     uses = sum(int(c.get("project_uses_count", 0)) for c in conds)
-    more = f" ほか {total - 3} 件" if total > 3 else ""
+    more = f" ほか {total - 3} 件以上" if total > 3 else ""
     return "、".join(ents) + more, uses
 
 
@@ -391,4 +415,6 @@ def _summary(rd: dict, entry: str, python_path: str, required: list) -> dict:
             r for _, _, r in cond_recs if not r.startswith("[high]")],
         "next_steps": steps,
         "note": "[high] / [low] は条件付き候補（安全の証明ではありません）。stubbable / submodule_stub_hints だけが証明済みです。",
+        "size_note": "MB はインストール済みのファイルの大きさ（__pycache__ を除く）で、exe の削減量ではありません"
+                     "（PyInstaller が同梱する範囲・圧縮で変わります）。",
     }

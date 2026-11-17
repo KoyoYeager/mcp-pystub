@@ -216,11 +216,9 @@ def verify(
     work = Path(tempfile.mkdtemp(prefix="pystub_verify_"))
     items: dict[str, dict] = {}
     errors: list[dict] = []
-    real_gen = stub_generator._prepare
-    stub_generator._prepare = lambda *a, **k: (prepared, None)  # 同じグラフ・意味解析を使い回す
-    try:
+    if True:  # 同じグラフ・意味解析を使い回す（モジュールの関数を書き換えない: 同時呼び出しで干渉しない）
         for p in packages:
-            g = stub_generator.generate_stubs(str(entry), p, python_path, max_depth)
+            g = stub_generator.generate_stubs(str(entry), p, python_path, max_depth, _prepared=prepared)
             if "error" in g:
                 errors.append({"item": p, "reason": "generate error", "error": g["error"]})
                 continue
@@ -228,16 +226,22 @@ def verify(
         for s in submodules:
             sub, _, target = s.partition("=>")
             parent = sub.split(".")[0]
-            g = stub_generator.generate_submodule_stubs(str(entry), parent, sub, python_path, max_depth)
+            g = stub_generator.generate_submodule_stubs(str(entry), parent, sub, python_path, max_depth,
+                                                        _prepared=prepared)
             if "error" in g:
                 errors.append({"item": sub, "reason": "generate error", "error": g["error"]})
                 continue
+            if sub in items:
+                # 同じサブモジュールを対象違いで渡された: 外す対象を足す（上書きしない）
+                if target and target not in items[sub]["block"]:
+                    items[sub]["block"].append(target)
+                    items[sub]["targets"].append(target)
+                continue
             items[sub] = {"kind": "submodule", "files": g["files"], "prefixes": [sub],
-                          "block": [target] if target else []}
+                          "block": [target] if target else [], "targets": [target] if target else []}
         for n in nofollow:
             items[f"nofollow:{n}"] = {"kind": "nofollow", "files": {}, "prefixes": [], "block": [n]}
-    finally:
-        stub_generator._prepare = real_gen
+
 
     # スタブのファイルを項目ごとのフォルダに書き出す
     stub_map: dict[str, dict[str, str]] = {}
@@ -302,6 +306,15 @@ def verify(
     base, base_hung = run_all([], targets)
     ok_targets = [m for m in targets if base.get(m, {}).get("ok")]
     base_entry = base.get("<entry>")
+    entry_note = ""
+    if run_entry and base_entry is None:
+        # import の途中で固まったなどで、基準のエントリー実行が済んでいない: 単独でやり直す
+        recs, t_out = _run_child(py, cfg_for([], []), work, timeout)
+        r0, _l, _d = _results(recs)
+        base_entry = r0.get("<entry>")
+        if base_entry is None:
+            entry_note = ("基準（スタブなし）のエントリー実行が" + ("時間内に終わらない" if t_out else "できない")
+                          + "ため、エントリーの出力の一致は確かめていません")
 
     active = [k for k in items]
     rejected: list[dict] = list(errors)
@@ -320,17 +333,22 @@ def verify(
             provided |= set(stub_map[k])
         return [m for m in ok_targets if m in provided or not any(under(m, x) for x in hidden_pref)]
 
-    while active and rounds < max_rounds:
-        rounds += 1
-        tg = visible(active)
-        res, _h = run_all(active, tg)
-        last_res = res
-        fails = [r for m, r in res.items() if m != "<entry>" and not r.get("ok")]
-        missing = [m for m in tg if m not in res]
+    def failures(keys: list[str]) -> tuple[list[dict], dict, list[str]]:
+        tg = visible(keys)
+        res, _h = run_all(keys, tg)
+        fl = [r for m, r in res.items() if m != "<entry>" and not r.get("ok")]
+        miss = [m for m in tg if m not in res]
         if run_entry and base_entry is not None:
             er = res.get("<entry>")
             if er is None or er.get("rc") != base_entry.get("rc") or er.get("stdout") != base_entry.get("stdout"):
-                fails.append(dict(er or {"m": "<entry>", "err": "entry not run"}, entry_mismatch=True))
+                fl.append(dict(er or {"m": "<entry>", "err": "entry not run"}, m="<entry>", entry_mismatch=True))
+        return fl, res, miss
+
+    unresolved: list[dict] = []
+    while active and rounds < max_rounds:
+        rounds += 1
+        fails, res, missing = failures(active)
+        last_res = res
         if not fails and not missing:
             break
         blamed: dict[str, dict] = {}
@@ -338,18 +356,20 @@ def verify(
             for k in _blame(r, {k: items[k] for k in active}):
                 blamed.setdefault(k, r)
         if not blamed:
-            # 原因を特定できない: 1 つずつ外して確かめる
+            # 原因を特定できない（例外を伴わない出力の不一致など）: 1 つずつ外して、外すと失敗が消える項目を探す
+            sig = {(r.get("m"), bool(r.get("entry_mismatch"))) for r in fails}
             for k in list(active):
                 trial = [x for x in active if x != k]
-                res2, _ = run_all(trial, visible(trial))
-                f2 = [r for m, r in res2.items() if m != "<entry>" and not r.get("ok")]
-                if len(f2) < len(fails):
+                f2, _r2, _m2 = failures(trial)
+                if not ({(r.get("m"), bool(r.get("entry_mismatch"))) for r in f2} & sig):
                     blamed[k] = fails[0]
                     break
             if not blamed:
                 for k in active:
-                    rejected.append({"item": k, "reason": "原因を特定できない失敗があるため全て外しました",
-                                     "module": fails[0].get("m") if fails else "", "error": (fails[0].get("err") if fails else "")})
+                    unresolved.append({"item": k, "reason": "原因を特定できない失敗があるため、通ったとは扱いません（特定できず）",
+                                       "module": fails[0].get("m") if fails else "",
+                                       "error": (fails[0].get("err") if fails else "") or
+                                       ("エントリーの出力が元と違います" if fails and fails[0].get("entry_mismatch") else "")})
                 active = []
                 break
         for k, r in blamed.items():
@@ -357,10 +377,21 @@ def verify(
                              "module": r.get("m"), "error": r.get("err"),
                              "traceback_tail": (r.get("tb") or "")[-1200:]})
         active = [k for k in active if k not in blamed]
+    else:
+        if active and rounds >= max_rounds:
+            # 回数の上限に達した: 残りを通ったとは扱わない
+            fails, res, missing = failures(active)
+            last_res = res
+            if fails or missing:
+                for k in active:
+                    unresolved.append({"item": k, "reason": f"{max_rounds} 回で原因を特定しきれませんでした（特定できず）",
+                                       "module": fails[0].get("m") if fails else "", "error": fails[0].get("err") if fails else ""})
+                active = []
 
     passed = {
         "packages": [k for k in active if items[k]["kind"] == "package"],
-        "submodules": [k for k in active if items[k]["kind"] == "submodule"],
+        "submodules": [f"{k}=>{t}" if t else k for k in active if items[k]["kind"] == "submodule"
+                       for t in (items[k]["targets"] or [""])],
         "nofollow": [k.split(":", 1)[1] for k in active if items[k]["kind"] == "nofollow"],
     }
     out = {
@@ -372,13 +403,16 @@ def verify(
         },
         "passed": passed,
         "rejected": rejected,
+        "unresolved": unresolved,
         "imported_modules": len(ok_targets),
         "baseline_failures": len(targets) - len(ok_targets),
         "baseline_hung": base_hung,
         "run_entry": run_entry,
-        "entry_matched": (None if not run_entry else (
+        "entry_matched": (None if not run_entry or base_entry is None else (
             bool(active) and last_res.get("<entry>", {}).get("stdout") == (base_entry or {}).get("stdout")
         )),
+        "entry_note": entry_note if run_entry else
+        "run_entry=False のため、エントリーの実行（出力の一致）は確かめていません。import だけを確かめました。",
         "rounds": rounds,
         "elapsed_s": round(time.monotonic() - t0, 1),
         "python_note": py_note,
