@@ -57,6 +57,34 @@ class Semantics:
     # top-level パッケージ → そのパッケージに触れる（到達済みユニットの）イベント
     events_by_top: dict[str, list[tuple[Unit, Event]]] = field(default_factory=dict)
     unparsed_local: list[str] = field(default_factory=list)
+    graph: ImportGraph | None = None
+    hooks: dict[str, str] = field(default_factory=dict)  # フックのあるモジュール名 → フックのファイル
+
+
+def find_pyinstaller_hooks(resolver: ModuleResolver) -> dict[str, str]:
+    """解析対象の site-packages にある PyInstaller のフック: モジュール名 → フックのパス（仕様 5 節）。"""
+    hooks: dict[str, str] = {}
+    for sp in resolver.site_packages:
+        dirs = [
+            sp / "PyInstaller" / "hooks",
+            sp / "_pyinstaller_hooks_contrib" / "stdhooks",
+            sp / "_pyinstaller_hooks_contrib" / "hooks" / "stdhooks",
+        ]
+        try:
+            dirs.extend(d for d in sp.glob("*/__pyinstaller") if d.is_dir())
+            dirs.extend(d for d in sp.glob("*/_pyinstaller") if d.is_dir())
+        except OSError:
+            pass
+        for d in dirs:
+            if not d.is_dir():
+                continue
+            try:
+                for f in d.glob("hook-*.py"):
+                    mod = f.name[len("hook-"):-3]
+                    hooks.setdefault(mod, str(f))
+            except OSError:
+                continue
+    return hooks
 
 
 def get_semantics(graph: ImportGraph) -> Semantics:
@@ -70,22 +98,40 @@ def get_semantics(graph: ImportGraph) -> Semantics:
             resolver.add_local_root(Path(graph.entry_point).resolve().parent)
     program = Program(resolver)
     entry_module = getattr(graph, "entry_module", "") or ""
+    graph_modules: list[str] = []
     for name, node in graph.nodes.items():
         if node.file_path and node.classification in ("local", "third_party"):
             program.register(name, node.file_path)
+            graph_modules.append(name)
+            if node.classification == "local":
+                program.local_modules.add(name)
             if node.depth == 0 and not entry_module:
                 entry_module = name
-    reach = compute_reachability(program, entry_module) if entry_module else Reachability()
+    # ビルド時に PyInstaller のフックが import するモジュール（グラフに入っているもの）も起点
+    hooks = find_pyinstaller_hooks(resolver)
+    build_roots = sorted(
+        m for m in hooks
+        if m in graph.nodes and graph.nodes[m].classification == "third_party" and graph.nodes[m].file_path
+    )
+    reach = (
+        compute_reachability(program, entry_module, build_roots=build_roots, graph_modules=graph_modules)
+        if entry_module else Reachability()
+    )
 
     events_by_top: dict[str, list[tuple[Unit, Event]]] = defaultdict(list)
+    loaded_tops = {m.split(".")[0] for m in reach.loaded_modules}
     for key in reach.reached:
         unit = program.units[key]
         for ev in unit.events:
+            if ev.guard and ev.guard not in loaded_tops:
+                continue  # `if 'X' not in sys.modules: return` の後: X が他で読み込まれない限り実行されない
             tops: set[str] = set()
             if ev.ref is not None:
-                tops = {m.split(".")[0] for m, _ in ev.ref.trace}
+                tops = ev.ref.touched_tops()
             elif ev.kind == "import":
                 tops = {m.split(".")[0] for m in ev.modules}
+                if ev.from_base:
+                    tops.add(ev.from_base.split(".")[0])
             for top in tops:
                 events_by_top[top].append((unit, ev))
 
@@ -96,48 +142,51 @@ def get_semantics(graph: ImportGraph) -> Semantics:
             node = graph.nodes.get(name)
             if node is not None and node.classification == "local":
                 unparsed_local.append(info.path or name)
-    sem = Semantics(program, reach, entry_module, dict(events_by_top), unparsed_local)
+    sem = Semantics(program, reach, entry_module, dict(events_by_top), unparsed_local, graph,
+                    {m: hooks[m] for m in build_roots})
     graph._semantics = sem  # type: ignore[attr-defined]
     return sem
 
 
 # ---------------------------------------------------------------------------
-# 使用の判定
+# 使用の判定（許可リスト方式: 仕様 2・3 節）
 # ---------------------------------------------------------------------------
 
-_SAFE_CTX = frozenset({"safe", "alias", "compare"})
-_CALL_CTX = frozenset({"call", "decorator", "base", "raise"})
-_ESCAPE_CTX = frozenset({"arg", "store", "return"})
+# どの文脈でも元と同じ値・同じ同一性をスタブが提供する種類
+_ALWAYS_SAFE_KINDS = frozenset({
+    "const", "constattr", "classconst", "external", "external_module",
+})
+
+
+def _leaf_is_use(rr: Ref, ctx: str) -> bool:
+    kind = rr.kind
+    names = [c for _, ch in rr.trace for c in ch]
+    if kind in _ALWAYS_SAFE_KINDS or "__version__" in names:
+        return False
+    if ctx in ("bind", "annot", "read", "hasattr", "presence"):
+        return False  # A. 束縛（スタブが同じ名前・同じ種類で提供する）
+    if ctx in ("isinst", "except"):
+        return kind != "class"  # B. 判別: P の実体が生成されないので結果は元と同じ
+    if ctx == "is":
+        return kind not in ("class", "function", "method", "module")
+    return True  # C. 実行（未知の文脈も含めて既定は使用）
 
 
 def classify_event(ev: Event, prefix: str) -> str | None:
     """prefix 配下への参照イベントを分類する。
 
     Returns:
-        "use"（スタブでは動かない）/ "ref"（スタブで提供すれば動く）/ None（無関係）
+        "use"（スタブでは動かない = C）/ "ref"（スタブで提供すれば同じ = A・B）/ None（無関係）
     """
     ref = ev.ref
     if ref is None or not ref.touches(prefix):
         return None
-    kind = ref.kind
-    chain_names = [c for _, ch in ref.trace for c in ch]
-    is_version = "__version__" in chain_names
-    ctx = ev.ctx
-    if kind == "constattr":
-        return "ref"  # 定数リテラルのメソッド呼び出し等（スタブも同じ値）
-    if ctx in _CALL_CTX:
-        return "use"
-    if ctx in _SAFE_CTX:
-        return "ref"
-    if kind == "const" or is_version:
-        return "ref"
-    if ctx == "operand":
-        if kind in ("module", "class"):
-            return "ref"
-        return "use"
-    if ctx in _ESCAPE_CTX:
-        return "use"
-    return "use"
+    for rr in ref.all_refs():
+        if rr.alts or not rr.touches(prefix):
+            continue
+        if _leaf_is_use(rr, ev.ctx):
+            return "use"
+    return "ref"
 
 
 def _symbol_name(ref: Ref, prefix: str) -> str:
@@ -145,7 +194,7 @@ def _symbol_name(ref: Ref, prefix: str) -> str:
     if entry is None:
         return ref.module
     mod, chain = entry
-    return ".".join((mod,) + tuple(c if c not in ("()", "[]") else c for c in chain)).replace(".()", "()").replace(".[]", "[]")
+    return ".".join((mod,) + tuple(chain)).replace(".()", "()").replace(".[]", "[]")
 
 
 @dataclass
@@ -155,17 +204,21 @@ class PrefixUsage:
     imports: list[tuple[Unit, Event]] = field(default_factory=list)
 
 
-def prefix_usage(sem: Semantics, prefix: str) -> PrefixUsage:
-    """prefix（パッケージ / サブモジュール）の外の到達可能コードからの使用を集める。"""
+def prefix_usage(sem: Semantics, prefix: str, exclude: tuple[str, ...] = ()) -> PrefixUsage:
+    """prefix（パッケージ / サブモジュール）の外の到達可能コードからの使用を集める。
+
+    exclude: 同時にスタブ化する他の範囲（そこからの使用は数えない）
+    """
     top = prefix.split(".")[0]
     out = PrefixUsage()
+    skip = (prefix,) + tuple(exclude)
     for unit, ev in sem.events_by_top.get(top, []):
-        if under(unit.module, prefix):
+        if any(under(unit.module, x) for x in skip):
             continue
         if ev.kind == "import":
             if any(under(m, prefix) for m in ev.modules) or (
                 ev.from_base and any(under(f"{ev.from_base}.{n}", prefix) for n in ev.names if n != "*")
-            ):
+            ) or (ev.from_base and under(ev.from_base, prefix)):
                 out.imports.append((unit, ev))
             continue
         if ev.kind == "dynamic":
@@ -183,16 +236,17 @@ def prefix_usage(sem: Semantics, prefix: str) -> PrefixUsage:
     return out
 
 
-def import_closure(sem: Semantics, exclude_prefix: str = "") -> set[str]:
-    """エントリーから読み込まれるモジュール（exclude_prefix 配下を除いた場合）。"""
+def import_closure(sem: Semantics, exclude_prefix: str = "", excludes: tuple[str, ...] = ()) -> set[str]:
+    """エントリー（とビルド時の起点）から読み込まれるモジュール（exclude 配下を除いた場合）。"""
     reach = sem.reach
+    ex = tuple(x for x in (exclude_prefix,) + tuple(excludes) if x)
     seen: set[str] = set()
-    q: deque[str] = deque([sem.entry_module])
+    q: deque[str] = deque([sem.entry_module] + list(reach.build_roots))
     while q:
         m = q.popleft()
         if m in seen:
             continue
-        if exclude_prefix and under(m, exclude_prefix):
+        if any(under(m, x) for x in ex):
             continue
         seen.add(m)
         if "." in m:
@@ -201,6 +255,24 @@ def import_closure(sem: Semantics, exclude_prefix: str = "") -> set[str]:
             if t not in seen:
                 q.append(t)
     return {m for m in seen if m in reach.loaded_modules}
+
+
+def graph_closure(graph: ImportGraph, entry: str, excludes: tuple[str, ...] = ()) -> set[str]:
+    """静的な import グラフ（関数内・保護された import も含む = PyInstaller が同梱する範囲）での閉包。"""
+    adj: dict[str, list[str]] = {}
+    for e in graph.edges:
+        adj.setdefault(e.from_module, []).append(e.to_module)
+    seen: set[str] = set()
+    q: deque[str] = deque([entry])
+    while q:
+        m = q.popleft()
+        if m in seen or any(under(m, x) for x in excludes):
+            continue
+        seen.add(m)
+        if "." in m:
+            q.append(m.rsplit(".", 1)[0])
+        q.extend(adj.get(m, ()))
+    return seen
 
 
 # ---------------------------------------------------------------------------
@@ -450,15 +522,63 @@ def _analyze_single_package(
             **common,
         )
 
-    # nofollow: 外からの実行される import が全て try/except ImportError で保護され、
-    # 属性参照も無い（`P is None` 程度）
+    # エントリーポイント・プラグイン登録（仕様 4 節: 解析不能）: entry_points() で読み込まれて
+    # 未知のコードから呼ばれる
+    eps = sorted({m for caller, m in sem.reach.entry_point_calls
+                  if under(m, package_name) and not under(caller, package_name)})
+    if eps:
+        return PackageAnalysis(
+            verdict="required",
+            reason=f"到達可能なコードが entry_points() でプラグインを読み込み、{eps[0]} が対象です"
+            "（呼ばれ方を静的に追えないため安全側判定）。",
+            gateway_functions=gateways,
+            **common,
+        )
+
+    # 有無の検出（仕様 3 節）: 'X' in sys.modules / find_spec("X") の X が、P をスタブにすると
+    # 読み込まれなくなる（または P の一部）なら、検出結果が変わる
+    if sem.reach.presence_checked:
+        full = import_closure(sem)
+        without = None
+        for x in sorted(sem.reach.presence_checked):
+            if under(x, package_name):
+                changed = False  # スタブ化しても P 自体は（スタブとして）読み込まれる
+            else:
+                if without is None:
+                    without = import_closure(sem, exclude_prefix=package_name)
+                changed = x in full and x not in without
+            if changed:
+                return PackageAnalysis(
+                    verdict="required",
+                    reason=f"到達可能なコードがモジュール '{x}' の有無を調べており、{package_name} を"
+                    "スタブにすると結果が変わります（安全側判定）。",
+                    gateway_functions=gateways,
+                    **common,
+                )
+
+    # 解析不能（仕様 4 節）: プロジェクトのコードにある非定数の動的 import / exec / sys.modules[...]
+    local_unanalyzable = [u for u in sem.reach.unanalyzable if u[0] in sem.program.local_modules]
+    if local_unanalyzable:
+        m, what, line = local_unanalyzable[0]
+        return PackageAnalysis(
+            verdict="required",
+            reason=f"プロジェクトのコードに静的に解析できない処理があります（{m} 行 {line}: {what}、安全側判定）。",
+            gateway_functions=gateways,
+            **common,
+        )
+
+    # nofollow（仕様 3 節）: 実行される import が全て「単純な保護」（try 本体は import だけ、
+    # except は pass か None/False 代入だけ）で、到達可能なコードからの参照が一切無い
     executed_imports = usage.imports
-    attr_refs = [r for r in usage.refs if r[1].ref is not None and _has_attr_access(r[1].ref, package_name)]
-    if executed_imports and all(ev.protected for _, ev in executed_imports) and not attr_refs:
+    if (
+        executed_imports
+        and all(ev.protected and ev.protect_ok for _, ev in executed_imports)
+        and not usage.refs
+    ):
         return PackageAnalysis(
             verdict="nofollow",
-            reason="全ての import が try/except ImportError で保護され、到達可能なコードで"
-            "使用されていません。--nofollow-import-to で除外可能。",
+            reason="全ての import が try/except ImportError で単純に保護され、到達可能なコードからの"
+            "参照がありません。--nofollow-import-to で除外可能。",
             gateway_functions=gateways,
             **common,
         )
@@ -469,88 +589,94 @@ def _analyze_single_package(
         reason = "依存ライブラリ経由でのみ import され、プロジェクトは該当機能を使用していません。"
     if usage.refs:
         reason += f"（参照 {len(usage.refs)} 件は isinstance・型注釈・定数などでスタブが提供します）"
+    reason += "（静的判定。verify ツールで動作確認を推奨）"
     return PackageAnalysis(verdict="stubbable", reason=reason, gateway_functions=gateways, **common)
 
 
-def _has_attr_access(ref: Ref, prefix: str) -> bool:
-    entry = ref.entry_for(prefix)
-    if entry is None:
-        return False
-    _, chain = entry
-    return bool(chain)
-
-
 # ---------------------------------------------------------------------------
-# サブモジュールによる間接排除
+# サブモジュールによる間接排除（仕様 6 節）
 # ---------------------------------------------------------------------------
 
 
 def find_submodule_hints(
     c_ext_package: str, graph: ImportGraph, sem: Semantics
 ) -> list[SubmoduleStubHint]:
-    """C拡張パッケージを間接排除できるサブモジュールを検出する。
+    """C 拡張パッケージ T を import 閉包から外す、最小で互いに重ならないサブモジュールの組。
 
-    判定ロジック:
-    1. 到達コードで c_ext_package を import しているモジュール（別パッケージ所属）を特定
-    2. その祖先サブモジュール（短い順）を候補とし、
-       a. 候補の外の到達可能コードが候補の機能を使わない（呼び出し・値渡し等なし）
-       b. 候補を除いた import 閉包に c_ext_package が残らない
-       を満たす最短の候補をヒントとする
+    1. 静的な import グラフ（PyInstaller が同梱する範囲）で T を import しているモジュールを集める
+    2. 各モジュールについて、祖先のサブモジュール（短い順）から「外の到達可能なコードが C の
+       操作をしない」最初の候補を選ぶ（ライブラリの中核は選ばれない）。選べないモジュールが
+       1 つでもあればヒントは出さない
+    3. 選んだ組を全部同時に適用して、(a) 組の外からの使用が無い (b) T がグラフの閉包から消える、
+       を確かめる。満たさなければ出さない
     """
-    reach = sem.reach
+    T = c_ext_package
+    entry = sem.entry_module
+    full = graph_closure(graph, entry)
+    if not any(under(m, T) for m in full):
+        return []
     importers: set[str] = set()
-    for mod, targets in reach.module_imports.items():
-        if mod.split(".")[0] == c_ext_package:
-            continue
-        if any(t.split(".")[0] == c_ext_package for t in targets):
-            node = graph.nodes.get(mod)
-            info = sem.program.modules.get(mod)
-            if "." in mod and (node is None or node.classification == "third_party" or (
-                info is not None and node is None
-            )):
-                importers.add(mod)
+    for e in graph.edges:
+        if under(e.to_module, T) and not under(e.from_module, T) and e.from_module in full:
+            importers.add(e.from_module)
     if not importers:
         return []
-
-    candidates: set[str] = set()
-    for imp in importers:
+    chosen: list[str] = []
+    for imp in sorted(importers, key=lambda m: (m.count("."), m)):
+        if any(under(imp, c) for c in chosen):
+            continue
+        node = graph.nodes.get(imp)
+        if "." not in imp or node is None or node.classification != "third_party":
+            return []  # トップレベルのパッケージ自体やプロジェクトのコードは切れない
         parts = imp.split(".")
+        picked = ""
         for i in range(2, len(parts) + 1):
-            candidates.add(".".join(parts[:i]))
+            cand = ".".join(parts[:i])
+            if under(cand, T):
+                break
+            if not prefix_usage(sem, cand).uses:
+                picked = cand
+                break
+        if not picked:
+            return []
+        chosen = [c for c in chosen if not under(c, picked)] + [picked]
+    chosen = sorted(set(chosen))
+    # 全部同時に適用して確かめる
+    for c in chosen:
+        others = tuple(x for x in chosen if x != c)
+        if prefix_usage(sem, c, exclude=others).uses:
+            return []
+    # 静的な import グラフ（PyInstaller が同梱する範囲 ⊇ 実行時に読み込まれる範囲）から T が消えること。
+    # T のフック（ビルド時の起点）は、T がグラフから消えれば実行されない
+    after = graph_closure(graph, entry, excludes=tuple(chosen))
+    if any(under(m, T) for m in after):
+        return []
 
     hints: list[SubmoduleStubHint] = []
-    chosen: list[str] = []
-    for cand in sorted(candidates, key=lambda c: (c.count("."), c)):
-        if any(under(cand, c) for c in chosen):
-            continue
-        usage = prefix_usage(sem, cand)
-        if usage.uses:
-            continue
-        closure = import_closure(sem, exclude_prefix=cand)
-        if any(m.split(".")[0] == c_ext_package for m in closure):
-            continue
-        chosen.append(cand)
+    for cand in chosen:
+        others = tuple(x for x in chosen if x != cand)
+        usage = prefix_usage(sem, cand, exclude=others)
         names: set[str] = set()
         for unit, ev in usage.imports:
             if ev.from_base and under(ev.from_base, cand):
                 names.update(n for n in ev.names if n != "*")
         for _, ev, sym in usage.refs:
-            entry = ev.ref.entry_for(cand) if ev.ref else None
-            if entry and entry[1]:
-                names.add(entry[1][0])
+            entry_ = ev.ref.entry_for(cand) if ev.ref else None
+            if entry_ and entry_[1]:
+                names.add(entry_[1][0])
         info = sem.program.modules.get(cand)
         node = graph.nodes.get(cand)
+        group = ", ".join(chosen)
         hints.append(SubmoduleStubHint(
-            target_package=c_ext_package,
+            target_package=T,
             parent_package=cand.split(".")[0],
             submodule=cand,
             submodule_path=(info.path if info and info.path else (node.file_path if node else "")) or "",
             imported_symbols=sorted(names),
             reason=(
-                f"{cand} が {c_ext_package} を import していますが、"
-                f"到達可能なコードは {cand} の機能を使用していません。"
-                f"このサブモジュールをスタブ化することで "
-                f"{c_ext_package} を間接排除できます。"
+                f"{cand} が {T} への import 経路にあり、到達可能なコードは {cand} の機能を実行しません。"
+                + (f"この組（{group}）を全て同時にスタブ化すると" if len(chosen) > 1 else "これをスタブ化すると")
+                + f" {T} が import 閉包から外れます（静的判定。verify ツールで動作確認を推奨）。"
             ),
         ))
     return hints

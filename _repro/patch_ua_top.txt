@@ -1,0 +1,223 @@
+@dataclass
+class Semantics:
+    program: Program
+    reach: Reachability
+    entry_module: str
+    # top-level パッケージ → そのパッケージに触れる（到達済みユニットの）イベント
+    events_by_top: dict[str, list[tuple[Unit, Event]]] = field(default_factory=dict)
+    unparsed_local: list[str] = field(default_factory=list)
+    graph: ImportGraph | None = None
+    hooks: dict[str, str] = field(default_factory=dict)  # フックのあるモジュール名 → フックのファイル
+
+
+def find_pyinstaller_hooks(resolver: ModuleResolver) -> dict[str, str]:
+    """解析対象の site-packages にある PyInstaller のフック: モジュール名 → フックのパス（仕様 5 節）。"""
+    hooks: dict[str, str] = {}
+    for sp in resolver.site_packages:
+        dirs = [
+            sp / "PyInstaller" / "hooks",
+            sp / "_pyinstaller_hooks_contrib" / "stdhooks",
+            sp / "_pyinstaller_hooks_contrib" / "hooks" / "stdhooks",
+        ]
+        try:
+            dirs.extend(d for d in sp.glob("*/__pyinstaller") if d.is_dir())
+            dirs.extend(d for d in sp.glob("*/_pyinstaller") if d.is_dir())
+        except OSError:
+            pass
+        for d in dirs:
+            if not d.is_dir():
+                continue
+            try:
+                for f in d.glob("hook-*.py"):
+                    mod = f.name[len("hook-"):-3]
+                    hooks.setdefault(mod, str(f))
+            except OSError:
+                continue
+    return hooks
+
+
+def get_semantics(graph: ImportGraph) -> Semantics:
+    cached = getattr(graph, "_semantics", None)
+    if cached is not None:
+        return cached
+    resolver: ModuleResolver | None = getattr(graph, "resolver", None)
+    if resolver is None:
+        resolver = ModuleResolver(project_root=graph.project_root or ".")
+        if graph.entry_point:
+            resolver.add_local_root(Path(graph.entry_point).resolve().parent)
+    program = Program(resolver)
+    entry_module = getattr(graph, "entry_module", "") or ""
+    graph_modules: list[str] = []
+    for name, node in graph.nodes.items():
+        if node.file_path and node.classification in ("local", "third_party"):
+            program.register(name, node.file_path)
+            graph_modules.append(name)
+            if node.classification == "local":
+                program.local_modules.add(name)
+            if node.depth == 0 and not entry_module:
+                entry_module = name
+    # ビルド時に PyInstaller のフックが import するモジュール（グラフに入っているもの）も起点
+    hooks = find_pyinstaller_hooks(resolver)
+    build_roots = sorted(
+        m for m in hooks
+        if m in graph.nodes and graph.nodes[m].classification == "third_party" and graph.nodes[m].file_path
+    )
+    reach = (
+        compute_reachability(program, entry_module, build_roots=build_roots, graph_modules=graph_modules)
+        if entry_module else Reachability()
+    )
+
+    events_by_top: dict[str, list[tuple[Unit, Event]]] = defaultdict(list)
+    for key in reach.reached:
+        unit = program.units[key]
+        for ev in unit.events:
+            tops: set[str] = set()
+            if ev.ref is not None:
+                tops = ev.ref.touched_tops()
+            elif ev.kind == "import":
+                tops = {m.split(".")[0] for m in ev.modules}
+                if ev.from_base:
+                    tops.add(ev.from_base.split(".")[0])
+            for top in tops:
+                events_by_top[top].append((unit, ev))
+
+    unparsed_local = []
+    for name in reach.loaded_modules:
+        info = program.modules.get(name)
+        if info is not None and info.parse_error:
+            node = graph.nodes.get(name)
+            if node is not None and node.classification == "local":
+                unparsed_local.append(info.path or name)
+    sem = Semantics(program, reach, entry_module, dict(events_by_top), unparsed_local, graph,
+                    {m: hooks[m] for m in build_roots})
+    graph._semantics = sem  # type: ignore[attr-defined]
+    return sem
+
+
+# ---------------------------------------------------------------------------
+# 使用の判定（許可リスト方式: 仕様 2・3 節）
+# ---------------------------------------------------------------------------
+
+# どの文脈でも元と同じ値・同じ同一性をスタブが提供する種類
+_ALWAYS_SAFE_KINDS = frozenset({
+    "const", "constattr", "classconst", "external", "external_value", "external_module", "builtin_value",
+})
+
+
+def _leaf_is_use(rr: Ref, ctx: str) -> bool:
+    kind = rr.kind
+    names = [c for _, ch in rr.trace for c in ch]
+    if kind in _ALWAYS_SAFE_KINDS or "__version__" in names:
+        return False
+    if ctx in ("bind", "annot", "read", "hasattr", "presence"):
+        return False  # A. 束縛（スタブが同じ名前・同じ種類で提供する）
+    if ctx in ("isinst", "except"):
+        return kind != "class"  # B. 判別: P の実体が生成されないので結果は元と同じ
+    if ctx == "is":
+        return kind not in ("class", "function", "method", "module")
+    return True  # C. 実行（未知の文脈も含めて既定は使用）
+
+
+def classify_event(ev: Event, prefix: str) -> str | None:
+    """prefix 配下への参照イベントを分類する。
+
+    Returns:
+        "use"（スタブでは動かない = C）/ "ref"（スタブで提供すれば同じ = A・B）/ None（無関係）
+    """
+    ref = ev.ref
+    if ref is None or not ref.touches(prefix):
+        return None
+    for rr in ref.all_refs():
+        if rr.alts or not rr.touches(prefix):
+            continue
+        if _leaf_is_use(rr, ev.ctx):
+            return "use"
+    return "ref"
+
+
+def _symbol_name(ref: Ref, prefix: str) -> str:
+    entry = ref.entry_for(prefix)
+    if entry is None:
+        return ref.module
+    mod, chain = entry
+    return ".".join((mod,) + tuple(chain)).replace(".()", "()").replace(".[]", "[]")
+
+
+@dataclass
+class PrefixUsage:
+    uses: list[tuple[Unit, Event, str]] = field(default_factory=list)
+    refs: list[tuple[Unit, Event, str]] = field(default_factory=list)
+    imports: list[tuple[Unit, Event]] = field(default_factory=list)
+
+
+def prefix_usage(sem: Semantics, prefix: str, exclude: tuple[str, ...] = ()) -> PrefixUsage:
+    """prefix（パッケージ / サブモジュール）の外の到達可能コードからの使用を集める。
+
+    exclude: 同時にスタブ化する他の範囲（そこからの使用は数えない）
+    """
+    top = prefix.split(".")[0]
+    out = PrefixUsage()
+    skip = (prefix,) + tuple(exclude)
+    for unit, ev in sem.events_by_top.get(top, []):
+        if any(under(unit.module, x) for x in skip):
+            continue
+        if ev.kind == "import":
+            if any(under(m, prefix) for m in ev.modules) or (
+                ev.from_base and any(under(f"{ev.from_base}.{n}", prefix) for n in ev.names if n != "*")
+            ) or (ev.from_base and under(ev.from_base, prefix)):
+                out.imports.append((unit, ev))
+            continue
+        if ev.kind == "dynamic":
+            if ev.ref is not None and ev.ref.touches(prefix):
+                out.uses.append((unit, ev, _symbol_name(ev.ref, prefix) + ".<getattr>"))
+            continue
+        cls = classify_event(ev, prefix)
+        if cls is None or ev.ref is None:
+            continue
+        sym = _symbol_name(ev.ref, prefix)
+        if cls == "use":
+            out.uses.append((unit, ev, sym))
+        else:
+            out.refs.append((unit, ev, sym))
+    return out
+
+
+def import_closure(sem: Semantics, exclude_prefix: str = "", excludes: tuple[str, ...] = ()) -> set[str]:
+    """エントリー（とビルド時の起点）から読み込まれるモジュール（exclude 配下を除いた場合）。"""
+    reach = sem.reach
+    ex = tuple(x for x in (exclude_prefix,) + tuple(excludes) if x)
+    seen: set[str] = set()
+    q: deque[str] = deque([sem.entry_module] + list(reach.build_roots))
+    while q:
+        m = q.popleft()
+        if m in seen:
+            continue
+        if any(under(m, x) for x in ex):
+            continue
+        seen.add(m)
+        if "." in m:
+            q.append(m.rsplit(".", 1)[0])
+        for t in reach.module_imports.get(m, ()):
+            if t not in seen:
+                q.append(t)
+    return {m for m in seen if m in reach.loaded_modules}
+
+
+def graph_closure(graph: ImportGraph, entry: str, excludes: tuple[str, ...] = ()) -> set[str]:
+    """静的な import グラフ（関数内・保護された import も含む = PyInstaller が同梱する範囲）での閉包。"""
+    adj: dict[str, list[str]] = {}
+    for e in graph.edges:
+        adj.setdefault(e.from_module, []).append(e.to_module)
+    seen: set[str] = set()
+    q: deque[str] = deque([entry])
+    while q:
+        m = q.popleft()
+        if m in seen or any(under(m, x) for x in excludes):
+            continue
+        seen.add(m)
+        if "." in m:
+            q.append(m.rsplit(".", 1)[0])
+        q.extend(adj.get(m, ()))
+    return seen
+
+

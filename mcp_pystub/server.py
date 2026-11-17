@@ -145,6 +145,36 @@ def generate_submodule(
     )
 
 
+@mcp.tool()
+def verify(
+    entry_point: str,
+    python_path: str = "",
+    packages: list[str] | None = None,
+    submodules: list[str] | None = None,
+    nofollow: list[str] | None = None,
+    run_entry: bool = False,
+) -> dict:
+    """スタブに差し替えた状態を、対象環境の python で実際に import して確かめます（任意実行）。
+
+    静的解析（analyze）は候補を出すだけです。verify は生成したスタブを一時フォルダに置き、対象環境の
+    python を子プロセスで起動して、import グラフ上の全モジュールを import します。site-packages は
+    書き換えません。スタブ無しの基準と比べて新たに失敗したものの原因のスタブを外し、検証を通った組を返します。
+
+    Args:
+        entry_point: プロジェクトのエントリーポイント
+        python_path: 対象環境の site-packages（空なら現在の環境）
+        packages: 確かめるスタブ化パッケージ（省略時は analyze の stubbable）
+        submodules: 確かめるサブモジュール（"asammdf.gui=>PySide6" の形で対象の C 拡張も指定。省略時は analyze のヒント）
+        nofollow: 除外して確かめるパッケージ（省略時は analyze の nofollow）
+        run_entry: True ならエントリー本体も実行して出力を元と比べる
+
+    Returns:
+        passed: 検証を通った組 / rejected: 外した項目と失敗の原文
+    """
+    from mcp_pystub.verifier import verify as _verify
+    return _verify(entry_point, python_path, packages, submodules, nofollow, run_entry)
+
+
 def main() -> None:
     """MCP サーバーを起動する。"""
     mcp.run()

@@ -1,0 +1,411 @@
+_HEADER = """# mcp-pystub stub: {module}
+class _M(type):
+    def __getattr__(c, n):
+        k = c.__dict__.get("_pystub_known")
+        if k is None or n in k:
+            return _M(n, (), {{"_pystub_known": ()}})
+        raise AttributeError(n)
+    def __call__(c, *a, **k): raise RuntimeError(c.__name__ + " (stub)")
+    __getitem__ = lambda c, i: c
+def _g(n):
+    return _M(n, (), {{"_pystub_known": ()}})
+"""
+
+_NET_KNOWN = """_PYSTUB_KNOWN = {known}
+def __getattr__(n):
+    if n in _PYSTUB_KNOWN:
+        return _g(n)
+    raise AttributeError(n)
+"""
+
+_NET_ALL = """def __getattr__(n):
+    if n[:2] == "__":
+        raise AttributeError(n)
+    return _g(n)
+"""
+
+
+def _valid_dotted(name: str) -> bool:
+    if not name:
+        return False
+    return all(p.isidentifier() and not keyword.iskeyword(p) for p in name.split("."))
+
+
+def _q(path: Path | str) -> str:
+    """シェル用に引用（パスは / 区切りに統一。Git Bash / POSIX シェル向け）。"""
+    return shlex.quote(str(path).replace("\\", "/"))
+
+
+# ---------------------------------------------------------------------------
+# アクセス収集
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class ModuleAccess:
+    names: dict[str, set[tuple[str, ...]]] = field(default_factory=lambda: defaultdict(set))
+    star: bool = False
+
+
+def _cut_chain(chain: tuple[str, ...]) -> tuple[str, ...]:
+    for i, c in enumerate(chain):
+        if c in ("()", "[]"):
+            return chain[:i]  # 呼び出し結果・添字の先はスタブの対象外
+    return chain
+
+
+def collect_accesses(sem: Semantics, prefix: str, exclude: tuple[str, ...] = ()) -> dict[str, ModuleAccess]:
+    """prefix の外のコードが prefix 配下のどのモジュールの何を参照するか。
+
+    - 到達可能なコード単位のイベント（参照・import）
+    - 静的な import グラフ上の、外から prefix 配下への import（到達しない関数内も含む）
+    """
+    acc: dict[str, ModuleAccess] = defaultdict(ModuleAccess)
+    skip = (prefix,) + tuple(exclude)
+    for key in sem.reach.reached:
+        unit = sem.program.units.get(key)
+        if unit is None or any(under(unit.module, x) for x in skip):
+            continue
+        for ev in unit.events:
+            if ev.kind == "import":
+                for m in ev.modules:
+                    if under(m, prefix):
+                        acc[m]  # noqa: B018 — 存在だけ登録
+                if ev.from_base:
+                    for n in ev.names:
+                        if under(ev.from_base, prefix):
+                            if n == "*":
+                                acc[ev.from_base].star = True
+                            else:
+                                acc[ev.from_base].names[n].add(())
+                        elif n != "*" and under(f"{ev.from_base}.{n}", prefix):
+                            acc[f"{ev.from_base}.{n}"]  # noqa: B018
+                continue
+            ref = ev.ref
+            if ref is None:
+                continue
+            for rr in ref.all_refs():
+                entry = rr.entry_for(prefix)
+                if entry is None:
+                    continue
+                mod, chain = entry
+                chain = _cut_chain(chain)
+                a = acc[mod]
+                if chain:
+                    a.names[chain[0]].add(chain[1:])
+    graph = sem.graph
+    if graph is not None:
+        for e in graph.edges:
+            if any(under(e.from_module, x) for x in skip) or not under(e.to_module, prefix):
+                continue
+            acc[e.to_module]  # noqa: B018
+            info = e.import_info
+            if info.import_type in ("from_import", "star_import"):
+                base = e.to_module
+                for n in info.names_imported:
+                    if n == "*":
+                        acc[base].star = True
+                    elif n:
+                        acc[base].names[n].add(())
+    return dict(acc)
+
+
+# ---------------------------------------------------------------------------
+# スタブ本体の生成（元の AST から忠実に）
+# ---------------------------------------------------------------------------
+
+
+class _StubBuilder:
+    def __init__(self, sem: Semantics, prefix: str, version: str | None) -> None:
+        self.sem = sem
+        self.p: Program = sem.program
+        self.prefix = prefix
+        self.version = version
+        self.modules: dict[str, ModuleAccess] = {}
+
+    def need(self, module: str, name: str | None = None, sub: tuple[str, ...] = ()) -> None:
+        a = self.modules.setdefault(module, ModuleAccess())
+        if name is not None:
+            a.names[name].add(sub)
+
+    def build(self, accesses: dict[str, ModuleAccess], extra_modules: list[str]) -> dict[str, str]:
+        for m, a in accesses.items():
+            ma = self.modules.setdefault(m, ModuleAccess())
+            ma.star = ma.star or a.star
+            for n, subs in a.names.items():
+                ma.names[n].update(subs)
+        for m in extra_modules:
+            self.modules.setdefault(m, ModuleAccess())
+
+        def add_parents() -> None:
+            for m in list(self.modules):
+                parts = m.split(".")
+                for i in range(1, len(parts)):
+                    parent = ".".join(parts[:i])
+                    if under(parent, self.prefix):
+                        self.modules.setdefault(parent, ModuleAccess())
+
+        add_parents()
+        self.modules.setdefault(self.prefix, ModuleAccess())
+
+        def signature() -> tuple:
+            return tuple(sorted(
+                (m, tuple(sorted((n, tuple(sorted(v))) for n, v in a.names.items())), a.star)
+                for m, a in self.modules.items()
+            ))
+
+        code: dict[str, str] = {}
+        for _ in range(10):
+            before = signature()
+            for m in list(self.modules):
+                code[m] = self._module_code(m, self.modules[m])
+            add_parents()
+            if signature() == before:
+                break
+        return code
+
+    # --- モジュール ---
+
+    def _known_names(self, info: ModuleInfo | None) -> set[str] | None:
+        if info is None or info.opaque:
+            return None
+        if info.has_getattr:
+            return None  # 元が __getattr__ を持つ: どの名前があるか静的に分からない
+        names = set(info.bindings)
+        for star in info.star_sources:
+            si = self.p.get(star)
+            if si is None or si.opaque or si.has_getattr:
+                return None
+            names |= set(si.bindings)
+        names.add("__version__") if "__version__" in info.bindings else None
+        return names
+
+    def _module_code(self, module: str, access: ModuleAccess) -> str:
+        info = self.p.get(module)
+        names: dict[str, set[tuple[str, ...]]] = {k: set(v) for k, v in access.names.items()}
+        all_list: list[str] | None = None
+        if info is not None and not info.opaque:
+            if access.star:
+                all_list = info.all_names
+                public = all_list if all_list is not None else self._public_names(module)
+                for n in public:
+                    names.setdefault(n, set())
+            elif info.all_names is not None:
+                all_list = info.all_names
+        is_top = module == self.prefix.split(".")[0]
+        if is_top and self.version:
+            names.pop("__version__", None)
+        defs: list[str] = []
+        tail: list[str] = []
+        self._emitted: set[str] = set()
+        self._defs = defs
+        self._module = module
+        for name in sorted(names):
+            if not name.isidentifier() or keyword.iskeyword(name):
+                continue
+            if name.startswith("__") and name.endswith("__") and name not in ("__version__", "__all__"):
+                continue
+            self._emit_name(module, info, name, names[name], defs, tail)
+        if all_list is not None:
+            for n in all_list:
+                if n not in self._emitted and n.isidentifier() and not keyword.iskeyword(n) \
+                        and not (n.startswith("__") and n.endswith("__")):
+                    self._emit_name(module, info, n, set(), defs, tail)
+            defs.append(f"__all__ = {list(all_list)!r}\n")
+        if is_top and self.version:
+            defs.append(f"__version__ = {self.version!r}\n")
+        known = self._known_names(info)
+        net = _NET_ALL if known is None else _NET_KNOWN.format(known=repr(frozenset(sorted(known))))
+        header = _HEADER.format(module=module)
+        return "\n".join([header, net] + defs + tail)
+
+    def _public_names(self, module: str) -> list[str]:
+        info = self.p.get(module)
+        if info is None or info.opaque:
+            return []
+        names = [n for n in info.bindings if not n.startswith("_")]
+        for star in info.star_sources:
+            si = self.p.get(star)
+            if si is not None and not si.opaque:
+                names.extend(si.all_names if si.all_names is not None else [
+                    n for n in si.bindings if not n.startswith("_")
+                ])
+        return sorted(set(names))
+
+    def _emit_name(self, module: str, info: ModuleInfo | None, name: str, subs: set[tuple[str, ...]],
+                   defs: list[str], tail: list[str]) -> None:
+        if name in self._emitted:
+            return
+        self._emitted.add(name)
+        r = self.p.resolve(module, (name,))
+        if name == "__version__":
+            lit = self._const_source(r)
+            defs.append(f"__version__ = {lit if lit is not None else repr(self.version or '0')}\n")
+            return
+        leaves = [x for x in r.all_refs() if not x.alts]
+        if r.alts:
+            kinds = {x.kind for x in leaves}
+            if kinds == {"class"} and len({(x.module, x.target) for x in leaves}) == 1:
+                r = leaves[0]
+            elif kinds == {"function"}:
+                defs.append(f"def {name}(*a, **k): raise RuntimeError({(module + '.' + name)!r})\n")
+                return
+            else:
+                defs.append(f"{name} = _g({name!r})\n")
+                return
+        kind = r.kind
+        if kind in ("module", "external_module"):
+            target = r.module
+            if kind == "module" and under(target, self.prefix):
+                for s in subs:
+                    if s:
+                        self.need(target, s[0], s[1:])
+                    else:
+                        self.need(target)
+                tail.append(
+                    f"try:\n    {name} = __import__({target!r}, None, None, ['_'])\n"
+                    f"except ImportError:\n    {name} = _g({name!r})\n"
+                )
+            else:
+                tail.append(
+                    f"try:\n    {name} = __import__({target!r}, None, None, ['_'])\n"
+                    f"except ImportError:\n    {name} = _g({name!r})\n"
+                )
+            return
+        if kind == "external":
+            # stdlib / 組み込みの再エクスポートは同じものを import する（同一性を保つ: S14）
+            mod, chain = r.module, r.chain
+            if mod == "builtins" and len(chain) == 1:
+                defs.append(f"{name} = {chain[0]}\n")
+            else:
+                expr = ".".join(chain)
+                defs.append(
+                    f"try:\n    import importlib as _il\n    {name} = _il.import_module({mod!r})"
+                    + "".join(f".{c}" for c in chain) + "\n"
+                    f"except (ImportError, AttributeError):\n    {name} = _g({name!r})  # {mod}.{expr}\n"
+                )
+            return
+        if not under(r.module, self.prefix) and kind in ("class", "function", "const", "opaque", "classconst"):
+            # 別パッケージのオブジェクトの再エクスポート: 元と同じものを import する
+            if r.chain:
+                path = r.module
+                tail.append(
+                    f"try:\n    import importlib as _il\n    {name} = _il.import_module({path!r})"
+                    + "".join(f".{c}" for c in r.chain) + "\n"
+                    f"except (ImportError, AttributeError):\n    {name} = _g({name!r})\n"
+                )
+                return
+        if kind in ("class", "function", "const") and r.chain and len(r.chain) == 1 and r.module != module \
+                and under(r.module, self.prefix):
+            # 定義元のモジュールで定義し、ここではそれを import する（同一性を保つ: F04）
+            for s in subs or {()}:
+                self.need(r.module, r.chain[0], s)
+            tail.append(
+                f"try:\n    from {r.module} import {r.chain[0]} as {name}\n"
+                f"except ImportError:\n    {name} = _g({name!r})\n"
+            )
+            return
+        if kind == "class":
+            defs.append(self._class_code(name, r, subs))
+            return
+        if kind in ("function", "method"):
+            defs.append(f"def {name}(*a, **k): raise RuntimeError({(module + '.' + name)!r})\n")
+            return
+        if kind in ("const", "classconst"):
+            lit = self._const_source(r)
+            if lit is not None:
+                defs.append(f"{name} = {lit}\n")
+                return
+        defs.append(f"{name} = _g({name!r})\n")
+
+    # --- クラス ---
+
+    def _exc_bases(self, info: ModuleInfo, ci: ClassInfo, depth: int = 0) -> list[str]:
+        """元のクラスの基底を辿って、組み込み・stdlib の例外の祖先を式として返す（S1）。"""
+        out: list[str] = []
+        if depth > 30:
+            return out
+        for b in ci.bases:
+            rb = self.p.ref_of_expr(info, _unwrap_base(b), None)
+            if rb is None or rb.alts:
+                continue
+            if rb.kind == "external" and rb.chain:
+                try:
+                    obj = stdlib_object(rb.module, rb.chain)
+                except Exception:  # noqa: BLE001
+                    continue
+                if isinstance(obj, type) and issubclass(obj, BaseException):
+                    expr = rb.chain[0] if rb.module == "builtins" and len(rb.chain) == 1 else (
+                        f"__import__({rb.module!r}, None, None, ['_'])" + "".join(f".{c}" for c in rb.chain)
+                    )
+                    if expr not in out:
+                        out.append(expr)
+            elif rb.kind == "class":
+                binfo = self.p.get(rb.module)
+                bci = binfo.classes.get(rb.target) if binfo is not None else None
+                if binfo is not None and bci is not None:
+                    for x in self._exc_bases(binfo, bci, depth + 1):
+                        if x not in out:
+                            out.append(x)
+        return out
+
+    def _class_known(self, info: ModuleInfo, ci: ClassInfo, depth: int = 0) -> set[str]:
+        names = set(ci.attrs) | set(ci.methods)
+        if depth > 30:
+            return names
+        for b in ci.bases:
+            rb = self.p.ref_of_expr(info, _unwrap_base(b), None)
+            if rb is not None and rb.kind == "class" and not rb.alts:
+                binfo = self.p.get(rb.module)
+                bci = binfo.classes.get(rb.target) if binfo is not None else None
+                if binfo is not None and bci is not None:
+                    names |= self._class_known(binfo, bci, depth + 1)
+        return names
+
+    def _class_code(self, name: str, r: Ref, subs: set[tuple[str, ...]]) -> str:
+        info = self.p.get(r.module)
+        ci = info.classes.get(r.target) if info is not None else None
+        bases: list[str] = []
+        known: set[str] | None = set()
+        if info is not None and ci is not None:
+            bases = self._exc_bases(info, ci)
+            known = self._class_known(info, ci)
+            if not self.p.class_is_plain(r.module, r.target):
+                known = None  # Enum 等: 属性の有無を静的に決めない
+        body: list[str] = [f"    _pystub_known = {repr(frozenset(sorted(known))) if known is not None else 'None'}"]
+        for s in sorted(subs):
+            if not s:
+                continue
+            attr = s[0]
+            if not attr.isidentifier() or keyword.iskeyword(attr) or (attr.startswith("__") and attr.endswith("__")):
+                continue
+            ar = self.p.extend(r, (attr,))
+            if ar.kind == "classconst":
+                lit = self._const_source(ar)
+                if lit is not None:
+                    body.append(f"    {attr} = {lit}")
+                    continue
+            if ar.kind in ("method", "function"):
+                body.append(f"    @staticmethod\n    def {attr}(*a, **k): raise RuntimeError({(name + '.' + attr)!r})")
+        inner = "\n".join(dict.fromkeys(body))
+        base_s = ", ".join(bases + ["metaclass=_M"])
+        return f"class {name}({base_s}):\n{inner}\n"
+
+    def _const_source(self, r: Ref) -> str | None:
+        info = self.p.get(r.module)
+        if info is None or info.opaque or not r.chain:
+            return None
+        blist = info.bindings.get(r.chain[0], [])
+        if len(r.chain) == 1:
+            if len(blist) == 1 and blist[0].kind == "literal" and self.p.binding_is_const(info, r.chain[0], blist):
+                return literal_source(blist[0].node)
+            return None
+        if r.kind == "classconst" and r.target:
+            ci = info.classes.get(r.target)
+            if ci is not None:
+                found = self.p._class_attr_lookup(info, ci, r.chain[-1])
+                if found is not None and found[2] == "attr" and len(found[3]) == 1:
+                    return literal_source(found[3][0].node)
+        return None
+
+

@@ -56,7 +56,15 @@ def analyze(
     )
 
     # Phase C+D: 使用分析 + 判定
-    analyses = analyze_packages(graph)
+    try:
+        analyses = analyze_packages(graph)
+    except RecursionError:
+        # 解析が深すぎて終わらない: 全て required（安全側）
+        tops = sorted({n.top_level_package for n in graph.nodes.values()
+                       if n.classification == "third_party" and n.top_level_package})
+        analyses = [PackageAnalysis(package_name=t, verdict="required",
+                                    reason="解析が深すぎて完了しませんでした（安全側判定）。") for t in tops]
+        graph.warnings.append("解析が深すぎて完了しなかったため、全パッケージを required にしました")
 
     # サイズ推定を付与
     sp_dirs = [str(sp) for sp in resolver._site_packages]
@@ -87,8 +95,14 @@ def analyze(
     for pkg in required:
         for hint in pkg.submodule_stubs:
             all_hints = all_hints + [asdict(hint)]
-    if all_hints:
-        result_dict["submodule_stub_hints"] = all_hints
+    result_dict["submodule_stub_hints"] = all_hints
+    result_dict["verify_status"] = "未実施"
+    result_dict["next_steps"] = [
+        "この結果は静的解析による候補です（実行の保証ではありません）。",
+        "適用前に verify ツールで、スタブ（とサブモジュールのヒント・nofollow）に差し替えた状態の import を"
+        "対象環境の python で確かめてください（verify は site-packages を書き換えません）。",
+        "verify が通った組だけを generate / generate_submodule の手順で適用し、ビルド後に実行結果を元と比べてください。",
+    ]
 
     return result_dict
 

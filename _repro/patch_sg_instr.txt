@@ -1,0 +1,112 @@
+def _generate_build_instructions(
+    name: str,
+    moves: list[Path],
+    site_root: Path,
+    pip_name: str | list[tuple[str, str]],
+    version: str | None,
+    graph: ImportGraph | None = None,
+    stub_root_hint: str = "_stubs",
+    verify_imports: list[str] | None = None,
+    import_root: Path | None = None,
+) -> dict:
+    """スタブ適用・復元のためのビルド手順を生成する（仕様 7 節）。
+
+    - 解析で実際に見つけた絶対パスを引用符つきで埋め込む（site.getsitepackages() は使わない）
+    - pip uninstall はしない（dist-info を残す → 復元後もメタデータが元のまま）
+    - 元ファイルは site-packages の外のバックアップ領域へ移動（ビルドに混入しない）
+    - 繰り返し適用しても同じ結果（バックアップが既にあれば移動しない、スタブは置き直す）
+    """
+    site_root = site_root.resolve()
+    import_root = (import_root or site_root).resolve()
+    backup_root = (site_root.parent / "_pystub_bak").resolve()
+    rel_moves: list[Path] = []
+    for m in moves:
+        mp = m.resolve()
+        if not _is_within(mp, import_root) or mp == import_root or mp == site_root:
+            raise ValueError(f"site-packages の外は扱いません: {mp}")
+        rel_moves.append(mp.relative_to(import_root))
+    bak_of = {rel: backup_root / (import_root / rel).relative_to(site_root) for rel in rel_moves}
+
+    backup_cmds = ["# === 元ファイルをバックアップ領域へ移動（必ず最初に実行。既にあれば何もしない） ==="]
+    for rel in rel_moves:
+        src = import_root / rel
+        dst = bak_of[rel]
+        backup_cmds.append(
+            f"if [ ! -e {_q(dst)} ]; then mkdir -p {_q(dst.parent)} && mv {_q(src)} {_q(dst)}; fi  # .bak 相当"
+        )
+
+    stub_top = name.replace(".", "/")
+    main_rel = rel_moves[0] if rel_moves else Path(stub_top)
+    is_file = str(main_rel).endswith(".py") or (import_root / main_rel).suffix == ".py"
+    target = import_root / (main_rel if is_file else Path(stub_top))
+    src_stub = Path(stub_root_hint) / (main_rel if is_file else Path(stub_top))
+    guard = " && ".join(f"[ -e {_q(bak_of[r])} ]" for r in rel_moves) or "true"
+    install_cmds = [
+        "# スタブを配置（生成された files を _stubs/ に書き出してから。バックアップが無ければ中止）:",
+        f"if {guard}; then rm -rf {_q(target)} && cp -r {_q(src_stub)} {_q(target)}; "
+        f"else echo 'backup missing: run backup_commands first' >&2; exit 1; fi",
+    ]
+
+    uninstall_cmds = ["# === 方法1: バックアップから復元（推奨・高速・確実） ==="]
+    uninstall_cmds.append(f"if {guard}; then rm -rf {_q(target)}; fi")
+    for rel in rel_moves:
+        uninstall_cmds.append(
+            f"if [ -e {_q(bak_of[rel])} ]; then rm -rf {_q(import_root / rel)} && mv {_q(bak_of[rel])} {_q(import_root / rel)}; fi"
+        )
+    uninstall_cmds.append("")
+    uninstall_cmds.append("# === 方法2: pip で再インストール（バックアップ消失時のフォールバック。対象環境の python で実行） ===")
+    if isinstance(pip_name, list):
+        specs = [f"{n}=={v}" for n, v in pip_name] or [name.split(".")[0]]
+    else:
+        specs = [f"{pip_name}=={version}" if version else pip_name]
+    uninstall_cmds.append("python -m pip install --force-reinstall --no-deps " + " ".join(_q(s) for s in specs))
+
+    imports = verify_imports or [name]
+    verify_cmds = [f'python -c "import {m}; print(\'{m} OK\')"' for m in imports]
+    if isinstance(pip_name, list):
+        for n, v in pip_name:
+            verify_cmds.append(
+                f'python -c "import importlib.metadata as m; v = m.version(\'{n}\'); '
+                f'assert v == \'{v}\', v; print(\'version OK\', v)"'
+            )
+    elif version and "." not in name:
+        verify_cmds.append(
+            f'python -c "import importlib.metadata as m; v = m.version(\'{pip_name}\'); '
+            f'assert v == \'{version}\', v; print(\'version OK\', v)"'
+        )
+
+    # PyInstaller のフック（仕様 5 節）: スタブにした範囲のフックは無効化する（名前が完全に一致するものだけ）
+    hook_patterns: list[str] = []
+    for d in (site_root / "PyInstaller" / "hooks", site_root / "_pyinstaller_hooks_contrib"):
+        if not d.is_dir():
+            continue
+        for h in d.rglob("hook-*.py"):
+            mod = h.name[len("hook-"):-3]
+            if under(mod, name):
+                hook_patterns.append(h.name if d.name == "hooks" and d.parent.name == "PyInstaller"
+                                     else str(h.relative_to(site_root)).replace("\\", "/"))
+    hook_cmds = (
+        [f"# リネームして無効化: {h} → {h}.disabled" for h in sorted(set(hook_patterns))]
+        if hook_patterns else [f"# {name} 用の PyInstaller フックは見つかりませんでした"]
+    )
+
+    notes = [
+        "必ず backup_commands を最初に実行すること（元ファイルを site-packages の外へ移動）",
+        "pip uninstall は不要（dist-info を残すので復元後もメタデータは元のまま）",
+        "ビルド後は uninstall_commands → verify_commands の順で復元・検証",
+        "コマンドは POSIX シェル（Git Bash 等）向け。パスは解析で見つけた実際の場所",
+        "PyInstaller フックがスタブと衝突する場合は hook_disable でフック無効化",
+        "適用前に verify ツールで、スタブに差し替えた状態の import を確かめることを推奨",
+    ]
+    return {
+        "site_packages": str(site_root),
+        "backup_dir": str(backup_root),
+        "backup_commands": backup_cmds,
+        "install_commands": install_cmds,
+        "uninstall_commands": uninstall_cmds,
+        "verify_commands": verify_cmds,
+        "hook_disable": hook_cmds,
+        "notes": notes,
+    }
+
+

@@ -495,13 +495,48 @@ class TestInstructions:
         assert str(s.sp.resolve()).replace("\\", "/") in all_cmds
         assert bi["site_packages"] == str(s.sp.resolve())
 
+    @staticmethod
+    def _tree(root: Path) -> dict[str, bytes]:
+        return {
+            str(f.relative_to(root)): f.read_bytes()
+            for f in sorted(root.rglob("*")) if f.is_file() and "__pycache__" not in f.parts
+        }
+
+    def _apply_restore_twice(self, s: "Scenario", g: dict) -> None:
+        """手順を実際に bash で実行: 適用 → 実行 → 復元 を 2 回。復元後のファイルは元と同一（仕様 7 節）。"""
+        bash = shutil.which("bash")
+        if bash is None:
+            pytest.skip("bash がありません")
+        bi = g["build_instructions"]
+        stage = s.root / "stage"
+        for rel, code in g["files"].items():
+            f = stage / "_stubs" / rel
+            f.parent.mkdir(parents=True, exist_ok=True)
+            f.write_text(code, encoding="utf-8")
+        before = self._tree(s.sp)
+        rc0, out0 = s.run()
+        for _ in range(2):
+            for key in ("backup_commands", "install_commands", "backup_commands", "install_commands"):
+                r = subprocess.run([bash, "-c", "\n".join(bi[key])], cwd=stage, capture_output=True, text=True)
+                assert r.returncode == 0, r.stderr
+            rc, out = s.run()
+            assert (rc, out) == (rc0, out0)
+            lines = []
+            for line in bi["uninstall_commands"]:
+                if "方法2" in line:
+                    break
+                lines.append(line)
+            r = subprocess.run([bash, "-c", "\n".join(lines)], cwd=stage, capture_output=True, text=True)
+            assert r.returncode == 0, r.stderr
+            assert self._tree(s.sp) == before
+
     def test_m8_single_file_module_instructions(self, tmp_path):
-        s = Scenario(tmp_path, HY, {"main.py": "import heavyy\n"})
+        s = Scenario(tmp_path, HY, {"main.py": "import heavyy\nprint('ok')\n"})
         g = generate_stubs(s.entry, "heavyy", python_path=str(s.sp))
         assert list(g["files"]) == ["heavyy.py"]
         cmds = "\n".join(g["build_instructions"]["backup_commands"] + g["build_instructions"]["install_commands"])
-        assert "heavyy.py" in cmds
-        assert "cp -r" not in "\n".join(g["build_instructions"]["install_commands"])
+        assert "heavyy.py" in cmds and "/heavyy " not in cmds
+        self._apply_restore_twice(s, g)
 
     def test_l1_no_pip_uninstall_and_backup_outside_site_packages(self, tmp_path):
         s = Scenario(tmp_path, HX, {"main.py": "import heavyx\n"})
@@ -512,12 +547,9 @@ class TestInstructions:
     def test_l2_paths_with_spaces_are_quoted(self, tmp_path):
         base = tmp_path / "dir with space 日本語"
         base.mkdir()
-        s = Scenario(base, HX, {"main.py": "import heavyx\n"})
-        bi = generate_stubs(s.entry, "heavyx", python_path=str(s.sp))["build_instructions"]
-        mv = [c for c in bi["backup_commands"] if c.startswith("mv ")][0]
-        args = shlex.split(mv.split("  #")[0])
-        assert args[0] == "mv" and len(args) == 3
-        assert args[1].endswith("/heavyx")
+        s = Scenario(base, HX, {"main.py": "import heavyx\nprint('ok', heavyx.MAX_SIZE)\n"})
+        g = generate_stubs(s.entry, "heavyx", python_path=str(s.sp))
+        self._apply_restore_twice(s, g)
 
     def test_l4_single_file_parent_message(self, tmp_path):
         s = Scenario(tmp_path, HY, {"main.py": "import heavyy\n"})

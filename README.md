@@ -41,6 +41,10 @@ submodule hints:    asammdf.gui → PySide6 (523 MB) 排除可能 — 50 hints �
 | `check` | 特定パッケージの使用状況を詳細分析 / Deep analysis of a specific package's usage |
 | `generate` | パッケージスタブの最小コードを生成 + ビルド手順出力 / Generate minimal stub code + build instructions |
 | `generate_submodule` | **C拡張パッケージを間接排除するサブモジュールスタブを生成** / Generate submodule stubs to indirectly eliminate C-extension packages |
+| `verify` | 生成スタブに差し替えた状態を、対象環境の python で実際に import して確かめ、通った組を返す（site-packages は書き換えない） / Dynamically verify proposals by importing the graph with stubs in the target interpreter |
+
+> `analyze` の結果は静的解析による**候補**です。判定の仕様は [docs/STUB_SAFETY_SPEC.md](docs/STUB_SAFETY_SPEC.md)。
+> 適用前に `verify` で確かめ、ビルド後に実行結果を元と比べてください。
 
 ### 判定結果 / Verdicts
 

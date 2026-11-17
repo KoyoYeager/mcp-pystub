@@ -1,0 +1,137 @@
+    if sem.unparsed_local:
+        return PackageAnalysis(
+            verdict="required",
+            reason=(
+                "構文解析できないローカルファイルがあり使用状況を確定できません（安全側判定）: "
+                + ", ".join(sem.unparsed_local[:3])
+            ),
+            gateway_functions=gateways,
+            **common,
+        )
+
+    # 解析不能（仕様 4 節）: プロジェクトのコードにある非定数の動的 import / exec / sys.modules[...]
+    local_unanalyzable = [u for u in sem.reach.unanalyzable if u[0] in sem.program.local_modules]
+    if local_unanalyzable:
+        m, what, line = local_unanalyzable[0]
+        return PackageAnalysis(
+            verdict="required",
+            reason=f"プロジェクトのコードに静的に解析できない処理があります（{m} 行 {line}: {what}、安全側判定）。",
+            gateway_functions=gateways,
+            **common,
+        )
+
+    # nofollow（仕様 3 節）: 実行される import が全て「単純な保護」（try 本体は import だけ、
+    # except は pass か None/False 代入だけ）で、到達可能なコードからの参照が一切無い
+    executed_imports = usage.imports
+    if (
+        executed_imports
+        and all(ev.protected and ev.protect_ok for _, ev in executed_imports)
+        and not usage.refs
+    ):
+        return PackageAnalysis(
+            verdict="nofollow",
+            reason="全ての import が try/except ImportError で単純に保護され、到達可能なコードからの"
+            "参照がありません。--nofollow-import-to で除外可能。",
+            gateway_functions=gateways,
+            **common,
+        )
+
+    if is_directly_imported:
+        reason = "プロジェクトコードが import していますが、実際のコードパスでは使用されていません。"
+    else:
+        reason = "依存ライブラリ経由でのみ import され、プロジェクトは該当機能を使用していません。"
+    if usage.refs:
+        reason += f"（参照 {len(usage.refs)} 件は isinstance・型注釈・定数などでスタブが提供します）"
+    reason += "（静的判定。verify ツールで動作確認を推奨）"
+    return PackageAnalysis(verdict="stubbable", reason=reason, gateway_functions=gateways, **common)
+
+
+# ---------------------------------------------------------------------------
+# サブモジュールによる間接排除（仕様 6 節）
+# ---------------------------------------------------------------------------
+
+
+def find_submodule_hints(
+    c_ext_package: str, graph: ImportGraph, sem: Semantics
+) -> list[SubmoduleStubHint]:
+    """C 拡張パッケージ T を import 閉包から外す、最小で互いに重ならないサブモジュールの組。
+
+    1. 静的な import グラフ（PyInstaller が同梱する範囲）で T を import しているモジュールを集める
+    2. 各モジュールについて、祖先のサブモジュール（短い順）から「外の到達可能なコードが C の
+       操作をしない」最初の候補を選ぶ（ライブラリの中核は選ばれない）。選べないモジュールが
+       1 つでもあればヒントは出さない
+    3. 選んだ組を全部同時に適用して、(a) 組の外からの使用が無い (b) T がグラフの閉包から消える、
+       を確かめる。満たさなければ出さない
+    """
+    T = c_ext_package
+    entry = sem.entry_module
+    full = graph_closure(graph, entry)
+    if not any(under(m, T) for m in full):
+        return []
+    importers: set[str] = set()
+    for e in graph.edges:
+        if under(e.to_module, T) and not under(e.from_module, T) and e.from_module in full:
+            importers.add(e.from_module)
+    if not importers:
+        return []
+    chosen: list[str] = []
+    for imp in sorted(importers, key=lambda m: (m.count("."), m)):
+        if any(under(imp, c) for c in chosen):
+            continue
+        node = graph.nodes.get(imp)
+        if "." not in imp or node is None or node.classification != "third_party":
+            return []  # トップレベルのパッケージ自体やプロジェクトのコードは切れない
+        parts = imp.split(".")
+        picked = ""
+        for i in range(2, len(parts) + 1):
+            cand = ".".join(parts[:i])
+            if under(cand, T):
+                break
+            if not prefix_usage(sem, cand).uses:
+                picked = cand
+                break
+        if not picked:
+            return []
+        chosen = [c for c in chosen if not under(c, picked)] + [picked]
+    chosen = sorted(set(chosen))
+    # 全部同時に適用して確かめる
+    for c in chosen:
+        others = tuple(x for x in chosen if x != c)
+        if prefix_usage(sem, c, exclude=others).uses:
+            return []
+    after = graph_closure(graph, entry, excludes=tuple(chosen))
+    if any(under(m, T) for m in after):
+        return []
+    if any(under(m, T) for m in import_closure(sem, excludes=tuple(chosen))):
+        return []
+
+    hints: list[SubmoduleStubHint] = []
+    for cand in chosen:
+        others = tuple(x for x in chosen if x != cand)
+        usage = prefix_usage(sem, cand, exclude=others)
+        names: set[str] = set()
+        for unit, ev in usage.imports:
+            if ev.from_base and under(ev.from_base, cand):
+                names.update(n for n in ev.names if n != "*")
+        for _, ev, sym in usage.refs:
+            entry_ = ev.ref.entry_for(cand) if ev.ref else None
+            if entry_ and entry_[1]:
+                names.add(entry_[1][0])
+        info = sem.program.modules.get(cand)
+        node = graph.nodes.get(cand)
+        group = ", ".join(chosen)
+        hints.append(SubmoduleStubHint(
+            target_package=T,
+            parent_package=cand.split(".")[0],
+            submodule=cand,
+            submodule_path=(info.path if info and info.path else (node.file_path if node else "")) or "",
+            imported_symbols=sorted(names),
+            reason=(
+                f"{cand} が {T} への import 経路にあり、到達可能なコードは {cand} の機能を実行しません。"
+                + (f"この組（{group}）を全て同時にスタブ化すると" if len(chosen) > 1 else "これをスタブ化すると")
+                + f" {T} が import 閉包から外れます（静的判定。verify ツールで動作確認を推奨）。"
+            ),
+        ))
+    return hints
+
+

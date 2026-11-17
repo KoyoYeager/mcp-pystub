@@ -96,11 +96,15 @@ def handlers_catch_import_error(handlers: list[ast.ExceptHandler]) -> bool:
     return False
 
 
+_STMT_FIELDS = ("body", "orelse", "finalbody", "handlers", "cases")
+
+
 class _ImportVisitor(ast.NodeVisitor):
     """AST を走査して import 文を収集する NodeVisitor。"""
 
-    def __init__(self, source_file: str) -> None:
+    def __init__(self, source_file: str, exprs: bool = True) -> None:
         self.source_file = source_file
+        self._exprs = exprs  # 式の中（importlib.import_module 等）も辿るか
         self.imports: list[ImportInfo] = []
         self.warnings: list[str] = []
 
@@ -108,6 +112,18 @@ class _ImportVisitor(ast.NodeVisitor):
         self._context_stack: list[str] = ["module"]
         self._protected_depth: int = 0  # try/except ImportError のネスト数
         self._type_checking_depth: int = 0  # if TYPE_CHECKING: のネスト数
+
+    def generic_visit(self, node: ast.AST) -> None:
+        if self._exprs:
+            super().generic_visit(node)
+            return
+        # 文の並びだけを辿る（import 文は式の中に現れない）
+        for f in _STMT_FIELDS:
+            v = getattr(node, f, None)
+            if isinstance(v, list):
+                for item in v:
+                    if isinstance(item, ast.AST):
+                        self.visit(item)
 
     @property
     def _context(self) -> str:
@@ -298,7 +314,12 @@ def extract_imports(file_path: str) -> tuple[list[ImportInfo], list[str]]:
     if tree is None:
         return [], [error or f"構文エラー: {file_path}"]
 
-    visitor = _ImportVisitor(source_file=str(path.resolve()))
+    try:
+        data = path.read_bytes()
+        exprs = b"import_module" in data or b"__import__" in data
+    except OSError:
+        exprs = True
+    visitor = _ImportVisitor(source_file=str(path.resolve()), exprs=exprs)
     try:
         visitor.visit(tree)
     except RecursionError:
