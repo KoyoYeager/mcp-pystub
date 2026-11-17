@@ -937,6 +937,12 @@ def _conditional_note(graph, sem: Semantics, prefix: str, is_package: bool) -> t
         a = analyze_packages(graph, {prefix})
         if a and a[0].verdict == "conditional":
             info = {"conditions": a[0].conditions, "total": a[0].conditions_total}
+        elif a and a[0].verdict == "required":
+            # 第 7 回 第 2 段: 静的解析では使用が見つかったパッケージ（記録からの候補など）。黙って動かず、使われたら止まる
+            # スタブにする（verify・実行の記録で確かめた入力の外では、使った時点で原因を出して終了コード 70 で止まる）
+            why = " ".join((a[0].reason or "").split())[:160]
+            return (f"{prefix} は静的解析で使用が見つかったパッケージ（required）です。実行の記録で実行されなかった前提で"
+                    f"外されています（静的解析の理由: {why}）"), {"conditions": [], "total": 0, "required": True}
     else:
         uses = prefix_usage(sem, prefix).uses
         if uses and not any(is_certain_use(sem, u, ev) for u, ev, _ in uses):

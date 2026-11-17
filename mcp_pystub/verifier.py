@@ -60,16 +60,10 @@ def emit(rec):
     out.write(json.dumps(rec, ensure_ascii=False) + "\n")
     out.flush()
 
-for m in cfg["targets"]:
-    emit({"start": m})
-    try:
-        importlib.import_module(m)
-        emit({"m": m, "ok": True})
-    except BaseException as e:  # noqa
-        emit({"m": m, "ok": False, "err": f"{type(e).__name__}: {e}"[:800], "tb": traceback.format_exc()[-3000:]})
-if cfg["run_entry"]:
+def run_entry():
     emit({"start": "<entry>"})
     # 普段の実行（python <エントリー> <引数>、エントリーのあるフォルダで）と同じ条件にする
+    saved_argv, saved_cwd = sys.argv, os.getcwd()
     sys.argv = [cfg["entry"]] + list(cfg.get("entry_args") or [])
     try:
         os.chdir(cfg.get("cwd") or os.path.dirname(cfg["entry"]))
@@ -89,7 +83,40 @@ if cfg["run_entry"]:
         err = f"{type(e).__name__}: {e}"[:800] + "\n" + traceback.format_exc()[-3000:]
     finally:
         sys.stdout = old
+        sys.argv = saved_argv
+        try:
+            os.chdir(saved_cwd)
+        except OSError:
+            pass
     emit({"m": "<entry>", "ok": rc == 0, "rc": rc, "stdout": buf.getvalue()[-20000:], "err": err})
+
+if cfg.get("entry_first") and cfg["run_entry"]:
+    # 実行の記録を取る時は、どの子プロセスもエントリーを先に動かす（普段の実行と同じく、グラフ上のモジュールを
+    # 先に import しない）。記録は基準（スタブなし）の実行の時だけ、エントリーの実行の間だけ取る
+    if cfg.get("trace_out"):
+        _spec = importlib.util.spec_from_file_location("_pystub_trace", cfg["trace_mod"])
+        _trm = importlib.util.module_from_spec(_spec)
+        _spec.loader.exec_module(_trm)
+        _rec = _trm.start(cfg["entry"])
+        try:
+            run_entry()
+        finally:
+            _data = _trm.stop(_rec)
+            with open(cfg["trace_out"], "w", encoding="utf-8") as _f:
+                json.dump(_data, _f, ensure_ascii=False)
+    else:
+        run_entry()
+    cfg["run_entry"] = False
+
+for m in cfg["targets"]:
+    emit({"start": m})
+    try:
+        importlib.import_module(m)
+        emit({"m": m, "ok": True})
+    except BaseException as e:  # noqa
+        emit({"m": m, "ok": False, "err": f"{type(e).__name__}: {e}"[:800], "tb": traceback.format_exc()[-3000:]})
+if cfg["run_entry"]:
+    run_entry()
 emit({"done": True})
 '''
 
@@ -147,7 +174,8 @@ def _run_child(py: str, cfg: dict, workdir: Path, timeout: float) -> tuple[list[
     return recs, timed_out
 
 
-_LAST_CHILD: dict = {}  # 直前の子プロセスの終了コードと標準エラー（エントリーが最後まで走らなかった理由に使う）
+_LAST_CHILD: dict = {}
+_BASE_EXTRA: dict = {}  # 基準の実行にだけ渡す設定（実行の記録）  # 直前の子プロセスの終了コードと標準エラー（エントリーが最後まで走らなかった理由に使う）
 
 
 def _results(recs: list[dict]) -> tuple[dict[str, dict], str | None, bool]:
@@ -178,6 +206,15 @@ def _blame(rec: dict, items: dict[str, dict]) -> list[str]:
             if f"'{p}'" in text or f"'{p}." in text or f"{p} (stub)" in text:
                 hit.append(key)
                 break
+    if not hit and "PystubConditionalStubError" in text:
+        # 止まるスタブの説明「mcp-pystub のスタブです。<名前> は…」から項目を特定する
+        for key, it in items.items():
+            for p in it["prefixes"]:
+                if f"のスタブです。{p} は" in text or f"のスタブです。{p} の" in text:
+                    hit.append(key)
+                    break
+        if hit:
+            return hit
     if not hit and "(stub)" in text:
         # RuntimeError: <名前> (stub) — 名前からは項目が分からない
         return []
@@ -196,6 +233,8 @@ def verify(
     max_rounds: int = 8,
     entry_args: list[str] | None = None,
     cwd: str = "",
+    record: bool = False,
+    trace_files: list[str] | None = None,
 ) -> dict:
     """スタブ（とサブモジュールのヒント・nofollow）に差し替えた状態で、実際に import して確かめる。
 
@@ -294,7 +333,8 @@ def verify(
             stubs.update(stub_map[k])
             prefixes += items[k]["prefixes"]
             block += items[k]["block"]
-        return {"stubs": stubs, "prefixes": prefixes, "block": block, "targets": tgts, "sys_path": sys_path,
+        return {**_BASE_EXTRA, "entry_first": bool(record and run_entry), "stubs": stubs, "prefixes": prefixes,
+                "block": block, "targets": tgts, "sys_path": sys_path,
                 "entry": str(entry), "run_entry": run_entry, "entry_args": list(entry_args or []),
                 "cwd": str(Path(cwd).resolve()) if cwd else str(Path(entry).parent)}
 
@@ -319,7 +359,14 @@ def verify(
                 break
         return res, hung
 
+    trace_path = work / "base_trace.json"
+    base_cfg_extra = {}
+    if record and run_entry:
+        base_cfg_extra = {"trace_out": str(trace_path), "trace_mod": str(Path(__file__).with_name("trace.py"))}
+    _BASE_EXTRA.clear()
+    _BASE_EXTRA.update(base_cfg_extra)
     base, base_hung = run_all([], targets)
+    _BASE_EXTRA.clear()
     base_child = dict(_LAST_CHILD)  # 基準の子プロセス全体の終了コード・標準エラー（エントリーの後の atexit も含む）
     ok_targets = [m for m in targets if base.get(m, {}).get("ok")]
     base_entry = base.get("<entry>")
@@ -373,6 +420,12 @@ def verify(
         res, _h = run_all(keys, tg)
         fl = [r for m, r in res.items() if m != "<entry>" and not r.get("ok")]
         miss = [m for m in tg if m not in res]
+        if miss and not fl:
+            # 子プロセスが import の途中で終わった（止まるスタブの os._exit(70) など）: 最初の未完了のモジュールを失敗として扱う
+            why = (_LAST_CHILD.get("stderr") or "").strip()
+            fl.append({"m": miss[0], "ok": False, "err": (
+                f"{miss[0]} の import の途中で子プロセスが終了した（終了コード {_LAST_CHILD.get('rc')}）: "
+                + (why.splitlines()[-1] if why else "標準エラーなし"))})
         if run_entry and base_entry is not None:
             er = res.get("<entry>")
             if er is not None and _LAST_CHILD.get("rc") != base_child.get("rc") \
@@ -436,6 +489,36 @@ def verify(
                                        "module": fails[0].get("m") if fails else "", "error": fails[0].get("err") if fails else ""})
                 active = []
 
+    # 実行の記録（指定された時だけ）: 基準の実行の記録と、渡された記録ファイルを合算し、各項目に観測の区分を付ける
+    from mcp_pystub import trace as _trace
+    trace_data = None
+    if record and run_entry and trace_path.exists():
+        try:
+            trace_data = json.loads(trace_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            trace_data = None
+    if trace_files:
+        trace_data = _trace.merge(trace_data, _trace.load(trace_files)) if trace_data else _trace.load(trace_files)
+    site_dirs = [str(Path(python_path).resolve())] if python_path else [str(p) for p in resolver._site_packages]
+    statuses: dict = {}
+    for k, it in items.items():
+        name = k.split(":", 1)[1] if it["kind"] == "nofollow" else k
+        obs = _trace.observe(trace_data, name, site_dirs) if trace_data else None
+        if it["kind"] == "submodule" and obs is not None:
+            obs["targets"] = {t: _trace.observe(trace_data, t, site_dirs)["state"] for t in it.get("targets", [])}
+        ok = k in active
+        if ok and run_entry and obs is not None and obs["state"] in ("not_imported", "import_only"):
+            st = "confirmed_run"  # 記録で未実行、かつエントリーの差し替え実行を通った
+        elif ok:
+            st = "confirmed_import"  # import（と、指定があればエントリーの実行）を通った。実行の記録での確認は無い
+        else:
+            st = "unconfirmed"
+        statuses[name] = {"status": st, "observed": obs, "entry_run_passed": bool(ok and run_entry)}
+    for r in rejected + unresolved:
+        statuses.setdefault(r["item"], {"status": "unconfirmed", "observed": None, "entry_run_passed": False})
+    labels = {"confirmed_run": "確認済み（実行）", "confirmed_import": "import 確認済み", "unconfirmed": "未確認"}
+    status_summary = {labels[k]: [n for n, v in statuses.items() if v["status"] == k] for k in labels}
+
     passed = {
         "packages": [k for k in active if items[k]["kind"] == "package"],
         "submodules": [f"{k}=>{t}" if t else k for k in active if items[k]["kind"] == "submodule"
@@ -450,6 +533,13 @@ def verify(
             "nofollow": [k.split(":", 1)[1] for k in items if items[k]["kind"] == "nofollow"],
         },
         "passed": passed,
+        "status_summary": status_summary,
+        "statuses": statuses,
+        "traced": trace_data is not None,
+        "status_note": ("確認済み（実行）= 実行の記録で未実行（not_imported / import_only）かつ run_entry=True の差し替え実行を通った。"
+                        "import 確認済み = スタブに差し替えた import（と、run_entry=True ならエントリーの実行）を通ったが、"
+                        "実行の記録での確認は無い / 記録では実行されていた。未確認 = 通らなかった・確かめられなかった。"
+                        "記録は動かした入力の範囲だけで、子プロセスの中と拡張モジュール（.pyd / .so）の中は記録できません。"),
         "baseline_failed": baseline_failed,
         "rejected": rejected,
         "unresolved": unresolved,

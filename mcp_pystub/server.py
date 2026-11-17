@@ -19,6 +19,7 @@ def analyze(
     python_path: str = "",
     max_depth: int = 10,
     include_small_conditional: bool = False,
+    trace_files: list[str] | None = None,
 ) -> dict:
     """プロジェクトのエントリーポイントから import グラフを解析し、
     スタブ置換可能なパッケージを自動検出します。
@@ -28,7 +29,7 @@ def analyze(
     - nofollow: try/except 保護あり（--nofollow-import-to で除外推奨）
     - required: スタブ化不可（実際に使用されている）
 
-    stubbable / nofollow / submodule_stub_hints は「全ての実行で元と同じ」と示せたものだけです。
+    stubbable / nofollow / submodule_stub_hints は、静的解析で使用が見つからなかった候補です（保証ではありません）。
     別のキー conditional / conditional_submodule_hints は「安全は示せないが、列挙した機能を使わないなら
     外せる」候補で、条件（壊れる入口）と確認方法（verify の呼び出し）が付きます。
     include_small_conditional=True で 1 MB 未満の条件付き候補も出します。
@@ -37,12 +38,15 @@ def analyze(
         entry_point: プロジェクトのエントリーポイントファイルパス
         python_path: site-packages パス（空の場合は現在の環境を自動検出）
         max_depth: import グラフの最大探索深度（デフォルト: 10）
+        trace_files: 実行の記録ファイル（利用者が python -m mcp_pystub.trace で作ったもの）。analyze は読むだけで
+            プログラムを実行しない。記録で実行された候補は「記録と矛盾」(trace_conflicts) として推奨から外し、
+            required だが記録で未実行のものは「記録からの候補」(trace_candidates) に出す
 
     Returns:
         stubbable / nofollow / required に分類されたパッケージ一覧
     """
     from mcp_pystub.analyzer import analyze as _analyze
-    return _analyze(entry_point, python_path, max_depth, include_small_conditional)
+    return _analyze(entry_point, python_path, max_depth, include_small_conditional, trace_files)
 
 
 @mcp.tool()
@@ -162,11 +166,13 @@ def verify(
     timeout: float = 900.0,
     entry_args: list[str] | None = None,
     cwd: str = "",
+    record: bool = False,
+    trace_files: list[str] | None = None,
 ) -> dict:
     """スタブに差し替えた状態を、対象環境の python で実際に import して確かめます（任意実行）。
 
-    警告: run_entry=True は対象のプログラムを実際に実行します。ファイルの書き込み・削除、通信、機器の操作などの副作用が
-    起きえます。AI エージェントは、利用者が明示的に求めた時だけ run_entry=True を指定してください。GUI や常駐型の
+    警告: run_entry=True と実行の記録（record=True）は対象のプログラムを実際に実行します。ファイルの書き込み・削除、通信、機器の操作などの副作用が
+    起きえます。AI エージェントは、利用者が明示的に求めた時だけ run_entry=True / record=True を指定してください。GUI や常駐型の
     プログラムは終了しないので timeout で打ち切られます。既定（run_entry=False）は import だけで、各モジュールの直下の
     コードは動きますが、エントリーの if __name__ == "__main__": の中は動きません。
 
@@ -184,6 +190,8 @@ def verify(
         timeout: 子プロセス 1 回あたりの制限時間（秒）
         entry_args: エントリーに渡す引数（sys.argv[1:]。既定は空）
         cwd: エントリーを実行する作業フォルダ（既定はエントリーのあるフォルダ）
+        record: True かつ run_entry=True のとき、基準（スタブなし）のエントリー実行で実行の記録も取る（追加の実行はしない）
+        trace_files: 利用者が python -m mcp_pystub.trace で作った記録ファイル（合算して各項目の観測の区分に使う）
 
     Returns:
         passed: 検証を通った組 / rejected: 外した項目と失敗の原文 / unresolved: 原因を特定できなかった項目
@@ -191,7 +199,7 @@ def verify(
     """
     from mcp_pystub.verifier import verify as _verify
     return _verify(entry_point, python_path, packages, submodules, nofollow, run_entry, timeout=timeout,
-                   entry_args=entry_args, cwd=cwd)
+                   entry_args=entry_args, cwd=cwd, record=record, trace_files=trace_files)
 
 
 def main() -> None:

@@ -130,7 +130,50 @@ def cscenario(name, sp_files, proj_files, entries=("main.py",), levels=("proven"
     print(f"RESULT {name} {findings}", flush=True)
     if os.environ.get("PYSTUB_VERIFY_CHECK") == "1" and any(e == entries[0] for _lv, e, _k in findings):
         _verify_check(name, root, sp, proj, ep, res, origs[entries[0]])
+    if os.environ.get("PYSTUB_TRACE_CHECK") == "1" and any(e == entries[0] for _lv, e, _k in findings):
+        _trace_check(name, root, sp, proj, ep, res, origs[entries[0]])
     return res
+
+
+def _trace_check(name, root, sp, proj, ep, res, orig):
+    """第 7 回 第 2 段: 1 項目ずつ適用して解析したエントリーを壊すか（黙って変わる / 70 で止まる）を見て、
+    壊す項目の確認の状態（記録 + run_entry=True / import だけ）を出す。"""
+    from mcp_pystub.verifier import verify
+    items = [("pkg", p["package_name"]) for p in res["stubbable"] + res.get("conditional", [])]
+    items += [("sub", (h["submodule"], h["target_package"])) for h in
+              res.get("submodule_stub_hints", []) + res.get("conditional_submodule_hints", [])]
+    items += [("nof", p["package_name"]) for p in res["nofollow"]]
+    pk = [x for k, x in items if k == "pkg"]
+    subs = [f"{x[0]}=>{x[1]}" for k, x in items if k == "sub"]
+    nof = [x for k, x in items if k == "nof"]
+    vr = verify(ep, python_path=str(sp), packages=pk, submodules=subs, nofollow=nof, run_entry=True, record=True)
+    vi = verify(ep, python_path=str(sp), packages=pk, submodules=subs, nofollow=nof)
+    for k, x in items:
+        one = {"stubbable": [], "nofollow": [], "submodule_stub_hints": [], "conditional": [],
+               "conditional_submodule_hints": []}
+        if k == "pkg":
+            one["stubbable"] = [{"package_name": x}]
+            key = x
+        elif k == "sub":
+            one["submodule_stub_hints"] = [{"submodule": x[0], "target_package": x[1]}]
+            key = x[0]
+        else:
+            one["nofollow"] = [{"package_name": x}]
+            key = x
+        site, _applied = build_site(root, sp, ep, one, "proven")
+        rc, o, er = run_py([str(proj), str(site)], ep)
+        if (rc, o) == (orig[0], orig[1]):
+            kind = "SAME"
+        elif rc == 70 or "PystubConditionalStubError" in (er or ""):
+            kind = "STOP70"
+        elif rc == 0:
+            kind = "SILENT_CHANGE"
+        else:
+            kind = "CHANGED_ERROR"
+        sr = vr["statuses"].get(key, {})
+        si = vi["statuses"].get(key, {})
+        obs = (sr.get("observed") or {}).get("state")
+        print(f"TCHECK {name} {key} {kind} rec={sr.get('status')}/{obs} imp={si.get('status')}", flush=True)
 
 
 def _verify_check(name, root, sp, proj, ep, res, orig):

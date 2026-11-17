@@ -87,4 +87,18 @@ def scenario(name, sp_files, proj_files, entry="main.py", show_stub=False, expec
         print(f"   [hint {h['submodule']} -X {h['target_package']}] rc={rc} same={same} {short(out)!r}")
         if not same: broken.append((h["submodule"], "hint", out))
     RESULTS.append((name, rc0, broken))
+    if os.environ.get("PYSTUB_TRACE_CHECK") == "1" and broken:
+        # 第 7 回 第 2 段: 壊した項目の確認の状態（記録 + run_entry=True / import だけ）
+        from mcp_pystub.verifier import verify
+        subs = [f"{h['submodule']}=>{h['target_package']}" for h in hints]
+        nof = [p for p, (k, _) in v.items() if k == "nofollow"]
+        vr = verify(ep, python_path=str(sp), packages=stubbables, submodules=subs, nofollow=nof, run_entry=True, record=True)
+        vi = verify(ep, python_path=str(sp), packages=stubbables, submodules=subs, nofollow=nof)
+        for b in broken:
+            item, out = b[0], (b[2] if len(b) > 2 else "")
+            kind = "STOP70" if "PystubConditionalStubError" in out else ("GENERR" if b[1] == "generror" else "CHANGED")
+            sr = vr["statuses"].get(item, {})
+            obs = (sr.get("observed") or {}).get("state")
+            print(f"TCHECK {name} {item} {kind} rec={sr.get('status')}/{obs} imp={vi['statuses'].get(item, {}).get('status')}",
+                  flush=True)
     return res, root, v

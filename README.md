@@ -144,6 +144,38 @@ exe の削減量ではありません（実際の削減は PyInstaller の同梱
 > 副作用が起きえます。AI エージェントは、利用者が明示的に求めた時だけ指定してください。GUI や常駐型のプログラムは終了しないので
 > timeout で打ち切られます。
 
+### 実行の記録 / Execution trace（任意）
+
+利用者が自分の管理下（試験用のデータ・テストの実行など）でプログラムを動かし、どのパッケージが import され、どの関数が
+実行されたかを記録できます。**対象のプログラムを実際に実行します**（副作用が起きえます）。
+
+```bash
+python -m mcp_pystub.trace --out trace.json entry.py 引数...            # スクリプト
+python -m mcp_pystub.trace --out trace.json -m pytest tests/             # -m 形式（pytest など）
+python -m mcp_pystub.trace --out trace.json --append entry.py 別の引数   # 複数回の実行を合算
+```
+
+対象環境の python で動かします（`mcp_pystub` が import できるように `PYTHONPATH` を通す）。Python 3.12 以降は
+`sys.monitoring`（関数の開始イベント）、それより前は `sys.setprofile` + `threading.setprofile` で記録します。
+
+- `analyze(..., trace_files=[...])`: 記録を読むだけで実行はしません。各候補に `observed`（`not_imported` / `import_only` /
+  `executed`（件数と代表的な関数名）/ `unknown_native`）を付けます。静的解析の候補が記録で `executed` なら **記録と矛盾**
+  （`trace_conflicts`）として推奨から外し、静的解析では required だが記録で `not_imported` / `import_only` のものは
+  **記録からの候補**（`trace_candidates`、verify で確かめる）に出します。
+- `verify(..., run_entry=True, record=True)`: 基準（スタブなし）のエントリー実行で記録も取ります（追加の実行はしません）。
+  `trace_files=[...]` で自分で作った記録も渡せます。各項目に `statuses` と `status_summary` が付きます:
+
+| 状態 | 意味 |
+|---|---|
+| 確認済み（実行） | 実行の記録で未実行（`not_imported` / `import_only`）、かつ `run_entry=True` の差し替え実行を通った |
+| import 確認済み | スタブに差し替えた import（と、指定があればエントリーの実行）を通った。実行の記録での確認は無い・記録では実行されていた |
+| 未確認 | 通らなかった・確かめられなかった |
+
+記録の制限: 子プロセスの中は記録しません。動かした入力の範囲しか分かりません。エントリーは実際に動きます（ファイルの
+書き込み・通信などの副作用）。拡張モジュール（.pyd / .so）の中の実行は記録できません（拡張モジュールを含み、関数の実行が
+記録に無いものは `unknown_native` で、未実行とは扱いません）。import の途中に自分のパッケージの関数を呼ぶだけのもの
+（`V = _setup()` 等）は `import_only` に数えます（別のパッケージの import の途中に呼ばれたものは実行に数えます）。
+
 ### 安全性の設計方針 / Safety Policy
 
 使用が見つからなかった候補（stubbable / nofollow / submodule_stub_hints）・条件付きとも、**静的解析による提案**です
@@ -327,7 +359,7 @@ python -m pytest tests/ -v
 
 | テスト種別 | 件数 | 結果 |
 |-----------|------|------|
-| ユニットテスト（tests/、攻撃シナリオの回帰を含む） | 305 | 全通過（第 6 回の時点） |
+| ユニットテスト（tests/、攻撃シナリオの回帰を含む） | 336 | 全通過（第 7 回 第 2 段の時点） |
 | PyPI ライブラリ大規模テスト（requests, flask, pandas 等） | 84 | クラッシュ 0 |
 | PyInstaller exe ビルド + 動作テスト | 22 | **全 PASS** |
 | asammdf E2E（MDF作成→読取→リサンプリング） | 1 | **exe 40% 削減 + 正常動作** |

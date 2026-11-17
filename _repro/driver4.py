@@ -233,6 +233,17 @@ def run(name, entry2=False):
     cond_hint_list = list(A.get("conditional_submodule_hints", []) or [])
     for x in cond_hint_list:
         cond_hints.setdefault(x["submodule"], x)
+    # 第 7 回 第 2 段: 適用する項目を絞る（PYSTUB_ONLY = 確認済み（実行）の名前）・記録からの候補を足す（PYSTUB_EXTRA_PKGS）
+    only = [x for x in _os.environ.get("PYSTUB_ONLY", "").split(",") if x]
+    if only:
+        stub_pkgs = [p for p in stub_pkgs if p in only]
+        nof = [p for p in nof if p in only]
+        cond_pkgs = [p for p in cond_pkgs if p in only]
+        hints = {k: v for k, v in hints.items() if k in only}
+        cond_hints = {k: v for k, v in cond_hints.items() if k in only}
+    extra = [x for x in _os.environ.get("PYSTUB_EXTRA_PKGS", "").split(",") if x]
+    cond_pkgs += [p for p in extra if p not in cond_pkgs]
+    R["only"], R["extra"] = only, extra
     R["summary"] = A.get("summary")
     R["conditional"] = [{k: x.get(k) for k in ("package_name", "estimated_savings_mb", "conditions_total", "unproven_because", "confidence")}
                         | {"conditions": [{k: g.get(k) for k in ("entry", "public_api", "entry_location", "why_unproven", "uses", "may_be_swallowed", "project_uses_count")}

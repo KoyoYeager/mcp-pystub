@@ -144,3 +144,18 @@ def test_verify_rejects_real_pandas_accessor_plugin():
     v = verify(str(R / "proj/entry.py"), python_path=str(R / "venv/Lib/site-packages"), packages=["geoacc"],
                submodules=[], nofollow=[], run_entry=True)
     assert "geoacc" not in v["passed"]["packages"], v
+
+
+# 第 7 回 第 2 段: 1 項目ずつ適用して解析したエントリーを壊す項目は、「確認済み（実行）」（記録で未実行 + run_entry=True の
+# 差し替え実行を通過）にならない。件数を固定する
+TCHECK_COUNTS = {"n1.py": 18, "f1.py": 14, "e1.py": 6, "e4.py": 3, "f3.py": 1}
+
+
+@pytest.mark.parametrize("script", sorted(TCHECK_COUNTS))
+def test_breaking_items_never_confirmed_run(script, tmp_path, monkeypatch):
+    monkeypatch.setenv("PYSTUB_TRACE_CHECK", "1")
+    out = _run(script, tmp_path)
+    checks = [l.split() for l in out.splitlines() if l.startswith("TCHECK ")]
+    assert len(checks) == TCHECK_COUNTS[script], len(checks)
+    bad = [c for c in checks if c[3] != "SAME" and c[4].startswith("rec=confirmed_run")]
+    assert not bad, bad
