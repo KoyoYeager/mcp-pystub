@@ -55,11 +55,23 @@ def _raise(n):
     # MCP_PYSTUB_STRICT=0 のときだけ例外を投げる
     m = "mcp-pystub のスタブです。" + _PYSTUB_NOTE + "（呼ばれたもの: " + n + "）"
     import os, sys
+    line = "[mcp-pystub] PystubConditionalStubError: " + m + "\\n"
     try:
-        sys.stderr.write("[mcp-pystub] PystubConditionalStubError: " + m + "\\n")
+        if sys.stderr is None:
+            raise OSError("no stderr")
+        sys.stderr.write(line)
         sys.stderr.flush()
     except Exception:
-        pass
+        # 標準エラーが無い（窓のない exe 等）: exe のあるフォルダ、書けなければ一時フォルダの pystub_stop.log
+        import tempfile
+        base = os.path.dirname(sys.executable if getattr(sys, "frozen", False) else os.path.abspath(sys.argv[0] or "."))
+        for d in (base, tempfile.gettempdir()):
+            try:
+                with open(os.path.join(d, "pystub_stop.log"), "a", encoding="utf-8") as f:
+                    f.write(line)
+                break
+            except Exception:
+                continue
     if os.environ.get("MCP_PYSTUB_STRICT", "1") != "0":
         try:
             sys.stdout.flush()
@@ -68,32 +80,45 @@ def _raise(n):
         os._exit(70)
     raise PystubConditionalStubError(m)
 class _M(type):
-    # 代わりのオブジェクト: 呼び出し・添字・真偽・書式・比較・反復・演算・未知の属性のどれでも止まる
+    # 2 種類ある。
+    # (1) スタブのクラス（class 文）と、元がクラス・関数・モジュールの代わり（_g(..., True)）:
+    #     ==・!=・hash・真偽・str・repr・書式は type の既定どおり（PyInstaller のビルド時 import・typing.Union の
+    #     重複除去・辞書の検索が使う）。元のクラスが普通のクラスでない（metaclass・Enum 等: _pystub_strict）なら
+    #     str・repr・書式・反復・添字は止まる。属性は、元に無い名前なら AttributeError（hasattr / getattr の既定値で
+    #     機能の有無を試すコードのため）、元にある値は「値の代わり」(2) を返し、クラス・関数なら (1) を返す。
+    # (2) 値の代わり（_pystub_ph）: 呼び出し・添字・真偽・書式・比較・反復・演算・属性のどれでも止まる。
     def __getattr__(c, n):
-        k = c.__dict__.get("_pystub_known")
+        d = c.__dict__
         if n[:2] == "__":
             raise AttributeError(n)
-        if k is not None and n in k:
-            return _M(n, (), {{"_pystub_known": ()}})
-        _raise(c.__name__ + "." + n)
+        if d.get("_pystub_ph"):
+            _raise(c.__name__ + "." + n)
+        k = d.get("_pystub_known")
+        if k is not None and n not in k:
+            raise AttributeError(n)  # 元のクラスに無い名前
+        kind = (d.get("_pystub_kinds") or {{}}).get(n, "v")
+        v = _g(c.__name__ + "." + n, kind in ("c", "f"))
+        type.__setattr__(c, n, v)  # 同じ属性は同じオブジェクト
+        return v
     def __call__(c, *a, **k): _raise(c.__name__)
     def __getitem__(c, i): _raise(c.__name__ + "[...]")
     def __iter__(c): _raise(c.__name__ + " の反復")
     def __len__(c): _raise("len(" + c.__name__ + ")")
     def __contains__(c, x): _raise(c.__name__ + " の in")
-    # 元がクラス・関数・モジュールのもの（スタブの class 文で作ったクラスと、_g(..., True)）は、
-    # 真偽・==・!=・str・書式を type の既定どおりにする（typing の Union の重複除去・辞書の検索などが使う）。
-    # 値の代わり（_g の既定）だけが止まる
     def __bool__(c):
         if not c.__dict__.get("_pystub_ph"):
             return True
         _raise(c.__name__ + " の真偽")
     def __str__(c):
-        if not c.__dict__.get("_pystub_ph"):
+        if not c.__dict__.get("_pystub_ph") and not c.__dict__.get("_pystub_strict"):
             return type.__str__(c)
         _raise("str(" + c.__name__ + ")")
+    def __repr__(c):
+        if not c.__dict__.get("_pystub_ph") and not c.__dict__.get("_pystub_strict"):
+            return type.__repr__(c)
+        _raise("repr(" + c.__name__ + ")")
     def __format__(c, spec):
-        if not c.__dict__.get("_pystub_ph"):
+        if not c.__dict__.get("_pystub_ph") and not c.__dict__.get("_pystub_strict"):
             return type.__format__(c, spec)
         _raise(c.__name__ + " の書式")
     def __eq__(c, o):
@@ -114,15 +139,28 @@ class _M(type):
     def __int__(c): _raise("int(" + c.__name__ + ")")
     __float__ = __index__ = __int__
     __hash__ = type.__hash__
-def _g(n, t=False):
-    # _pystub_ph: 値の代わり（元が何か分からない）。元がクラス・関数・モジュールなら t=True で印を付けない
-    return _M(n, (), {{"_pystub_known": (), "_pystub_truthy": t, "_pystub_ph": not t}})
+def _g(n, t=False, strict=False):
+    # t=True: 元はクラス・関数・モジュール（上の (1)。属性は分からないので全て値の代わり）。t=False: 値の代わり (2)
+    # strict: 元が普通のクラスでない（Enum 等）
+    return _M(n, (), {{"_pystub_known": None if t else (), "_pystub_truthy": t, "_pystub_ph": not t,
+                       "_pystub_strict": strict}})
 """
 
 _NET_KNOWN = """_PYSTUB_KNOWN = {known}
 def __getattr__(n):
     if n in _PYSTUB_KNOWN and n[:2] != "__":
         return _g(n)
+    raise AttributeError(n)
+"""
+
+# 条件付き: 名前の種類（元がクラス・関数・モジュールなら値の代わりにしない）
+_NET_KNOWN_LOUD = """_PYSTUB_KNOWN = {known}
+_PYSTUB_KINDS = {kinds}
+def __getattr__(n):
+    if n in _PYSTUB_KNOWN and n[:2] != "__":
+        k = _PYSTUB_KINDS.get(n)
+        v = globals()[n] = _g(n, k in ("c", "f", "m", "s"), k == "s")  # 同じ名前は同じオブジェクト（同一性・hash）
+        return v
     raise AttributeError(n)
 """
 
@@ -324,7 +362,23 @@ class _StubBuilder:
         if is_top and self.version:
             defs.append(f"__version__ = {self.version!r}\n")
         known = self._known_names(info)
-        net = _NET_ALL if known is None else _NET_KNOWN.format(known=repr(frozenset(sorted(known))))
+        if known is not None and self.loud_note:
+            kinds = {}
+            for nm in sorted(known):
+                if nm in self._emitted:
+                    continue
+                try:
+                    r0 = self.p.resolve(module, (nm,))
+                    k0 = r0.kind if not r0.alts else ""
+                except Exception:  # noqa: BLE001
+                    r0, k0 = None, ""
+                if k0 == "class":
+                    kinds[nm] = "c" if self.p.class_is_plain(r0.module, r0.target) else "s"
+                elif k0 in ("function", "module", "external_module"):
+                    kinds[nm] = "f" if k0 == "function" else "m"
+            net = _NET_KNOWN_LOUD.format(known=repr(frozenset(sorted(known))), kinds=repr(kinds))
+        else:
+            net = _NET_ALL if known is None else _NET_KNOWN.format(known=repr(frozenset(sorted(known))))
         header = _LOUD_HEADER.format(module=module, note=self.loud_note) if self.loud_note else \
             _HEADER.format(module=module)
         return "\n".join([header, net] + defs + tail)
@@ -496,6 +550,20 @@ class _StubBuilder:
             if not self.p.class_is_plain(r.module, r.target):
                 known = None  # Enum 等: 属性の有無を静的に決めない
         body: list[str] = [f"    _pystub_known = {repr(frozenset(sorted(known))) if known is not None else 'None'}"]
+        if self.loud_note and ci is not None and ci.doc is not None:
+            body.append(f"    __doc__ = {ci.doc!r}")  # 条件付き: 元の docstring を写す（証明済みのスタブは変えない）
+        if self.loud_note:
+            # 条件付き: 属性の種類（c: クラス / f: 関数・メソッド / v: 値）と、普通のクラスでない印
+            kinds = {}
+            for nm in sorted(known or ()):
+                try:
+                    ak = self.p.extend(r, (nm,)).kind
+                except Exception:  # noqa: BLE001
+                    ak = ""
+                kinds[nm] = "c" if ak == "class" else ("f" if ak in ("function", "method") else "v")
+            body.append(f"    _pystub_kinds = {kinds!r}")
+            if not self.p.class_is_plain(r.module, r.target):
+                body.append("    _pystub_strict = True")
         for s in sorted(subs):
             if not s:
                 continue

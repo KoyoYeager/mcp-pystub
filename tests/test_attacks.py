@@ -48,20 +48,32 @@ def test_proven_attacks_b(script, tmp_path):
     assert not broken, "\n".join(x[:400] for x in broken)
 
 
-@pytest.mark.parametrize("script", ["c1.py", "c1b.py", "c2.py"])
+@pytest.mark.parametrize("script", ["c1.py", "c1b.py", "c2.py", "e1.py", "e4.py"])
 def test_conditional_attacks(script, tmp_path):
+    """条件付きの段（第 5 回の基準）:
+    - 黙って変わる（SILENT / CHANGED）は 0 件
+    - high の候補で、解析したエントリー（main.py）が止まる・変わるのは 0 件
+    - low の候補は、解析したエントリーが 70 で止まることがある（別の入力で止まりうる、の意味）
+    """
     out = _run(script, tmp_path)
     bad = []
     n = 0
+    confs: list[str] = []
     for l in out.splitlines():
+        if l.startswith("===== "):
+            confs = []
+        m = re.search(r"^\s+(COND|CHINT)\s.*conf=(\w+)", l)
+        if m:
+            confs.append(m.group(2))
         m = re.match(r"RESULT (\S+) (\[.*\])$", l)
         if not m:
             continue
         n += 1
         for lv, entry, kind in ast.literal_eval(m.group(2)):
-            # 解析したエントリーは同じ出力でなければならない。別の入口は止まる（LOUD）なら可
-            if entry == "main.py" or kind != "LOUD":
-                bad.append((m.group(1), lv, entry, kind))
+            if kind != "LOUD":
+                bad.append((m.group(1), lv, entry, kind, "黙って変わった"))
+            elif entry == "main.py" and "high" in confs:
+                bad.append((m.group(1), lv, entry, kind, f"high の候補で解析したエントリーが止まった {confs}"))
     assert n, out[-2000:]
     assert not bad, bad
 

@@ -66,11 +66,26 @@ stubbable には混ざりません。各候補に、推定の削減量・条件�
 証明できなかった理由（名前だけの振り分け / 引数に渡したクラス / 登録デコレータ / 入力次第の分岐）・確認方法
 （`verify(..., run_entry=True)` の呼び出し）と `confidence`（high / low）が付きます。
 
-条件付きのスタブは、条件の機能に到達した時点（呼び出し・添字・真偽・書式・比較・反復・未知の属性のどれでも）で、
-標準エラーに `[mcp-pystub] PystubConditionalStubError: mcp-pystub のスタブです。…` と原因を書いて
-**終了コード 70 で即終了**します（`except` で握りつぶせません）。`MCP_PYSTUB_STRICT=0` を付けた時だけ
-`PystubConditionalStubError` を投げる動作になります（この場合、呼び出し元の `except Exception` 等で
-握りつぶされうる箇所は条件の `may_be_swallowed` に出ます）。
+条件付きのスタブは、条件の機能に到達した時点（関数の呼び出し、値の代わりへの添字・真偽・書式・比較・反復・属性、
+普通でないクラスの str / 反復など）で、標準エラーに `[mcp-pystub] PystubConditionalStubError: mcp-pystub のスタブです。…`
+と原因を書いて **終了コード 70 で即終了**します（`except` で握りつぶせません）。標準エラーが無い窓のない exe では、
+原因を exe のあるフォルダ（書けなければ一時フォルダ）の `pystub_stop.log` に書きます。`MCP_PYSTUB_STRICT=0` を付けた時だけ
+`PystubConditionalStubError` を投げる動作になります（呼び出し元の `except Exception` 等で握りつぶされうる箇所は条件の
+`may_be_swallowed` に出ます）。スタブのクラスそのものの `==`・hash・真偽・repr は元のクラスと同じ動作で、元に無い属性は
+`AttributeError` になります。
+
+**制限**: 子プロセス（multiprocessing・concurrent.futures・subprocess）の中で止まった場合、親が終了コードや例外として
+受け取って処理を続けることがあります。即終了なので、書き込み途中のファイルが残り、`atexit` / `finally` は実行されません。
+site-packages の `.pth` と `sitecustomize` が起動時に実行するコードは解析の外です。
+
+**confidence**（条件付き候補ごと。仕様 10.2.1）:
+
+| 値 | 意味 |
+|---|---|
+| `high` | 入口の列挙が完了し、プロジェクトのコードがどの入口の関数も呼ばず（受け手の分からない同名の呼び出しも無い）、入口へ入る辺が登録・間接呼び出しの仕組み（singledispatch・登録辞書・コールバック一覧・methodcaller・`__init_subclass__`）でない。解析したエントリーは止まらない見込み |
+| `low` | 条件を守れば外せるが、プロジェクトが入口の関数を呼んでいる・経路が間接的。解析したエントリーでは変わらなくても、別の入力で終了コード 70 で止まりうる。理由は `confidence_reason`（例: 「プロジェクトが `asammdf.MDF.append()` を呼んでいます。入力によってはここから … pandas に届きます」） |
+
+low でも、解析したエントリーで変わらないことは `verify(..., run_entry=True)` で確かめられます。
 
 `analyze` の結果の先頭には `summary`（証明済みの推定削減 MB・conditional(high) の MB と件数・推奨の一覧・次の手順）が
 付きます。1 MB 未満の条件付き候補は既定で省き（`conditional_omitted_small` に件数）、`include_small_conditional=True`
@@ -284,7 +299,7 @@ python -m pytest tests/ -v
 
 | テスト種別 | 件数 | 結果 |
 |-----------|------|------|
-| ユニットテスト（9モジュール） | 91 | 全通過 |
+| ユニットテスト（tests/、攻撃シナリオの回帰を含む） | 299 | 全通過（第 5 回の時点） |
 | PyPI ライブラリ大規模テスト（requests, flask, pandas 等） | 84 | クラッシュ 0 |
 | PyInstaller exe ビルド + 動作テスト | 22 | **全 PASS** |
 | asammdf E2E（MDF作成→読取→リサンプリング） | 1 | **exe 40% 削減 + 正常動作** |

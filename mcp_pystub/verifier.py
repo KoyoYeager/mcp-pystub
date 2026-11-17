@@ -373,7 +373,9 @@ def verify(
                 active = []
                 break
         for k, r in blamed.items():
-            rejected.append({"item": k, "reason": "スタブに差し替えると import / 実行が失敗",
+            silent = bool(r.get("entry_mismatch")) and not (r.get("err") or "").strip()
+            rejected.append({"item": k, "reason": ("スタブに差し替えるとエントリーの出力が変わった（例外は出ていない）" if silent
+                                                   else "スタブに差し替えると import / 実行が失敗"),
                              "module": r.get("m"), "error": r.get("err"),
                              "traceback_tail": (r.get("tb") or "")[-1200:]})
         active = [k for k in active if k not in blamed]

@@ -124,6 +124,7 @@ class ClassInfo:
     bases: list[ast.expr] = field(default_factory=list)
     keywords: list[ast.keyword] = field(default_factory=list)
     decorators: list[str] = field(default_factory=list)  # デコレータの末尾の名前
+    doc: str | None = None  # クラスの docstring（スタブに写す）
 
 
 @dataclass
@@ -250,6 +251,7 @@ class Unit:
     events: list[Event] = field(default_factory=list)
     escaped_units: list[str] = field(default_factory=list)  # 登録されうる関数（未知・登録デコレータ）
     certain_escaped: set[str] = field(default_factory=set)  # 登録が確実に実行される（atexit.register 等）
+    registry_escaped: set[str] = field(default_factory=set)  # 入れ物に登録される（登録辞書・コールバック一覧・singledispatch 等）
     unknown_calls: bool = False  # 中身の分からない呼び出し（ループ変数・添字の呼び出し）がある
 
     @property
@@ -415,6 +417,29 @@ def _sys_modules_guard(stmt: ast.stmt) -> str:
 # ---------------------------------------------------------------------------
 # デコレータが関数を外へ逃がすか（登録デコレータの検出）
 # ---------------------------------------------------------------------------
+
+
+_REGISTER_ATTRS = frozenset({"append", "add", "register", "setdefault", "insert", "extend", "update", "appendleft",
+                             "connect", "subscribe", "put"})
+_REGISTRY_DECORATOR_NAMES = frozenset({"register", "route", "command", "group", "hook", "hookimpl", "listens_for",
+                                       "connect", "subscribe", "receiver", "handler", "callback", "task",
+                                       "fixture", "implementer", "plugin", "entrypoint", "add", "append"})
+
+
+def decorator_registers(fn: ast.AST) -> bool:
+    """デコレータ関数（工場を含む）が、引数の関数を入れ物（辞書・一覧・集合）に登録するか（登録の仕組み）。"""
+    params: set[str] = set()
+    for n in ast.walk(fn):
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+            params.update(a.arg for a in n.args.posonlyargs + n.args.args + n.args.kwonlyargs)
+    for n in ast.walk(fn):
+        if isinstance(n, ast.Assign) and isinstance(n.value, ast.Name) and n.value.id in params \
+                and any(isinstance(t, ast.Subscript) for t in n.targets):
+            return True  # _REG[name] = f
+        if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) and n.func.attr in _REGISTER_ATTRS \
+                and any(isinstance(a, ast.Name) and a.id in params for a in list(n.args) + [k.value for k in n.keywords]):
+            return True  # _CBS.append(f) / registry.register(f)
+    return False
 
 
 def decorator_escapes(fn: ast.AST, depth: int = 0) -> bool:
@@ -937,7 +962,8 @@ class Program:
                     key = f"{qual}#{n}"
                 ci = ClassInfo(module=info.name, qualname=key, node=None, bases=list(stmt.bases),
                                keywords=list(stmt.keywords),
-                               decorators=[_decorator_last_name(d) for d in stmt.decorator_list])
+                               decorators=[_decorator_last_name(d) for d in stmt.decorator_list],
+                               doc=ast.get_docstring(stmt, clean=False))
                 self._collect_bindings(info, stmt.body, ci.attrs, qual + ".", False, False)
                 info.classes[key] = ci
                 info.class_qual_of[_pos(stmt)] = key
@@ -1800,6 +1826,7 @@ class _UnitWalker:
         """def: デコレータ・既定引数・注釈は定義時（このユニット）に評価される。"""
         sc = cls_scope if cls_scope is not None else scope
         escaped = False
+        registry = False
         for d in node.decorator_list:
             self._expr(d, "decorator", sc)
             name = _decorator_last_name(d)
@@ -1813,6 +1840,11 @@ class _UnitWalker:
                 dnode = self.p.function_node(dinfo, r.target) if dinfo is not None else None
                 if dnode is not None and not decorator_escapes(dnode):
                     continue
+                if dnode is not None and decorator_registers(dnode):
+                    registry = True
+            elif isinstance(target, ast.Attribute) and (target.attr in _REGISTRY_DECORATOR_NAMES
+                                                        or target.attr.startswith("on_")):
+                registry = True  # 解析できないデコレータ: X.register / app.route / bus.on_xxx の形（登録の仕組み）
             escaped = True
         args = node.args
         for dflt in list(args.defaults) + [x for x in args.kw_defaults if x is not None]:
@@ -1830,6 +1862,8 @@ class _UnitWalker:
             if qual:
                 assert self.unit is not None
                 self.unit.escaped_units.append(qual)
+                if registry:
+                    self.unit.registry_escaped.add(qual)
                 for d in node.decorator_list:
                     dr = self.p.ref_of_expr(self.info, d.func if isinstance(d, ast.Call) else d, sc)
                     if dr is not None and not dr.alts and dr.module == "atexit" and dr.chain[-1:] == ("register",):
@@ -2153,7 +2187,7 @@ class _UnitWalker:
             return
         elif fname in (".methodcaller",) or fname == "methodcaller":
             if e.args and isinstance(e.args[0], ast.Constant) and isinstance(e.args[0].value, str):
-                self._ev(Event("method", name=e.args[0].value, lineno=e.lineno))
+                self._ev(Event("method", name=e.args[0].value, lineno=e.lineno, ctx="methodcaller"))
             for a in e.args:
                 ev(a, "arg", sc)
         elif fname in (".find_spec", "find_spec") and e.args and isinstance(e.args[0], ast.Constant) \
@@ -2749,7 +2783,7 @@ def compute_reachability(
                             reach_module_getattr(ev.from_base)  # from M import N で M.__getattr__ が呼ばれる
             return
         if ev.kind == "method":
-            if ev.ctx == "self" and unit.cls:
+            if ev.ctx == "self" and unit.cls:  # (methodcaller は ctx="methodcaller": 名前の振り分けとして扱う)
                 self_dispatch(unit, ev.name)
             tag[0] = "name"  # 受け手が分からない（self でも族の外の同名メソッド）: 名前だけの振り分け
             on_method_name(ev.name, attr_only=False)
@@ -3003,7 +3037,7 @@ def compute_reachability(
                 # 本体が登録先を呼び出す（ループ変数・添字の呼び出しがある）場合は確実に実行される（C07 / C08）
                 certain_reg = qual in unit.certain_escaped or (
                     unit.qualname == "<module>" and unit.unknown_calls)
-                tag[0] = "precise" if certain_reg else "decorator"
+                tag[0] = "precise" if certain_reg else ("registry" if qual in unit.registry_escaped else "decorator")
                 reach((unit.module, qual), "escaped (decorator)")
                 tag[0] = "precise"
             for ev in unit.events:

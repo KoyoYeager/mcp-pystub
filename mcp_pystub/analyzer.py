@@ -390,7 +390,8 @@ def _summary(rd: dict, entry: str, python_path: str, required: list) -> dict:
             high_n += 1
         cond_recs.append((h.get("confidence"), -h.get("estimated_savings_mb", 0.0),
                           f"[{h.get('confidence')}] {h['submodule']} をスタブ化すると {h['target_package']} を排除できます"
-                          f"（約 {h.get('estimated_savings_mb', 0.0):.1f} MB。条件: {text or '—'} を使わない。プロジェクト内の使用 {uses} 件）"))
+                          f"（約 {h.get('estimated_savings_mb', 0.0):.1f} MB。条件: {text or '—'} を使わない。プロジェクト内の使用 {uses} 件）"
+                          + (f" — low の理由: {h.get('confidence_reason')}" if h.get("confidence") == "low" and h.get("confidence_reason") else "")))
     for p in rd.get("conditional", []):
         text, uses = _cond_text(p.get("conditions", []), p.get("conditions_total", 0), p.get("conditions_complete", True))
         if p.get("confidence") == "high":
@@ -398,11 +399,15 @@ def _summary(rd: dict, entry: str, python_path: str, required: list) -> dict:
             high_n += 1
         cond_recs.append((p.get("confidence"), -p.get("estimated_savings_mb", 0.0),
                           f"[{p.get('confidence')}] {p['package_name']} をスタブ化できます"
-                          f"（約 {p.get('estimated_savings_mb', 0.0):.1f} MB。条件: {text or '—'} を使わない。プロジェクト内の使用 {uses} 件）"))
+                          f"（約 {p.get('estimated_savings_mb', 0.0):.1f} MB。条件: {text or '—'} を使わない。プロジェクト内の使用 {uses} 件）"
+                          + (f" — low の理由: {p.get('confidence_reason')}" if p.get("confidence") == "low" and p.get("confidence_reason") else "")))
     cond_recs.sort(key=lambda x: (0 if x[0] == "high" else 1, x[1]))
     py = f", python_path={python_path!r}" if python_path else ""
     steps = [
-        "1. 推奨の上から選ぶ（[high] = 障害は依存ライブラリ内の過大近似だけで、プロジェクトのコードに条件の入口の使用が無い）",
+        "1. 推奨の上から選ぶ。[high] = 入口の列挙が完了し、プロジェクトのコードがどの入口の関数も呼ばず、経路に登録・"
+        "間接呼び出しの仕組みが無い（解析したエントリーは止まらない見込み）。[low] = 条件を守れば外せるが、プロジェクトが"
+        "入口の関数を呼んでいる・経路が間接的（解析したエントリーでは変わらなくても、別の入力で終了コード 70 で止まりうる）",
+        "   low でも、解析したエントリーで変わらないことは verify(..., run_entry=True) で確かめられます",
         f"2. サブモジュールなら generate_submodule({entry!r}, <親>, <サブモジュール>{py})、パッケージなら generate(...) でスタブを作る",
         f"3. verify({entry!r}{py}, packages=[...], submodules=['<サブモジュール>=><排除する C 拡張>'], run_entry=True) で確かめる",
         "4. build_instructions の手順で適用 → ビルド → 実行結果を元と比べる → 手順どおり復元",

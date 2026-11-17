@@ -98,7 +98,8 @@ class SubmoduleStubHint:
     conditional: bool = False  # 条件付き（安全を示せない。conditions の機能を使わない前提）
     conditions: list[dict] = field(default_factory=list)
     conditions_total: int = 0
-    conditions_complete: bool = True  # False: 入口が多すぎて列挙を打ち切った（conditions_total は下限）
+    conditions_complete: bool = True  # False: プロジェクトに解決できない同名の呼び出しがある
+    confidence_reason: str = ""  # low の理由（1 行）
     confidence: str = ""  # high: 障害が全て依存ライブラリ内の過大近似で、プロジェクトに入口の使用が 0 件 / low
 
 
@@ -120,7 +121,8 @@ class PackageAnalysis:
     # conditional のとき: 「これを使うと壊れる」入口（仕様 9 節）
     conditions: list[dict] = field(default_factory=list)
     conditions_total: int = 0
-    conditions_complete: bool = True  # False: 入口が多すぎて列挙を打ち切った（conditions_total は下限）
+    conditions_complete: bool = True  # False: プロジェクトに解決できない同名の呼び出しがある
+    confidence_reason: str = ""  # low の理由（1 行）
     unproven_because: list[str] = field(default_factory=list)
     confidence: str = ""
     conditional_submodule_stubs: list[SubmoduleStubHint] = field(default_factory=list)

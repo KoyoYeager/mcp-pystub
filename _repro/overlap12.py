@@ -18,7 +18,8 @@ OUT = Path(r"C:\tmp\pystub-e2e\after_round4\overlap12")
 OUT.mkdir(parents=True, exist_ok=True)
 entry = str(S / "proj" / "entry.py")
 expected = (S / "expected.txt").read_text(encoding="utf-8").replace("\r\n", "\n").strip()
-freeze0 = (S / "freeze_orig.txt").read_text(encoding="utf-8").replace("\r", "")
+# freeze_orig.txt の改行は \r\r\n（read_text だと空行が増えて一致しない）: バイト列で読んで \r を除く
+freeze0 = (S / "freeze_orig.txt").read_bytes().decode("utf-8", "replace").replace("\r", "").strip()
 
 
 def record_bad():
@@ -41,7 +42,8 @@ def record_bad():
 
 
 def state():
-    fr = subprocess.run([str(PY), "-m", "pip", "freeze"], capture_output=True, text=True).stdout.replace("\r", "")
+    fr = subprocess.run([str(PY), "-m", "pip", "freeze"], capture_output=True).stdout.decode("utf-8", "replace") \
+        .replace("\r", "").strip()
     r = subprocess.run([str(PY), entry], capture_output=True, text=True)
     bak = V / "Lib" / "_pystub_bak"
     return {"freeze_equal": fr == freeze0, "output_equal": r.stdout.replace("\r\n", "\n").strip() == expected,

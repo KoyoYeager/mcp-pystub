@@ -23,8 +23,10 @@ OK_MAIN = "import sig, other\nclass P:\n    def plot(self):\n        return 'p'\
 def test_confidence_high_when_project_does_not_use_entry(tmp_path):
     c = Case(tmp_path, SIG, OK_MAIN.replace("def plot", "def draw_it").replace("other.show(P())", "1"),
              "import sig\nprint(sig.Signal(1).plot())\n")
-    # 名前の振り分けを起こすのはライブラリ内（other.show）だけにする
-    _write(c.proj, {"main.py": "import sig, other\nprint('ok', sig.Signal(3).value(), other.show(sig.Signal(4)) if False else 0)\n"})
+    # 名前の振り分けを起こすのはライブラリ内（other.show）だけにし、プロジェクトは other.show を呼ばない
+    # （第 5 回: 入口へ入る呼び出しのある関数をプロジェクトが直接呼ぶなら low）
+    _write(c.sp, {"lib2/__init__.py": "import other\ndef go(objs):\n    return [other.show(o) for o in objs]\n"})
+    _write(c.proj, {"main.py": "import sig, lib2\nprint('ok', sig.Signal(3).value(), lib2.go([]))\n"})
     res = analyze(str(c.proj / "main.py"), python_path=str(c.sp), include_small_conditional=True)
     cond = {p["package_name"]: p for p in res["conditional"]}
     assert "gx" in cond, res["conditional"]  # 候補が出ないなら失敗（黙って通さない）
@@ -56,9 +58,10 @@ def test_confidence_low_for_branch(tmp_path):
 
 def test_summary_is_first_and_lists_high_first(tmp_path):
     sp = dict(SIG)
-    sp["lib2/__init__.py"] = "def dispatch(objs):\n    return [o.plot() for o in objs]\n"
+    sp["lib2/__init__.py"] = "def _dispatch(objs):\n    return [o.plot() for o in objs]\ndef run(objs):\n    return _dispatch(objs)\n"
+    sp["lib3/__init__.py"] = "import lib2\ndef top(objs):\n    return lib2.run(objs)\n"
     _write(tmp_path / "sp", sp)
-    _write(tmp_path / "proj", {"main.py": "import sig, lib2\nprint('ok', sig.Signal(3).value(), lib2.dispatch([]))\n", "pyproject.toml": ""})
+    _write(tmp_path / "proj", {"main.py": "import sig, lib3\nprint('ok', sig.Signal(3).value(), lib3.top([]))\n", "pyproject.toml": ""})
     res = analyze(str(tmp_path / "proj" / "main.py"), python_path=str(tmp_path / "sp"), include_small_conditional=True)
     assert list(res)[0] == "summary"
     s = res["summary"]
@@ -150,3 +153,11 @@ def test_overlapping_package_and_submodule_stub_restore(tmp_path):
     sh(method1(gs["build_instructions"]))
     assert tree() == before
     assert not (site.parent / "_pystub_bak").exists()
+
+
+def test_low_when_project_calls_function_that_dispatches(tmp_path):
+    """プロジェクトが、入口へ入る呼び出しのある関数（other.show）を直接呼ぶ → low（理由つき）"""
+    c = Case(tmp_path, SIG, OK_MAIN, "import sig, other\nprint(other.show(sig.Signal(1)))\n")
+    g = [p for p in c.res["conditional"] if p["package_name"] == "gx"][0]
+    assert g["confidence"] == "low"
+    assert "other.show()" in g["confidence_reason"]

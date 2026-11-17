@@ -657,6 +657,7 @@ def _analyze_single_package(
             conditions=pending["conditions"],
             conditions_total=pending["total"],
             conditions_complete=pending.get("complete", True),
+            confidence_reason=pending.get("confidence_reason", ""),
             unproven_because=pending["because"],
             confidence=pending["confidence"],
             **common,
@@ -810,6 +811,9 @@ def find_submodule_hints(
             conditions=(ci or {}).get("conditions", []),
             conditions_total=(ci or {}).get("total", 0),
             conditions_complete=(ci or {}).get("complete", True),
+            confidence_reason=((ci or {}).get("confidence_reason", "") or next(
+                (f"同時にスタブにする {c2} の条件: {x.get('confidence_reason')}" for c2, x in cond_info.items()
+                 if x.get("confidence") == "low" and c2 != cand), "")),
             target_package=T,
             parent_package=cand.split(".")[0],
             submodule=cand,
@@ -842,7 +846,8 @@ def _unique(items: list[str]) -> list[str]:
 _TAG_TEXT = {
     "name": "名前だけの振り分け（受け手の型が分からない呼び出しを、同名のメソッド全てに届くと仮定）",
     "argclass": "引数に渡したクラス（渡した先で生成されると仮定）",
-    "decorator": "登録デコレータ（飾られた関数が後で呼ばれると仮定）",
+    "decorator": "解析できないデコレータ（飾られた関数が後で呼ばれると仮定）",
+    "registry": "登録の仕組み（登録辞書・コールバック一覧・singledispatch 等に登録された関数が呼ばれると仮定）",
     "branch": "入力・呼び出し次第の分岐（関数の中の if / except / 条件式の枝）",
 }
 
@@ -961,7 +966,7 @@ def _region_entries_multi(sem: Semantics, keys: list) -> tuple[dict, bool]:
                 if src != k and _instance_from_certain(sem, k):
                     ek = (k, t)
                     if ek not in out:
-                        out[ek] = (ev, src, dist[k], origin[k])
+                        out[ek] = (ev, src, dist[k], origin[k], _indirect_edge(t, ev))
             if nm not in names_done:
                 names_done.add(nm)
                 preds = list(preds) + by_name_other.get(nm, [])
@@ -971,7 +976,7 @@ def _region_entries_multi(sem: Semantics, keys: list) -> tuple[dict, bool]:
                     continue  # 名前の振り分け先のクラスのインスタンスは、この範囲に入らないと作られない
                 ek = (k, t)
                 if ek not in out:
-                    out[ek] = (ev, src, dist[k], origin[k])
+                    out[ek] = (ev, src, dist[k], origin[k], _indirect_edge(t, ev))
             elif src not in dist:
                 dist[src] = dist[k] + 1
                 origin[src] = origin[k]
@@ -979,10 +984,37 @@ def _region_entries_multi(sem: Semantics, keys: list) -> tuple[dict, bool]:
     return out, complete
 
 
+_INDIRECT_TAGS = frozenset({"registry"})
+
+
+def _indirect_edge(tag: str, ev) -> bool:
+    """登録・間接呼び出しの仕組みの辺か（デコレータでの登録・singledispatch・登録辞書・コールバック一覧・
+    引数に渡したクラス・operator.methodcaller・__init_subclass__ の登録）。"""
+    if tag in _INDIRECT_TAGS:
+        return True
+    if getattr(ev, "ctx", "") == "methodcaller":
+        return True
+    return getattr(ev, "kind", "") == "classdef"  # 定義時のフック（__init_subclass__ / metaclass）から
+
+
+def _exact_region(sem: Semantics, keys: list) -> set:
+    """使用のユニットへ、確実な辺（precise / 関数の中の分岐）だけで届くユニット（名前の振り分け等の推定を挟まない）。"""
+    rev, _c, _o = _rev_index(sem)
+    seen = set(keys)
+    q = deque(keys)
+    while q:
+        k = q.popleft()
+        for src, t, _ev in rev.get(k, ()):
+            if src is not None and src not in seen and t in ("precise", "branch"):
+                seen.add(src)
+                q.append(src)
+    return seen
+
+
 def _region_entries(sem: Semantics, key: tuple[str, str]) -> tuple[list, bool]:
     """互換: 1 つのユニットに届く入口の一覧。"""
     out, complete = _region_entries_multi(sem, [key])
-    return [(k, t, ev, src, d) for (k, t), (ev, src, d, _o) in out.items()], complete
+    return [(k, t, ev, src, d) for (k, t), (ev, src, d, _o, _i) in out.items()], complete
 
 
 def _instance_from_certain(sem: Semantics, key: tuple[str, str]) -> bool:
@@ -1041,20 +1073,22 @@ def build_conditions(sem: Semantics, uses: list, prefix: str) -> dict | None:
     flat: list = []
     for unit, ev, sym in uses:
         if unit.key in sem.certain and ev.cond:
-            flat.append((unit.key, "branch", ev, unit.key, 0, [(ev, sym)], unit.key))
+            flat.append((unit.key, "branch", ev, unit.key, 0, [(ev, sym)], unit.key, False))
         else:
             if unit.key not in sym_of:
                 region_keys.append(unit.key)
             sym_of.setdefault(unit.key, []).append((ev, sym))
+    exact: set = set()
     if region_keys:
+        exact = _exact_region(sem, region_keys)
         found, complete_all = _region_entries_multi(sem, region_keys)
         if not found:
             return None  # 入口を特定できない: 区別できない
-        for (k, t), (eev, src, d, orig) in found.items():
-            flat.append((k, t, eev, src, d, sym_of.get(orig, []), orig))
+        for (k, t), (eev, src, d, orig, indi) in found.items():
+            flat.append((k, t, eev, src, d, sym_of.get(orig, []), orig, indi))
             # 依存ライブラリの中の動的な getattr などから入る辺も、入口としては列挙できている（過大近似の一種）。
             # 列挙が完了しないのは、プロジェクトのコードに解決できない同名の呼び出しがある場合（下）
-    for ekey, tag, eev, caller, dist, evsyms, orig in flat:
+    for ekey, tag, eev, caller, dist, evsyms, orig, indi in flat:
         if tag == "precise":
             return None  # 確実な辺の先が確実でない（起点から外れた）: 区別できない
         because.add(tag)
@@ -1070,7 +1104,14 @@ def build_conditions(sem: Semantics, uses: list, prefix: str) -> dict | None:
             "_key": ekey,
             "_tag": tag,
             "_dist": dist,
+            "_caller": caller,
+            "_exact": False,
+            "indirect": False,
         })
+        if tag == "branch" or ekey in exact:
+            g["_exact"] = True
+        if indi:
+            g["indirect"] = True
         g["_dist"] = min(g["_dist"], dist)
         if "public_api" not in g:
             api, route = _public_route(sem, caller)
@@ -1100,9 +1141,31 @@ def build_conditions(sem: Semantics, uses: list, prefix: str) -> dict | None:
         groups[("#inner", prefix)] = merged
     all_project_zero = True
     unresolved_project = False
+    low_reasons: list[str] = []
     for g in groups.values():
         ekey, tag = g.pop("_key"), g.pop("_tag")
         g["distance_to_use"] = g.pop("_dist")
+        g["_tag2"] = tag
+        if tag == "branch" and ekey in sem.certain:
+            # 入口の関数は確実に実行される（プロジェクトがそこへ至る関数を呼んでいる）: 入力次第で届く
+            all_project_zero = False
+            api = g.get("public_api") or g["entry"]
+            g["project_calls_entry"] = True
+            low_reasons.append(f"プロジェクトが `{api}` を呼んでいます。入力によってはここから {prefix} に届きます"
+                               f"（{g['entry']} の中の分岐）")
+        caller = g.pop("_caller", None)
+        exact_entry = g.pop("_exact", False)
+        loc = sem.program.local_modules
+        if tag != "branch" and exact_entry and caller is not None and (
+                caller[0] in loc or (sem.precise_parent.get(caller) or ("",))[0] in loc):
+            # 入口へ入る呼び出しのある関数を、プロジェクトが直接呼んでいる（MDF.append() の中の self._mdf.append 等）
+            all_project_zero = False
+            g["project_calls_entry"] = True
+            low_reasons.append(f"プロジェクトが `{_api_name(sem, caller)}` を呼んでいます。入力によってはここから "
+                               f"{g['entry']} を経て {prefix} に届きます")
+        if g.get("indirect"):
+            low_reasons.append(f"{g['entry']} から {prefix} への経路に、登録・間接呼び出しの仕組み（デコレータでの登録 / "
+                               "singledispatch / 登録辞書・コールバック一覧 / methodcaller / __init_subclass__ 等）があります")
         if g.get("inner_entries"):
             hits, loose = _inner_project_uses(sem, prefix)
         else:
@@ -1114,8 +1177,11 @@ def build_conditions(sem: Semantics, uses: list, prefix: str) -> dict | None:
         if hits:
             all_project_zero = False
             g["project_note"] = f"プロジェクトのコードがこの入口を {len(hits)} か所で使っています（解決した参照）"
+            low_reasons.append(f"プロジェクトが `{g['entry']}` を呼んでいます（{hits[0]}）")
         elif loose:
             unresolved_project = True
+            low_reasons.append(f"プロジェクトに受け手の分からない `{name if not g.get('inner_entries') else ''}` の呼び出しがあります"
+                               f"（{loose[0]}）。名前の一致で {g['entry']} に届きえます")
             g["project_note"] = (f"プロジェクトのコードに、受け手の分からない同名の呼び出しが {len(loose)} か所あります"
                                  "（解決できない呼び出し: 列挙は完了していません）")
         else:
@@ -1133,7 +1199,15 @@ def build_conditions(sem: Semantics, uses: list, prefix: str) -> dict | None:
             g["distance_to_use"], -len(g["uses"]), g["entry"]))
     total = len(conds)
     complete = complete_all and not unresolved_project
-    confidence = "high" if (complete and all_project_zero and total > 0) else "low"
+    indirect_any = any(g.get("indirect") for g in conds)
+    for g in conds:
+        g.pop("_tag2", None)
+    confidence = "high" if (complete and all_project_zero and not indirect_any and total > 0) else "low"
+    reason = ""
+    if confidence == "low":
+        reason = low_reasons[0] if low_reasons else "入口の列挙が完了していません"
+        if len(low_reasons) > 1:
+            reason += f"（ほか {len(low_reasons) - 1} 件）"
     shown = conds[:MAX_CONDITIONS]
     for g in shown:
         if g["may_be_swallowed"]:
@@ -1141,7 +1215,7 @@ def build_conditions(sem: Semantics, uses: list, prefix: str) -> dict | None:
                          "MCP_PYSTUB_STRICT=0 のときはスタブの例外が握りつぶされることがあります（既定では終了コード 70 で止まります）")
     summary = ", ".join(g["entry"] for g in shown[:3]) + (f" ほか {total - 3} 件" if total > 3 else "")
     return {"conditions": shown, "total": total, "because": sorted(_TAG_TEXT.get(t, t) for t in because),
-            "summary": summary, "confidence": confidence, "complete": complete}
+            "summary": summary, "confidence": confidence, "complete": complete, "confidence_reason": reason}
 
 
 def _inner_project_uses(sem: Semantics, prefix: str) -> tuple[list[str], list[str]]:
@@ -1171,8 +1245,13 @@ def _local_index(sem: Semantics):
                     for rr in ev.ref.all_refs():
                         if rr.kind in ("function", "method", "class"):
                             by_target.setdefault((rr.module, rr.target), []).append(where)
-                elif ev.kind in ("method", "attr") and ev.ctx != "self":
-                    by_name.setdefault(ev.name, []).append(where)  # 受け手が分からない呼び出し
+                        elif rr.kind in ("derived", "unknown") and rr.chain and ev.ctx in ("call", "decorator"):
+                            # plug.make().run のような、受け手の分からない属性の呼び出し
+                            last = rr.chain[-1]
+                            if last not in ("()", "[]"):
+                                by_name.setdefault(last, []).append(where)
+                elif ev.kind == "method" and ev.ctx != "self":
+                    by_name.setdefault(ev.name, []).append(where)  # 受け手が分からない呼び出し（属性の読み出しは数えない）
         idx = (by_target, by_name)
         sem.__dict__["_local_ref_index"] = idx
     return idx

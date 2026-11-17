@@ -172,7 +172,9 @@ from mcp_pystub.verifier import verify  # noqa: E402
 from tests.test_conditional import Case, _run  # noqa: E402
 
 SIG4 = {
-    "gx/__init__.py": "def draw(v):\n    return 'drawn %s' % v\nLEVEL = int('3')\nTABLE = dict(a=1)\n",
+    "gx/__init__.py": "import enum\ndef draw(v):\n    return 'drawn %s' % v\nLEVEL = int('3')\nTABLE = dict(a=1)\n"
+                      "class R:\n    BACKEND = str(1)\n    def run(self):\n        return 1\n"
+                      "class Color(enum.Enum):\n    RED = 1\n",
     "gx/extra/__init__.py": "def more():\n    return 1\n",
     "gx/extra/deep.py": "X = 1\n",
     "sig/__init__.py": "class Signal:\n    def __init__(self, v):\n        self.v = v\n    def value(self):\n        return self.v\n"
@@ -215,12 +217,22 @@ def test_no_whole_and_submodule_proposal_together(tmp_path):
           "pk/io/x.py": "def g():\n    import cx\n    return cx.native()\n"}
     res = _analyze(tmp_path, sp, "import pk, pk.io.x\nprint('ok')\n")
     whole = {p["package_name"] for p in res["stubbable"]} | {p["package_name"] for p in res["conditional"]}
+    assert "pk" in whole, res  # 全体の候補が実際に出る事例で確かめる（空の検査にしない）
+    assert any("重なるため出さなかったサブモジュールのヒント" in w and "pk.io" in w for w in res["warnings"]), res["warnings"]
     for h in res["submodule_stub_hints"] + res["conditional_submodule_hints"]:
         assert not any(h["submodule"] == w or h["submodule"].startswith(w + ".") for w in whole), (h, whole)
 
 
 def test_conditional_hints_have_conditions(tmp_path):
-    res = _analyze(tmp_path, SIG4, MAIN4)
+    """条件付きのサブモジュールのヒントには必ず条件がある（ヒントが実際に出る事例で確かめる）"""
+    sp = {
+        "cx/__init__.py": "def native():\n    return 'native'\n", f"cx/_core{EXT}": b"fake",
+        "book/__init__.py": "from .reader import load\n",
+        "book/image.py": "try:\n    import cx\nexcept ImportError:\n    cx = False\nclass Image:\n    def __init__(self, data):\n        self.data = cx.native() + data\n",
+        "book/reader.py": "from book.image import Image, cx\ndef load(parts):\n    out = []\n    if not cx:\n        return out\n    for p in parts:\n        if p.startswith('img:'):\n            out.append(Image(p).data)\n        else:\n            out.append(p)\n    return out\n",
+    }
+    res = _analyze(tmp_path, sp, "import book\nprint('ok', book.load(['a']))\n")
+    assert res["conditional_submodule_hints"], res
     for h in res["conditional_submodule_hints"]:
         assert h["conditions"], h
 
@@ -234,10 +246,18 @@ def test_conditional_stub_stops_on_any_operation(tmp_path):
     rc0, out0 = _run(c.proj, c.sp, c.proj / "main.py")
     assert (rc, out) == (rc0, out0)
     for expr in ("[x for x in gx.LEVEL]", "gx.LEVEL > 0", "'%s' % (gx.LEVEL,)", "gx.TABLE['a']", "bool(gx.LEVEL)",
-                 "str(gx.LEVEL)", "gx.LEVEL + 1", "len(gx.TABLE)", "gx.TABLE.keys()", "f'{gx.LEVEL}'"):
+                 "str(gx.LEVEL)", "gx.LEVEL + 1", "len(gx.TABLE)", "gx.TABLE.keys()", "f'{gx.LEVEL}'",
+                 # クラスの属性（元が値）: 読んだ値のどの操作でも止まる（第 5 回 E01〜E03）
+                 "'%s' % (gx.R.BACKEND,)", "gx.R.BACKEND == '1'", "bool(gx.R.BACKEND)", "str(gx.R.BACKEND)",
+                 # 普通でないクラス（Enum）: str / 反復も止まる（E05）
+                 "str(gx.Color)", "list(gx.Color)"):
         (c.proj / "op.py").write_text(f"import gx\nprint('r', {expr})\n", encoding="utf-8")
         rc, out = _run(c.proj, site, c.proj / "op.py")
         assert rc == 70 and "PystubConditionalStubError" in out, (expr, rc, out)
+    # スタブのクラスそのもの: ==・hash・真偽・repr は type の既定どおり（元と同じ）
+    (c.proj / "same.py").write_text("import gx\nprint(repr(gx.R), gx.R == gx.R, bool(gx.R), hash(gx.R) == hash(gx.R),"
+                                    " hasattr(gx.R, 'BACKEND'))\n", encoding="utf-8")
+    assert _run(c.proj, site, c.proj / "same.py") == _run(c.proj, c.sp, c.proj / "same.py")
 
 
 def test_conditional_stub_has_all_submodules(tmp_path):
@@ -271,6 +291,8 @@ def test_verify_does_not_blame_unrelated_item_for_silent_output_change(tmp_path)
                run_entry=True)
     assert "hv2" in r["passed"]["packages"], r
     assert "hv1" not in r["passed"]["packages"], r
+    rej = [x for x in r["rejected"] if x["item"] == "hv1"]
+    assert rej and "出力が変わった" in rej[0]["reason"], r["rejected"]
 
 
 def test_verify_same_submodule_two_targets_and_entry_note(tmp_path):
@@ -284,3 +306,18 @@ def test_verify_same_submodule_two_targets_and_entry_note(tmp_path):
                nofollow=[], run_entry=False)
     assert set(r["passed"]["submodules"]) == {"pk.gui=>cx", "pk.gui=>cy"}, r
     assert "run_entry=False" in r["entry_note"]
+
+
+def test_stop_without_stderr_writes_log(tmp_path):
+    """標準エラーが無い（窓のない exe）時は pystub_stop.log に原因を書いて 70 で止まる"""
+    c = Case(tmp_path, SIG4, MAIN4, "import gx\nprint(gx.draw(1))\n")
+    site = c.apply(packages=["gx"])
+    work = tmp_path / "w"
+    work.mkdir()
+    script = work / "run.py"
+    script.write_text("import sys\nsys.path[:0] = %r\nsys.stderr = None\nimport gx\ngx.draw(1)\n"
+                      % [str(c.proj), str(site)], encoding="utf-8")
+    r = subprocess.run([sys.executable, "-S", str(script)], cwd=str(work), capture_output=True)
+    assert r.returncode == 70
+    log = work / "pystub_stop.log"
+    assert log.exists() and "PystubConditionalStubError" in log.read_text(encoding="utf-8")
