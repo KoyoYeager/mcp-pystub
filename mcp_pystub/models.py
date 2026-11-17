@@ -95,6 +95,9 @@ class SubmoduleStubHint:
     imported_symbols: list[str] = field(default_factory=list)  # 親が re-export するシンボル
     estimated_savings_mb: float = 0.0
     reason: str = ""
+    conditional: bool = False  # 条件付き（安全を示せない。conditions の機能を使わない前提）
+    conditions: list[dict] = field(default_factory=list)
+    conditions_total: int = 0
 
 
 @dataclass
@@ -102,7 +105,7 @@ class PackageAnalysis:
     """単一パッケージの分析結果"""
 
     package_name: str = ""
-    verdict: str = "required"  # "stubbable" | "nofollow" | "required"
+    verdict: str = "required"  # "stubbable" | "nofollow" | "conditional" | "required"
     reason: str = ""
     is_directly_imported: bool = False
     is_transitively_imported: bool = False
@@ -112,6 +115,11 @@ class PackageAnalysis:
     estimated_size_mb: float = 0.0
     submodule_stubs: list[SubmoduleStubHint] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+    # conditional のとき: 「これを使うと壊れる」入口（仕様 9 節）
+    conditions: list[dict] = field(default_factory=list)
+    conditions_total: int = 0
+    unproven_because: list[str] = field(default_factory=list)
+    conditional_submodule_stubs: list[SubmoduleStubHint] = field(default_factory=list)
 
 
 @dataclass

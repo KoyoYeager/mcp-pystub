@@ -18,6 +18,7 @@ def analyze(
     entry_point: str,
     python_path: str = "",
     max_depth: int = 10,
+    include_small_conditional: bool = False,
 ) -> dict:
     """プロジェクトのエントリーポイントから import グラフを解析し、
     スタブ置換可能なパッケージを自動検出します。
@@ -26,6 +27,11 @@ def analyze(
     - stubbable: スタブ化可能（プロジェクトの実行パスで未使用）
     - nofollow: try/except 保護あり（--nofollow-import-to で除外推奨）
     - required: スタブ化不可（実際に使用されている）
+
+    stubbable / nofollow / submodule_stub_hints は「全ての実行で元と同じ」と示せたものだけです。
+    別のキー conditional / conditional_submodule_hints は「安全は示せないが、列挙した機能を使わないなら
+    外せる」候補で、条件（壊れる入口）と確認方法（verify の呼び出し）が付きます。
+    include_small_conditional=True で 1 MB 未満の条件付き候補も出します。
 
     Args:
         entry_point: プロジェクトのエントリーポイントファイルパス
@@ -36,7 +42,7 @@ def analyze(
         stubbable / nofollow / required に分類されたパッケージ一覧
     """
     from mcp_pystub.analyzer import analyze as _analyze
-    return _analyze(entry_point, python_path, max_depth)
+    return _analyze(entry_point, python_path, max_depth, include_small_conditional)
 
 
 @mcp.tool()

@@ -44,6 +44,25 @@ def _g(n):
     return _M(n, (), {{"_pystub_known": ()}})
 """
 
+# 条件付き候補のスタブ: 呼ばれたら「mcp-pystub のスタブ」と分かる例外で落ちる
+_LOUD_HEADER = """# mcp-pystub stub (conditional): {module}
+class PystubConditionalStubError(RuntimeError):
+    pass
+_PYSTUB_NOTE = {note!r}
+def _raise(n):
+    raise PystubConditionalStubError("mcp-pystub のスタブです。" + _PYSTUB_NOTE + "（呼ばれたもの: " + n + "）")
+class _M(type):
+    def __getattr__(c, n):
+        k = c.__dict__.get("_pystub_known")
+        if n[:2] != "__" and (k is None or n in k):
+            return _M(n, (), {{"_pystub_known": ()}})
+        raise AttributeError(n)
+    def __call__(c, *a, **k): _raise(c.__name__)
+    __getitem__ = lambda c, i: c
+def _g(n):
+    return _M(n, (), {{"_pystub_known": ()}})
+"""
+
 _NET_KNOWN = """_PYSTUB_KNOWN = {known}
 def __getattr__(n):
     if n in _PYSTUB_KNOWN and n[:2] != "__":
@@ -149,11 +168,12 @@ def collect_accesses(sem: Semantics, prefix: str, exclude: tuple[str, ...] = ())
 
 
 class _StubBuilder:
-    def __init__(self, sem: Semantics, prefix: str, version: str | None) -> None:
+    def __init__(self, sem: Semantics, prefix: str, version: str | None, loud_note: str = "") -> None:
         self.sem = sem
         self.p: Program = sem.program
         self.prefix = prefix
         self.version = version
+        self.loud_note = loud_note  # 条件付き候補: 呼ばれたら出す説明
         self.modules: dict[str, ModuleAccess] = {}
 
     def need(self, module: str, name: str | None = None, sub: tuple[str, ...] = ()) -> None:
@@ -249,7 +269,8 @@ class _StubBuilder:
             defs.append(f"__version__ = {self.version!r}\n")
         known = self._known_names(info)
         net = _NET_ALL if known is None else _NET_KNOWN.format(known=repr(frozenset(sorted(known))))
-        header = _HEADER.format(module=module)
+        header = _LOUD_HEADER.format(module=module, note=self.loud_note) if self.loud_note else \
+            _HEADER.format(module=module)
         return "\n".join([header, net] + defs + tail)
 
     def _public_names(self, module: str) -> list[str]:
@@ -285,7 +306,7 @@ class _StubBuilder:
             if kinds == {"class"} and len({(x.module, x.target) for x in leaves}) == 1:
                 r = leaves[0]
             elif kinds == {"function"}:
-                defs.append(f"def {name}(*a, **k): raise RuntimeError({(module + '.' + name)!r})\n")
+                defs.append(self._func_stub(name, module + "." + name))
                 return
             else:
                 defs.append(f"{name} = _g({name!r})\n")
@@ -346,7 +367,7 @@ class _StubBuilder:
             defs.append(self._class_code(name, r, subs))
             return
         if kind in ("function", "method"):
-            defs.append(f"def {name}(*a, **k): raise RuntimeError({(module + '.' + name)!r})\n")
+            defs.append(self._func_stub(name, module + "." + name))
             return
         if kind in ("const", "classconst"):
             lit = self._const_source(r)
@@ -354,6 +375,11 @@ class _StubBuilder:
                 defs.append(f"{name} = {lit}\n")
                 return
         defs.append(f"{name} = _g({name!r})\n")
+
+    def _func_stub(self, name: str, qual: str) -> str:
+        if self.loud_note:
+            return f"def {name}(*a, **k): _raise({qual!r})\n"
+        return f"def {name}(*a, **k): raise RuntimeError({qual!r})\n"
 
     # --- クラス ---
 
@@ -423,7 +449,10 @@ class _StubBuilder:
                     body.append(f"    {attr} = {lit}")
                     continue
             if ar.kind in ("method", "function"):
-                body.append(f"    @staticmethod\n    def {attr}(*a, **k): raise RuntimeError({(name + '.' + attr)!r})")
+                if self.loud_note:
+                    body.append(f"    @staticmethod\n    def {attr}(*a, **k): _raise({(name + '.' + attr)!r})")
+                else:
+                    body.append(f"    @staticmethod\n    def {attr}(*a, **k): raise RuntimeError({(name + '.' + attr)!r})")
         inner = "\n".join(dict.fromkeys(body))
         base_s = ", ".join(bases + ["metaclass=_M"])
         return f"class {name}({base_s}):\n{inner}\n"
@@ -657,7 +686,8 @@ def generate_stubs(
     # 外から参照されないモジュール（P 内部からだけ import されるもの）は、
     # P 自体がスタブになれば読み込まれないので生成しない
     extra: list[str] = []
-    builder = _StubBuilder(sem, package_name, version)
+    note, conditional_info = _conditional_note(graph, sem, package_name, is_package=True)
+    builder = _StubBuilder(sem, package_name, version, loud_note=note)
     if main.is_file() and not is_extension_file(main) and "." not in package_name:
         # 単一ファイルモジュール
         code_by_mod = builder.build(accesses, [])
@@ -706,7 +736,33 @@ def generate_stubs(
         "stub_total_bytes": stub_size,
         "build_instructions": build_instructions,
         "warnings": warnings,
+        "conditional": bool(conditional_info),
+        "conditions": (conditional_info or {}).get("conditions", []),
     }
+
+
+def _conditional_note(graph, sem: Semantics, prefix: str, is_package: bool) -> tuple[str, dict | None]:
+    """条件付き候補なら、スタブが落ちる時に出す説明（「<prefix> は <条件> を使わない前提」）。"""
+    from mcp_pystub.usage_analyzer import analyze_packages, build_conditions, is_certain_use
+
+    info = None
+    if is_package:
+        a = analyze_packages(graph, {prefix})
+        if a and a[0].verdict == "conditional":
+            info = {"conditions": a[0].conditions, "total": a[0].conditions_total}
+    else:
+        uses = prefix_usage(sem, prefix).uses
+        if uses and not any(is_certain_use(sem, u, ev) for u, ev, _ in uses):
+            info = build_conditions(sem, uses, prefix)
+    if not info:
+        return "", None
+    ents = []
+    for g in info["conditions"][:3]:
+        api = g.get("public_api") or ""
+        ents.append((api + " → " if api and api != g["entry"] else "") + g["entry"])
+    more = f" ほか {info['total'] - 3} 件" if info["total"] > 3 else ""
+    note = f"{prefix} は、次の機能を使わない前提で外されています: " + "、".join(ents) + more
+    return note, info
 
 
 def _usage_warnings(sem: Semantics, prefix: str) -> list[str]:
@@ -926,7 +982,8 @@ def generate_submodule_stubs(
     sem = get_semantics(graph)
     accesses = collect_accesses(sem, submodule)
     extra: list[str] = []
-    builder = _StubBuilder(sem, submodule, None)
+    note, conditional_info = _conditional_note(graph, sem, submodule, is_package=False)
+    builder = _StubBuilder(sem, submodule, None, loud_note=note)
     code_by_mod = builder.build(accesses, extra)
     files: dict[str, str] = {}
     for m, c in code_by_mod.items():
@@ -987,4 +1044,6 @@ def generate_submodule_stubs(
         "symbols_exported": symbols_to_export,
         "build_instructions": build_instructions,
         "warnings": _usage_warnings(sem, submodule),
+        "conditional": bool(conditional_info),
+        "conditions": (conditional_info or {}).get("conditions", []),
     }

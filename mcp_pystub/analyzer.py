@@ -21,6 +21,7 @@ def analyze(
     entry_point: str,
     python_path: str = "",
     max_depth: int = 10,
+    include_small_conditional: bool = False,
 ) -> dict:
     """プロジェクトを解析し、スタブ可能性を判定する。
 
@@ -96,6 +97,36 @@ def analyze(
         for hint in pkg.submodule_stubs:
             all_hints = all_hints + [asdict(hint)]
     result_dict["submodule_stub_hints"] = all_hints
+
+    # 条件付き候補（仕様 9 節）: stubbable には混ぜない。削減量の大きい順、1 MB 未満は既定で省く
+    min_mb = 0.0 if include_small_conditional else 1.0
+    py_arg = f", python_path={python_path!r}" if python_path else ""
+    conditional = []
+    omitted = 0
+    for a in sorted((a for a in analyses if a.verdict == "conditional"), key=lambda a: -a.estimated_size_mb):
+        if a.estimated_size_mb < min_mb:
+            omitted += 1
+            continue
+        d = asdict(a)
+        d["estimated_savings_mb"] = round(a.estimated_size_mb, 1)
+        d["how_to_check"] = (f"verify({str(entry)!r}{py_arg}, packages=[{a.package_name!r}], submodules=[], "
+                             f"nofollow=[], run_entry=True)")
+        conditional.append(d)
+    chints = []
+    for a in required:
+        for h in a.conditional_submodule_stubs:
+            h.estimated_savings_mb = round(a.estimated_size_mb, 1)
+            if h.estimated_savings_mb < min_mb:
+                omitted += 1
+                continue
+            d = asdict(h)
+            d["how_to_check"] = (f"verify({str(entry)!r}{py_arg}, packages=[], "
+                                 f"submodules=[{(h.submodule + '=>' + h.target_package)!r}], nofollow=[], run_entry=True)")
+            chints.append(d)
+    chints.sort(key=lambda d: -d["estimated_savings_mb"])
+    result_dict["conditional"] = conditional
+    result_dict["conditional_submodule_hints"] = chints
+    result_dict["conditional_omitted_small"] = omitted
     result_dict["verify_status"] = "未実施"
     result_dict["next_steps"] = [
         "この結果は静的解析による候補です（実行の保証ではありません）。",

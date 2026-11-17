@@ -82,6 +82,7 @@ class Binding:
     node: ast.AST | None = None
     qualname: str = ""
     conditional: bool = False
+    fallback: bool = False  # `except ImportError:` の中の束縛（元の環境では import が成功するので実行されない）
 
 
 @dataclass
@@ -138,6 +139,7 @@ class Ref:
     target: str = ""  # function/method/class の qualname（module 内）
     marks: tuple[tuple[int, tuple[str, ...]], ...] = ()
     alts: tuple["Ref", ...] = ()
+    fallback: bool = False  # except ImportError の代替の束縛から来た
 
     def all_refs(self):
         yield self
@@ -199,6 +201,8 @@ class Event:
     protect_ok: bool = False  # 保護が「単純」（try 本体が import だけ・except が pass か None 代入だけ）
     guard: str = ""  # `if 'X' not in sys.modules: return` の後なら X
     target: str = ""  # classdef / family: クラス qualname
+    cond: bool = False  # 関数の中の if / except / 条件式の枝（入力・呼び出し次第で実行される）
+    broad: bool = False  # `except Exception` / `except:` で囲まれている（例外が握りつぶされうる）
 
 
 @dataclass
@@ -535,10 +539,18 @@ class Program:
                 self._collect_bindings(info, stmt.orelse, out, qual_prefix, is_module, True)
             elif isinstance(stmt, (ast.Try, getattr(ast, "TryStar", ast.Try))):
                 self._collect_bindings(info, stmt.body, out, qual_prefix, is_module, True)
+                import_fallback = handlers_catch_import_error(stmt.handlers) and all(
+                    isinstance(s, (ast.Import, ast.ImportFrom, ast.Pass)) for s in stmt.body
+                )
                 for h in stmt.handlers:
                     if h.name:
                         self._add(out, h.name, Binding("unknown", conditional=True))
+                    before = {k: len(v) for k, v in out.items()}
                     self._collect_bindings(info, h.body, out, qual_prefix, is_module, True)
+                    if import_fallback:
+                        for k, v in out.items():
+                            for b in v[before.get(k, 0):]:
+                                b.fallback = True
                 self._collect_bindings(info, stmt.orelse, out, qual_prefix, is_module, True)
                 self._collect_bindings(info, stmt.finalbody, out, qual_prefix, is_module, True)
             elif isinstance(stmt, (ast.With, ast.AsyncWith, ast.For, ast.AsyncFor, ast.While)):
@@ -782,7 +794,11 @@ class Program:
             return Ref("missing", mod, chain, trace)
         if len(blist) == 1:
             return self._resolve_binding(info, head, blist, blist[0], rest, trace, depth)
-        alts = tuple(self._resolve_binding(info, head, blist, b, rest, trace, depth) for b in blist)
+        alts = tuple(
+            replace(self._resolve_binding(info, head, blist, b, rest, trace, depth), fallback=True) if b.fallback
+            else self._resolve_binding(info, head, blist, b, rest, trace, depth)
+            for b in blist
+        )
         # 同じ定義（def / class）への複数束縛でも、どれが実行されるかは決めない
         return Ref("multi", mod, chain, trace, alts=alts)
 
@@ -1031,6 +1047,8 @@ class _UnitWalker:
         self.info = info
         self.guard = ""
         self.unit: Unit | None = None
+        self.branch = 0  # 関数の中の分岐の深さ
+        self.broad = 0  # 広い except の try 本体の深さ
 
     # --- 入口 ---
 
@@ -1168,6 +1186,10 @@ class _UnitWalker:
     def _ev(self, ev: Event) -> None:
         if self.guard and not ev.guard:
             ev.guard = self.guard
+        if self.branch and self.unit is not None and self.unit.qualname != "<module>":
+            ev.cond = True
+        if self.broad:
+            ev.broad = True
         assert self.unit is not None
         self.unit.events.append(ev)
 
@@ -1261,14 +1283,16 @@ class _UnitWalker:
             if stmt.value is not None:
                 ev(stmt.value, "return", sc)
         elif isinstance(stmt, ast.If):
-            ev(stmt.test, "operand", sc)
+            ev(stmt.test, "truth", sc)
             if is_type_checking_test(stmt.test):
                 self._walk_body(stmt.orelse, scope, cls_scope, protected, protect_ok)
                 return
+            self.branch += 1
             self._walk_body(stmt.body, scope, cls_scope, protected, protect_ok)
             self._walk_body(stmt.orelse, scope, cls_scope, protected, protect_ok)
+            self.branch -= 1
         elif isinstance(stmt, ast.While):
-            ev(stmt.test, "operand", sc)
+            ev(stmt.test, "truth", sc)
             self._walk_body(stmt.body, scope, cls_scope, protected, protect_ok)
             self._walk_body(stmt.orelse, scope, cls_scope, protected, protect_ok)
         elif isinstance(stmt, (ast.For, ast.AsyncFor)):
@@ -1283,12 +1307,22 @@ class _UnitWalker:
         elif isinstance(stmt, (ast.Try, getattr(ast, "TryStar", ast.Try))):
             prot = handlers_catch_import_error(stmt.handlers)  # type: ignore[arg-type]
             simple = prot and self._simple_protection(stmt)
+            broad_h = any(
+                h.type is None or (isinstance(h.type, ast.Name) and h.type.id in ("Exception", "BaseException"))
+                or (isinstance(h.type, ast.Tuple) and any(isinstance(x, ast.Name) and x.id in ("Exception", "BaseException")
+                                                           for x in h.type.elts))
+                for h in stmt.handlers
+            )
+            self.broad += 1 if broad_h else 0
             self._walk_body(stmt.body, scope, cls_scope, protected or prot, (protect_ok or not protected) and simple
                             if prot else protect_ok)
+            self.broad -= 1 if broad_h else 0
             for h in stmt.handlers:
                 if h.type is not None:
                     ev(h.type, "except", sc)
+                self.branch += 1
                 self._walk_body(h.body, scope, cls_scope, protected, protect_ok)
+                self.branch -= 1
             self._walk_body(stmt.orelse, scope, cls_scope, protected, protect_ok)
             self._walk_body(stmt.finalbody, scope, cls_scope, protected, protect_ok)
         elif isinstance(stmt, ast.Raise):
@@ -1316,7 +1350,9 @@ class _UnitWalker:
                         ev(n.value, "eq", sc)
                 if case.guard is not None:
                     ev(case.guard, "operand", sc)
+                self.branch += 1
                 self._walk_body(case.body, scope, cls_scope, protected, protect_ok)
+                self.branch -= 1
         # Pass / Break / Continue / Global / Nonlocal: 何もしない
 
     @staticmethod
@@ -1427,7 +1463,9 @@ class _UnitWalker:
                 # 受け手が解決できない属性: 同名のメソッド・property を名前で到達させる
                 if not self._receiver_is_builtin(e.value, sc):
                     kind = "method" if ctx in ("call", "decorator", "arg", "store", "return") else "attr"
-                    self._ev(Event(kind, name=e.attr, lineno=e.lineno))
+                    on_self = isinstance(e.value, ast.Name) and e.value.id in ("self", "cls") and \
+                        self.unit is not None and bool(self.unit.cls)
+                    self._ev(Event(kind, name=e.attr, lineno=e.lineno, ctx="self" if on_self else ""))
                 ev(e.value, "read", sc)
             return
         if isinstance(e, ast.Call):
@@ -1497,10 +1535,23 @@ class _UnitWalker:
             ev(e.value, "store", sc)
             return
         if isinstance(e, ast.IfExp):
-            ev(e.test, "operand", sc)
+            ev(e.test, "truth", sc)
             inner = ctx if ctx in ("isinst", "except", "annot") else "store"
+            self.branch += 1
             ev(e.body, inner, sc)
             ev(e.orelse, inner, sc)
+            self.branch -= 1
+            return
+        if isinstance(e, ast.BoolOp):
+            inner = "truth" if ctx == "truth" else "operand"
+            ev(e.values[0], inner, sc)
+            self.branch += 1  # 2 番目以降は短絡評価で実行されないことがある
+            for x in e.values[1:]:
+                ev(x, inner, sc)
+            self.branch -= 1
+            return
+        if isinstance(e, ast.UnaryOp) and isinstance(e.op, ast.Not):
+            ev(e.operand, "truth", sc)
             return
         if isinstance(e, (ast.Await, ast.Yield, ast.YieldFrom)):
             ev(e.value, "return", sc)
@@ -1643,7 +1694,11 @@ class _UnitWalker:
             if gexpr is None and fname.endswith("iter_entry_points") and e.args:
                 gexpr = e.args[0]
             groups = self._string_values(gexpr) if gexpr is not None else None
-            if groups is None:
+            param = self._unreassigned_param(gexpr) if (groups is None and gexpr is not None) else None
+            if param is not None and self.unit is not None:
+                self._ev(Event("dynamic_param", name=self.unit.qualname, lineno=e.lineno, ctx="entry_points",
+                               target=f"{param[0]}:{param[1]}"))
+            elif groups is None:
                 self._ev(Event("entry_points", name="", lineno=e.lineno))
             else:
                 for grp in sorted(groups):
@@ -1817,6 +1872,10 @@ class Reachability:
     entry_point_calls: set[tuple[str, str]] = field(default_factory=set)  # (呼び出し元モジュール, 対象モジュール)  # 'X' in sys.modules / find_spec("X") の X
     build_roots: list[str] = field(default_factory=list)
     why: dict[tuple[str, str], tuple] = field(default_factory=dict)
+    # 到達の辺: (呼び出し元, 到達先, 印, 辺を作ったイベント)。印は precise か、過大近似の種類
+    # （name: 名前だけの振り分け / argclass: 引数に渡したクラス / decorator: 登録デコレータ / branch: 入力次第の分岐）
+    edges: list[tuple] = field(default_factory=list)
+    roots: list[tuple[str, str]] = field(default_factory=list)
     # モジュール → そのモジュールの到達コードが import するモジュール
     module_imports: dict[str, set[str]] = field(default_factory=dict)
 
@@ -1938,12 +1997,23 @@ def compute_reachability(
     current: list = [(None, "entry")]
     pending_guard: dict[str, list[tuple[Unit, Event]]] = {}
 
+    tag = ["precise"]
+    edge_seen: set = set()
+
     def reach(key: tuple[str, str], reason: str = "") -> None:
         if key in st.reached:
+            src = current[0][0]
+            ek = (src, key, tag[0])
+            if ek not in edge_seen:
+                edge_seen.add(ek)
+                st.edges.append((src, key, tag[0], current[0][1]))
             return
         if key not in program.units:
             if key[1] == "<module>" or program.function_unit(*key) is None:
                 return
+        src = current[0][0]
+        edge_seen.add((src, key, tag[0]))
+        st.edges.append((src, key, tag[0], current[0][1]))
         st.reached.add(key)
         st.why[key] = (current[0][0], reason or current[0][1])
         work.append(key)
@@ -1996,20 +2066,25 @@ def compute_reachability(
         mro_cache[key] = frozenset(out)
         return mro_cache[key]
 
+    inst_tags: set = set()
+
     def instantiate(module: str, qual: str) -> None:
         stack = [(module, qual)]
         while stack:
             module_, qual_ = stack.pop()
             key = (module_, qual_)
-            if key in st.instantiated:
+            if (key, tag[0]) in inst_tags:
                 continue
+            inst_tags.add((key, tag[0]))
+            first = key not in st.instantiated
             st.instantiated.add(key)
             ci = class_info(module_, qual_)
             if ci is None:
                 continue
-            for mname, quals in ci.methods.items():
-                for uq in quals:
-                    methods_by_name.setdefault(mname, []).append((module_, uq))
+            if first:
+                for mname, quals in ci.methods.items():
+                    for uq in quals:
+                        methods_by_name.setdefault(mname, []).append((module_, uq))
             info = program.get(module_)
             hooks = framework_hook_names(program, ci) if info is not None else frozenset()
             dyn_prefixes = [pfx for (m, pfx) in st.dynamic_modules if m == module_]
@@ -2021,13 +2096,18 @@ def compute_reachability(
                     all_methods
                     or (mname.startswith("__") and mname.endswith("__"))
                     or mname in ci.properties
-                    or mname in st.called_names
-                    or (mname in st.attr_names)
                     or (hooks is not None and mname in hooks)
                     or any(mname.startswith(pfx) for pfx in dyn_prefixes)
                 ):
                     for uq in quals:
                         reach((module_, uq), f"method {mname}")
+                elif mname in st.called_names or mname in st.attr_names:
+                    # 以前に名前だけで呼ばれた: 名前による振り分け
+                    saved = tag[0]
+                    tag[0] = "name" if saved == "precise" else saved
+                    for uq in quals:
+                        reach((module_, uq), f"name {mname}")
+                    tag[0] = saved
             if info is not None:
                 for b in ci.bases:
                     r = program.ref_of_expr(info, _unwrap_base(b), None)
@@ -2036,11 +2116,15 @@ def compute_reachability(
                             load_module(rr.module)
                             stack.append((rr.module, rr.target))
 
+    seen_name_tags: set = set()
+
     def on_method_name(name: str, attr_only: bool) -> None:
         target = st.attr_names if attr_only else st.called_names
-        if name in target:
+        nt = (name, attr_only, tag[0])
+        if name in target and nt in seen_name_tags:
             return
         target.add(name)
+        seen_name_tags.add(nt)
         for key in methods_by_name.get(name, ()):
             reach(key, f"name {name}")
 
@@ -2085,6 +2169,14 @@ def compute_reachability(
                 load_module(m)
 
     def handle(unit: Unit, ev: Event) -> None:
+        saved = tag[0]
+        tag[0] = "branch" if ev.cond else "precise"
+        try:
+            _handle(unit, ev)
+        finally:
+            tag[0] = saved
+
+    def _handle(unit: Unit, ev: Event) -> None:
         if ev.guard and ev.guard not in {m.split(".")[0] for m in st.loaded_modules}:
             pending_guard.setdefault(ev.guard, []).append((unit, ev))
             return
@@ -2105,9 +2197,13 @@ def compute_reachability(
                             load_module(sub)
             return
         if ev.kind == "method":
+            if ev.ctx != "self":
+                tag[0] = "name"  # 受け手が分からない: 名前だけの振り分け
             on_method_name(ev.name, attr_only=False)
             return
         if ev.kind == "attr":
+            if ev.ctx != "self":
+                tag[0] = "name"
             on_method_name(ev.name, attr_only=True)
             return
         if ev.kind == "classdef":
@@ -2206,7 +2302,13 @@ def compute_reachability(
                 if ev.ctx in ("call", "decorator", "arg", "store", "return", "raise", "unknown", "operand",
                               "subscript", "iter", "with"):
                     load_module(rr.module)
-                    instantiate(rr.module, rr.target)
+                    if ev.ctx not in ("call", "decorator", "raise"):
+                        saved_t = tag[0]
+                        tag[0] = "argclass"  # 値として渡したクラス: 生成されると仮定
+                        instantiate(rr.module, rr.target)
+                        tag[0] = saved_t
+                    else:
+                        instantiate(rr.module, rr.target)
             elif rr.kind == "instance":
                 load_module(rr.module)
                 instantiate(rr.module, rr.target)
@@ -2216,7 +2318,10 @@ def compute_reachability(
                 if rr.chain:
                     last = rr.chain[-1]
                     if last not in ("()", "[]"):
+                        saved_t = tag[0]
+                        tag[0] = "name"
                         on_method_name(last, attr_only=False)
+                        tag[0] = saved_t
 
     deferred: list[tuple[Unit, Event]] = []
     applied_names: dict[int, set[str]] = {}
@@ -2284,7 +2389,10 @@ def compute_reachability(
                 if "*" in done:
                     continue
                 done.add("*")
-                handle(unit, replace(ev, kind="dynamic", name=""))
+                if ev.ctx == "entry_points":
+                    handle(unit, replace(ev, kind="entry_points", name="", ctx=""))
+                else:
+                    handle(unit, replace(ev, kind="dynamic", name=""))
                 progressed = True
                 continue
             new = names - done
@@ -2292,6 +2400,12 @@ def compute_reachability(
                 continue
             done |= new
             progressed = True
+            current[0] = (unit.key, ev)
+            if ev.ctx == "entry_points":
+                for n in sorted(new):
+                    handle(unit, replace(ev, kind="entry_points", name=n, ctx=""))
+                continue
+            tag[0] = "name"
             for n in sorted(new):
                 if ev.ctx == "self" and unit.cls:
                     # self の属性: クラス族のメソッドで、その名前のもの
@@ -2308,6 +2422,7 @@ def compute_reachability(
         return progressed
 
     for m in [entry_module] + list(build_roots or []):
+        st.roots.append((m, "<module>"))
         load_module(m)
 
     while True:
@@ -2316,7 +2431,9 @@ def compute_reachability(
             unit = program.units[key]
             current[0] = (key, "")
             for qual in unit.escaped_units:
+                tag[0] = "decorator"  # 登録デコレータ（関数を保持して後で呼びうる）
                 reach((unit.module, qual), "escaped (decorator)")
+                tag[0] = "precise"
             for ev in unit.events:
                 current[0] = (key, ev)
                 if ev.kind == "dynamic_param":
@@ -2330,3 +2447,54 @@ def compute_reachability(
             if not run_deferred():
                 break
     return st
+
+
+# ---------------------------------------------------------------------------
+# 確実に実行されるコード（仕様 9 節: 条件付き候補の区別）
+# ---------------------------------------------------------------------------
+
+
+def certain_units(st: Reachability) -> set[tuple[str, str]]:
+    """起点（エントリー・ビルド時の起点）から、確実な辺（precise）だけで届くコード単位。"""
+    adj: dict = {}
+    for src, dst, t, _ev in st.edges:
+        if t == "precise":
+            adj.setdefault(src, []).append(dst)
+    seen: set = set()
+    q = deque(k for k in st.roots if k in st.reached)
+    # 親パッケージの本体など、起点が読み込むモジュール本体は辺（src=None）で入る
+    for src, dst, t, _ev in st.edges:
+        if src is None and t == "precise":
+            q.append(dst)
+    while q:
+        k = q.popleft()
+        if k in seen:
+            continue
+        seen.add(k)
+        q.extend(adj.get(k, ()))
+    return seen
+
+
+def entry_paths(st: Reachability, certain: set) -> dict:
+    """確実な集合の外のユニット → (入口のユニット, 入口へ入る辺の印, 入口へ入る辺のイベント, 確実側の呼び出し元)。
+
+    確実な集合から、全ての辺で幅優先に辿り、最初に確実な集合を出た辺を「入口」とする。
+    """
+    adj: dict = {}
+    for src, dst, t, ev in st.edges:
+        adj.setdefault(src, []).append((dst, t, ev))
+    out: dict = {}
+    q: deque = deque()
+    for k in certain:
+        for dst, t, ev in adj.get(k, ()):
+            if dst not in certain and dst not in out:
+                out[dst] = (dst, t, ev, k)
+                q.append(dst)
+    while q:
+        k = q.popleft()
+        info = out[k]
+        for dst, t, ev in adj.get(k, ()):
+            if dst not in certain and dst not in out:
+                out[dst] = info
+                q.append(dst)
+    return out

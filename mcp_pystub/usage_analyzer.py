@@ -32,7 +32,9 @@ from mcp_pystub.models import (
     SubmoduleStubHint,
 )
 from mcp_pystub.module_resolver import EXTENSION_SUFFIXES, ModuleResolver, is_extension_file
-from mcp_pystub.semantics import Event, Program, Reachability, Ref, Unit, compute_reachability, under
+from mcp_pystub.semantics import (
+    Event, Program, Reachability, Ref, Unit, certain_units, compute_reachability, entry_paths, under,
+)
 
 
 # ビルドツールが内部で使用するパッケージ。スタブ化すると
@@ -59,6 +61,9 @@ class Semantics:
     unparsed_local: list[str] = field(default_factory=list)
     graph: ImportGraph | None = None
     hooks: dict[str, str] = field(default_factory=dict)  # フックのあるモジュール名 → フックのファイル
+    certain: set = field(default_factory=set)  # 確実に実行されるコード単位
+    precise_parent: dict = field(default_factory=dict)  # 確実なユニット → 確実な辺での親
+    entries: dict = field(default_factory=dict)  # 確実でないユニット → 過大近似の入口
 
 
 def find_pyinstaller_hooks(resolver: ModuleResolver) -> dict[str, str]:
@@ -144,6 +149,11 @@ def get_semantics(graph: ImportGraph) -> Semantics:
                 unparsed_local.append(info.path or name)
     sem = Semantics(program, reach, entry_module, dict(events_by_top), unparsed_local, graph,
                     {m: hooks[m] for m in build_roots})
+    sem.certain = certain_units(reach)
+    sem.entries = entry_paths(reach, sem.certain)
+    for src, dst, t, _ev in reach.edges:
+        if t == "precise" and dst in sem.certain and dst not in sem.precise_parent and src != dst:
+            sem.precise_parent[dst] = src
     graph._semantics = sem  # type: ignore[attr-defined]
     return sem
 
@@ -169,6 +179,9 @@ def _leaf_is_use(rr: Ref, ctx: str) -> bool:
         return kind != "class"  # B. 判別: P の実体が生成されないので結果は元と同じ
     if ctx == "is":
         return kind not in ("class", "function", "method", "module")
+    if ctx == "truth":
+        # 真偽の判定: クラス・関数・モジュールは元でもスタブでも常に真
+        return kind not in ("class", "function", "method", "module", "external_module")
     return True  # C. 実行（未知の文脈も含めて既定は使用）
 
 
@@ -184,6 +197,8 @@ def classify_event(ev: Event, prefix: str) -> str | None:
     for rr in ref.all_refs():
         if rr.alts or not rr.touches(prefix):
             continue
+        if rr.fallback and ev.ctx == "truth":
+            continue  # except ImportError の代替: 元の環境（パッケージがある）では実行されない
         if _leaf_is_use(rr, ev.ctx):
             return "use"
     return "ref"
@@ -486,26 +501,39 @@ def _analyze_single_package(
     # C 拡張を含むパッケージはスタブ化不可（間接排除のヒントを探す）
     if resolver is not None and has_c_extensions(package_name, resolver):
         hints = find_submodule_hints(package_name, graph, sem)
+        chints: list[SubmoduleStubHint] = []
         reason = "C 拡張（.pyd/.so）を含むためスタブ化不可。"
         if hints:
             submod_names = ", ".join(h.submodule for h in hints)
             reason += f" ただし {submod_names} をスタブ化することで間接排除が可能です。"
-        return PackageAnalysis(verdict="required", reason=reason, submodule_stubs=hints, **common)
+        else:
+            chints = find_submodule_hints(package_name, graph, sem, allow_conditional=True)
+            if chints:
+                reason += (" 条件付きの候補: " + ", ".join(h.submodule for h in chints)
+                           + "（conditional_submodule_hints を参照）")
+        return PackageAnalysis(verdict="required", reason=reason, submodule_stubs=hints,
+                               conditional_submodule_stubs=chints, **common)
 
     usage = prefix_usage(sem, package_name)
     gateways = _gateways(usage.uses, sem.reach.reached)
 
-    if usage.uses:
-        first_unit, first_ev, first_sym = usage.uses[0]
+    pending: dict | None = None
+    certain_uses = [(u, ev, sym) for u, ev, sym in usage.uses if is_certain_use(sem, u, ev)]
+    if usage.uses and not certain_uses:
+        pending = build_conditions(sem, usage.uses, package_name)
+        if pending is None:
+            certain_uses = usage.uses  # 入口を特定できない: 区別できないので required
+    if certain_uses:
+        first_unit, first_ev, first_sym = certain_uses[0]
         where = first_unit.module + (
             "" if first_unit.qualname == "<module>" else f":{first_unit.qualname}"
         )
-        kind = "import 時に" if first_unit.qualname == "<module>" else "到達可能な関数で"
+        kind = "import 時に" if first_unit.qualname == "<module>" else "確実に実行される関数で"
         return PackageAnalysis(
             verdict="required",
             reason=(
                 f"{kind}実際に使用されています（{where} 行 {first_ev.lineno}: {first_sym}、"
-                f"文脈 {first_ev.ctx}、使用箇所 {len(usage.uses)} 件）。"
+                f"文脈 {first_ev.ctx}、確実な使用 {len(certain_uses)} 件 / 使用 {len(usage.uses)} 件）。"
             ),
             gateway_functions=gateways,
             **common,
@@ -567,6 +595,20 @@ def _analyze_single_package(
             **common,
         )
 
+    if pending is not None:
+        return PackageAnalysis(
+            verdict="conditional",
+            reason=(
+                "安全は示せません（到達の過大近似・入力次第の経路でだけ使われます）。"
+                f"次の機能を使わない前提で外せます: {pending['summary']}（verify(..., run_entry=True) で確認を推奨）"
+            ),
+            gateway_functions=gateways,
+            conditions=pending["conditions"],
+            conditions_total=pending["total"],
+            unproven_because=pending["because"],
+            **common,
+        )
+
     # nofollow（仕様 3 節）: 実行される import が全て「単純な保護」（try 本体は import だけ、
     # except は pass か None/False 代入だけ）で、到達可能なコードからの参照が一切無い
     executed_imports = usage.imports
@@ -599,7 +641,7 @@ def _analyze_single_package(
 
 
 def find_submodule_hints(
-    c_ext_package: str, graph: ImportGraph, sem: Semantics
+    c_ext_package: str, graph: ImportGraph, sem: Semantics, allow_conditional: bool = False
 ) -> list[SubmoduleStubHint]:
     """C 拡張パッケージ T を import 閉包から外す、最小で互いに重ならないサブモジュールの組。
 
@@ -634,7 +676,8 @@ def find_submodule_hints(
             cand = ".".join(parts[:i])
             if under(cand, T):
                 break
-            if not prefix_usage(sem, cand).uses:
+            uses = prefix_usage(sem, cand).uses
+            if not uses or (allow_conditional and _conditional_ok(sem, uses, cand)):
                 picked = cand
                 break
         if not picked:
@@ -642,10 +685,16 @@ def find_submodule_hints(
         chosen = [c for c in chosen if not under(c, picked)] + [picked]
     chosen = sorted(set(chosen))
     # 全部同時に適用して確かめる
+    cond_info: dict[str, dict] = {}
     for c in chosen:
         others = tuple(x for x in chosen if x != c)
-        if prefix_usage(sem, c, exclude=others).uses:
-            return []
+        uses = prefix_usage(sem, c, exclude=others).uses
+        if uses:
+            if not allow_conditional or not _conditional_ok(sem, uses, c):
+                return []
+            cond_info[c] = build_conditions(sem, uses, c)  # type: ignore[assignment]
+    if allow_conditional and not cond_info:
+        return []  # 証明済みのヒントとして出せる（こちらには出さない）
     # 静的な import グラフ（PyInstaller が同梱する範囲 ⊇ 実行時に読み込まれる範囲）から T が消えること。
     # T のフック（ビルド時の起点）は、T がグラフから消えれば実行されない
     after = graph_closure(graph, entry, excludes=tuple(chosen))
@@ -667,7 +716,11 @@ def find_submodule_hints(
         info = sem.program.modules.get(cand)
         node = graph.nodes.get(cand)
         group = ", ".join(chosen)
+        ci = cond_info.get(cand)
         hints.append(SubmoduleStubHint(
+            conditional=bool(cond_info),
+            conditions=(ci or {}).get("conditions", []),
+            conditions_total=(ci or {}).get("total", 0),
             target_package=T,
             parent_package=cand.split(".")[0],
             submodule=cand,
@@ -691,3 +744,128 @@ def _unique(items: list[str]) -> list[str]:
             seen.add(item)
             result.append(item)
     return result
+
+
+# ---------------------------------------------------------------------------
+# 条件付き候補（仕様 9 節）
+# ---------------------------------------------------------------------------
+
+_TAG_TEXT = {
+    "name": "名前だけの振り分け（受け手の型が分からない呼び出しを、同名のメソッド全てに届くと仮定）",
+    "argclass": "引数に渡したクラス（渡した先で生成されると仮定）",
+    "decorator": "登録デコレータ（飾られた関数が後で呼ばれると仮定）",
+    "branch": "入力・呼び出し次第の分岐（関数の中の if / except / 条件式の枝）",
+}
+
+MAX_CONDITIONS = 10
+
+
+def _conditional_ok(sem: Semantics, uses: list, prefix: str) -> bool:
+    """使用が全て「確実ではない」もので、入口を特定できるか。"""
+    if any(is_certain_use(sem, u, ev) for u, ev, _ in uses):
+        return False
+    return build_conditions(sem, uses, prefix) is not None
+
+
+def is_certain_use(sem: Semantics, unit: Unit, ev: Event) -> bool:
+    """確実に実行される使用か（import 時・ビルド時・エントリーが必ず通る経路で、分岐の中ではない）。"""
+    return unit.key in sem.certain and not ev.cond
+
+
+def _api_name(sem: Semantics, key: tuple[str, str]) -> str:
+    """ユニットを、利用者が照らせる名前に（パッケージの最上位から再エクスポートされていればその名前）。"""
+    module, qual = key
+    q = qual.split("#")[0].replace(".<locals>.", ".")
+    if q == "<module>":
+        return f"import {module}"
+    top = module.split(".")[0]
+    head = q.split(".")[0]
+    info = sem.program.modules.get(top)
+    if info is not None and not info.opaque and head in info.bindings and module != top:
+        try:
+            r = sem.program.resolve(top, (head,))
+            if r.module == module:
+                return f"{top}.{q}()"
+        except Exception:  # noqa: BLE001
+            pass
+    return f"{module}.{q}()"
+
+
+def _path_to(sem: Semantics, key: tuple[str, str], stop: tuple[str, str], limit: int = 6) -> list[str]:
+    out = []
+    seen = set()
+    k = key
+    while k is not None and k not in seen and len(out) < limit:
+        seen.add(k)
+        out.append(_api_name(sem, k))
+        if k == stop:
+            break
+        w = sem.reach.why.get(k)
+        k = w[0] if w else None
+    return list(reversed(out))
+
+
+def _public_route(sem: Semantics, caller: tuple[str, str] | None, limit: int = 8) -> tuple[str, list[str]]:
+    """確実な呼び出し元から起点まで遡り、プロジェクトのコードが直接呼ぶ依存ライブラリの関数（公開 API）と経路。"""
+    chain: list[tuple[str, str]] = []
+    k = caller
+    seen = set()
+    while k is not None and k not in seen and len(chain) < 60:
+        seen.add(k)
+        chain.append(k)
+        k = sem.precise_parent.get(k)
+    chain.reverse()  # 起点 → 呼び出し元
+    api = ""
+    for i, u in enumerate(chain):
+        if u[0] in sem.program.local_modules:
+            continue
+        if i > 0 and chain[i - 1][0] in sem.program.local_modules and u[1] != "<module>":
+            api = _api_name(sem, u)
+            break
+    route = [_api_name(sem, u) for u in chain if u[0] not in sem.program.local_modules][-limit:]
+    return api, route
+
+
+def build_conditions(sem: Semantics, uses: list, prefix: str) -> dict | None:
+    """使用（全て確実ではない）から「これを使うと壊れる」入口を組み立てる。入口が分からなければ None。"""
+    groups: dict = {}
+    because: set[str] = set()
+    for unit, ev, sym in uses:
+        if unit.key in sem.certain and ev.cond:
+            ekey, tag, eev, caller = unit.key, "branch", ev, unit.key
+        else:
+            info = sem.entries.get(unit.key)
+            if info is None:
+                return None
+            ekey, tag, eev, caller = info
+            if tag == "precise":
+                # 確実な辺の先が確実でない（起点から外れた）: 区別できない
+                return None
+        because.add(tag)
+        g = groups.setdefault((ekey, tag), {
+            "entry": _api_name(sem, ekey),
+            "entry_location": f"{ekey[0]}:{ekey[1]}" + (f" 行 {eev.lineno}" if tag == "branch" and getattr(eev, "lineno", 0) else ""),
+            "why_unproven": _TAG_TEXT.get(tag, tag),
+            "dispatch_name": (getattr(eev, "name", "") if tag == "name" else ""),
+            "called_from": _api_name(sem, caller) if caller is not None else "",
+            "uses": [],
+            "path": _path_to(sem, unit.key, ekey),
+            "may_be_swallowed": False,
+        })
+        if "public_api" not in g:
+            api, route = _public_route(sem, caller)
+            g["public_api"] = api  # プロジェクトのコードが呼ぶ、条件の入口に至る依存ライブラリの関数
+            g["route_from_project"] = route
+        if len(g["uses"]) < 5 and sym not in g["uses"]:
+            g["uses"].append(sym)
+        if ev.broad or getattr(eev, "broad", False):
+            g["may_be_swallowed"] = True
+    conds = sorted(groups.values(), key=lambda g: (-len(g["uses"]), g["entry"]))
+    total = len(conds)
+    shown = conds[:MAX_CONDITIONS]
+    for g in shown:
+        if g["may_be_swallowed"]:
+            g["note"] = "呼び出し元が except Exception（または except:）で囲まれており、スタブの例外が握りつぶされることがあります"
+    summary = ", ".join(g["entry"] for g in shown[:3]) + (f" ほか {total - 3} 件" if total > 3 else "")
+    return {"conditions": shown, "total": total, "because": sorted(_TAG_TEXT.get(t, t) for t in because),
+            "summary": summary}
