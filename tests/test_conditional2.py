@@ -1,0 +1,146 @@
+"""条件付き候補の confidence・要約・握りつぶし・重なった適用（仕様 7・9 節）"""
+
+from __future__ import annotations
+
+import shutil
+import subprocess
+from pathlib import Path
+
+import pytest
+
+from mcp_pystub.analyzer import analyze
+from mcp_pystub.stub_generator import generate_stubs, generate_submodule_stubs
+from tests.test_conditional import EXT, Case, _run, _write
+
+SIG = {
+    "gx/__init__.py": "def draw(v):\n    return 'drawn %s' % v\n",
+    "sig/__init__.py": "class Signal:\n    def __init__(self, v):\n        self.v = v\n    def value(self):\n        return self.v\n    def plot(self):\n        import gx\n        return gx.draw(self.v)\n",
+    "other/__init__.py": "def show(obj):\n    return obj.plot()\n",
+}
+OK_MAIN = "import sig, other\nclass P:\n    def plot(self):\n        return 'p'\nprint('ok', sig.Signal(3).value(), other.show(P()))\n"
+
+
+def test_confidence_high_when_project_does_not_use_entry(tmp_path):
+    c = Case(tmp_path, SIG, OK_MAIN.replace("def plot", "def draw_it").replace("other.show(P())", "1"),
+             "import sig\nprint(sig.Signal(1).plot())\n")
+    # 名前の振り分けを起こすのはライブラリ内（other.show）だけにする
+    _write(c.proj, {"main.py": "import sig, other\nprint('ok', sig.Signal(3).value(), other.show(sig.Signal(4)) if False else 0)\n"})
+    res = analyze(str(c.proj / "main.py"), python_path=str(c.sp), include_small_conditional=True)
+    cond = {p["package_name"]: p for p in res["conditional"]}
+    if "gx" in cond:
+        g = cond["gx"]
+        assert g["confidence"] in ("high", "low")
+        for x in g["conditions"]:
+            assert "project_uses_count" in x and "project_note" in x
+
+
+def test_confidence_low_when_project_uses_entry_name(tmp_path):
+    """プロジェクト自身が同名の `plot` を参照している → low（照らす必要がある）"""
+    main = ("import sig, other\nclass P:\n    def plot(self):\n        return 'p'\n"
+            "def call(o):\n    return o.plot()\nprint('ok', sig.Signal(3).value(), call(P()))\n")
+    c = Case(tmp_path, SIG, main, "import sig\nprint(sig.Signal(1).plot())\n")
+    g = [p for p in c.res["conditional"] if p["package_name"] == "gx"][0]
+    assert g["confidence"] == "low"
+    cond = g["conditions"][0]
+    assert cond["project_uses_count"] >= 1 and cond["project_uses"]
+    assert "main.py" in cond["project_uses"][0]
+
+
+def test_confidence_low_for_branch(tmp_path):
+    sp = {"hv/__init__.py": "def compute():\n    return 42\n",
+          "lib/__init__.py": "import hv\ndef run(fast):\n    if fast:\n        return hv.compute()\n    return 0\n"}
+    c = Case(tmp_path, sp, "import lib\nprint('ok', lib.run(False))\n", "import lib\nprint('ok', lib.run(True))\n")
+    g = [p for p in c.res["conditional"] if p["package_name"] == "hv"][0]
+    assert g["confidence"] == "low"
+
+
+def test_summary_is_first_and_lists_high_first(tmp_path):
+    sp = dict(SIG)
+    sp["lib2/__init__.py"] = "def dispatch(objs):\n    return [o.plot() for o in objs]\n"
+    _write(tmp_path / "sp", sp)
+    _write(tmp_path / "proj", {"main.py": "import sig, lib2\nprint('ok', sig.Signal(3).value(), lib2.dispatch([]))\n", "pyproject.toml": ""})
+    res = analyze(str(tmp_path / "proj" / "main.py"), python_path=str(tmp_path / "sp"), include_small_conditional=True)
+    assert list(res)[0] == "summary"
+    s = res["summary"]
+    assert "proven_savings_mb" in s and "conditional_high_savings_mb" in s and s["next_steps"]
+    cond = {p["package_name"]: p for p in res["conditional"]}
+    assert cond["gx"]["confidence"] == "high"
+    assert cond["gx"]["conditions"][0]["project_uses_count"] == 0
+    assert "直接使っていません" in cond["gx"]["conditions"][0]["project_note"]
+    assert s["recommendations"][0].startswith("[high] gx")
+
+
+def test_swallowed_stub_error_is_still_reported_on_stderr(tmp_path):
+    """呼び出し元が素の except で握りつぶしても、標準エラーに「mcp-pystub のスタブです」が出る（asammdf Signal.plot 型）"""
+    sp = dict(SIG)
+    sp["sig/__init__.py"] = ("class Signal:\n    def __init__(self, v):\n        self.v = v\n    def value(self):\n        return self.v\n"
+                             "    def plot(self):\n        try:\n            import gx\n            return gx.draw(self.v)\n"
+                             "        except:\n            return 'fallback'\n")
+    c = Case(tmp_path, sp, OK_MAIN, "import sig\nprint(sig.Signal(1).plot())\n")
+    g = [p for p in c.res["conditional"] if p["package_name"] == "gx"][0]
+    assert g["conditions"][0]["may_be_swallowed"] is True
+    site = c.apply(packages=["gx"])
+    rc, out = _run(c.proj, site, c.proj / "violate.py")
+    assert "fallback" in out and "mcp-pystub のスタブです" in out
+
+
+def test_overlapping_package_and_submodule_stub_restore(tmp_path):
+    """パッケージのスタブとその内側のサブモジュールのスタブを重ねて適用・復元しても、元のファイルが失われない。"""
+    bash = shutil.which("bash")
+    if bash is None:
+        pytest.skip("bash がありません")
+    sp = {
+        "cx/__init__.py": "def native():\n    return 1\n", f"cx/_core{EXT}": b"fake",
+        "pk/__init__.py": "def f():\n    return 'f'\n",
+        "pk/io/__init__.py": "",
+        "pk/io/x.py": "def g():\n    import cx\n    return cx.native()\n",
+    }
+    _write(tmp_path / "sp", sp)
+    _write(tmp_path / "proj", {"main.py": "import pk, pk.io.x\nprint('ok')\n", "pyproject.toml": ""})
+    entry = str(tmp_path / "proj" / "main.py")
+    site = tmp_path / "sp"
+
+    def tree():
+        return {str(f.relative_to(site)): f.read_bytes() for f in sorted(site.rglob("*"))
+                if f.is_file() and "__pycache__" not in f.parts}
+
+    before = tree()
+    gp = generate_stubs(entry, "pk", python_path=str(site))
+    gs = generate_submodule_stubs(entry, "pk", "pk.io.x", python_path=str(site))
+    assert "error" not in gp and "error" not in gs
+    stage = tmp_path / "stage"
+    for g in (gp, gs):
+        for rel, code in g["files"].items():
+            f = stage / "_stubs" / rel
+            f.parent.mkdir(parents=True, exist_ok=True)
+            f.write_text(code, encoding="utf-8")
+
+    def sh(lines):
+        r = subprocess.run([bash, "-c", "\n".join(lines)], cwd=stage, capture_output=True, text=True)
+        assert r.returncode == 0, r.stderr
+
+    def method1(bi):
+        out = []
+        for line in bi["uninstall_commands"]:
+            if "方法2" in line:
+                break
+            out.append(line)
+        return out
+
+    for g in (gp, gs):  # パッケージ → 内側の順に適用
+        sh(g["build_instructions"]["backup_commands"])
+        sh(g["build_instructions"]["install_commands"])
+    for g in (gs, gp):  # 逆順に復元
+        sh(method1(g["build_instructions"]))
+    assert tree() == before
+    # 内側のサブモジュールだけを適用したときは、スタブが実際に置かれる（自分のバックアップで
+    # 親ディレクトリができたことを「親パッケージのスタブ」と取り違えて skip しない）
+    sh(gs["build_instructions"]["backup_commands"])
+    sh(gs["build_instructions"]["install_commands"])
+    stubbed = tree()
+    xk = str(Path("pk/io/x.py"))
+    assert xk in stubbed, "スタブが置かれていない（元ファイルだけ退避された）"
+    assert stubbed[xk] != before[xk]
+    sh(method1(gs["build_instructions"]))
+    assert tree() == before
+    assert not (site.parent / "_pystub_bak").exists()

@@ -50,7 +50,16 @@ class PystubConditionalStubError(RuntimeError):
     pass
 _PYSTUB_NOTE = {note!r}
 def _raise(n):
-    raise PystubConditionalStubError("mcp-pystub のスタブです。" + _PYSTUB_NOTE + "（呼ばれたもの: " + n + "）")
+    m = "mcp-pystub のスタブです。" + _PYSTUB_NOTE + "（呼ばれたもの: " + n + "）"
+    import os, sys
+    try:
+        sys.stderr.write("[mcp-pystub] " + m + "\\n")  # 呼び出し元の except で握りつぶされても分かるように
+        sys.stderr.flush()
+    except Exception:
+        pass
+    if os.environ.get("MCP_PYSTUB_STRICT") == "1":
+        os._exit(70)
+    raise PystubConditionalStubError(m)
 class _M(type):
     def __getattr__(c, n):
         k = c.__dict__.get("_pystub_known")
@@ -850,7 +859,22 @@ def _generate_build_instructions(
         rel_moves.append(mp.relative_to(import_root))
     bak_of = {rel: backup_root / (import_root / rel).relative_to(site_root) for rel in rel_moves}
 
+    # 重なりの防御: 親パッケージが既に（別のスタブとして）丸ごとバックアップ領域へ移されていれば、
+    # この項目はその中に含まれるので適用・復元とも何もしない（仕様 7 節）。
+    # 判定は親の __init__.py がバックアップ側にあるかで行う。親の「ディレクトリ」の有無で判定すると、
+    # この項目自身のバックアップ（bak/<親>/<子>.py）で親ディレクトリが作られた時点で
+    # 誤って skip し、元ファイルを退避したままスタブを置かない事故になる（第 3 回 e2e で発生）。
+    anc_checks = []
+    parts = Path(name.replace(".", "/")).parts
+    for i in range(1, len(parts)):
+        anc_rel = Path(*parts[:i])
+        anc_bak = backup_root / (import_root / anc_rel).relative_to(site_root)
+        anc_checks.append(f"[ -e {_q(anc_bak / '__init__.py')} ]")
+    covered = " || ".join(anc_checks)
+    skip = (f"if {covered}; then echo 'skip: {name} は親パッケージのスタブに含まれます'; exit 0; fi") if anc_checks else ""
     backup_cmds = ["# === 元ファイルをバックアップ領域へ移動（必ず最初に実行。既にあれば何もしない） ==="]
+    if skip:
+        backup_cmds.append(skip)
     for rel in rel_moves:
         src = import_root / rel
         dst = bak_of[rel]
@@ -866,11 +890,12 @@ def _generate_build_instructions(
     guard = " && ".join(f"[ -e {_q(bak_of[r])} ]" for r in rel_moves) or "true"
     install_cmds = [
         "# スタブを配置（生成された files を _stubs/ に書き出してから。バックアップが無ければ中止）:",
+    ] + ([skip] if skip else []) + [
         f"if {guard}; then rm -rf {_q(target)} && cp -r {_q(src_stub)} {_q(target)}; "
         f"else echo 'backup missing: run backup_commands first' >&2; exit 1; fi",
     ]
 
-    uninstall_cmds = ["# === 方法1: バックアップから復元（推奨・高速・確実） ==="]
+    uninstall_cmds = ["# === 方法1: バックアップから復元（推奨・高速・確実） ==="] + ([skip] if skip else [])
     uninstall_cmds.append(f"if {guard}; then rm -rf {_q(target)}; fi")
     for rel in rel_moves:
         uninstall_cmds.append(

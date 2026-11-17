@@ -5,7 +5,8 @@ sys.path.insert(0, r"C:\tmp\pystub-e2e")
 from scenarios import S
 
 ROOT = Path(r"C:\tmp\pystub-e2e")
-OUT = ROOT / "after_round3"
+import os as _os
+OUT = ROOT / _os.environ.get("E2E_OUT", "after_round3")
 REPO = r"C:\workspace\mcp-pystub\.claude\worktrees\agent-ab7fe9091ba1b9f66"
 SYS_PY = r"C:\Python313\python.exe"
 BASH = r"C:\Program Files\Git\bin\bash.exe"
@@ -217,14 +218,16 @@ def run(name, entry2=False):
     nof = [x["package_name"] for x in A["nofollow"]]
     cond_pkgs = [x["package_name"] for x in A.get("conditional", [])]
     cond_hints = {}
-    for x in A.get("conditional_submodule_hints", []) or []:
-        cond_hints[x["submodule"]] = x
-    R["conditional"] = [{k: x.get(k) for k in ("package_name", "estimated_savings_mb", "conditions_total", "unproven_because")}
-                        | {"conditions": [{k: g.get(k) for k in ("entry", "public_api", "entry_location", "why_unproven", "uses", "may_be_swallowed")}
+    cond_hint_list = list(A.get("conditional_submodule_hints", []) or [])
+    for x in cond_hint_list:
+        cond_hints.setdefault(x["submodule"], x)
+    R["summary"] = A.get("summary")
+    R["conditional"] = [{k: x.get(k) for k in ("package_name", "estimated_savings_mb", "conditions_total", "unproven_because", "confidence")}
+                        | {"conditions": [{k: g.get(k) for k in ("entry", "public_api", "entry_location", "why_unproven", "uses", "may_be_swallowed", "project_uses_count")}
                                           for g in x.get("conditions", [])]} for x in A.get("conditional", [])]
-    R["conditional_hints"] = [{k: h.get(k) for k in ("submodule", "parent_package", "target_package", "estimated_savings_mb", "conditions_total")}
-                              | {"conditions": [{k: g.get(k) for k in ("entry", "public_api", "entry_location", "why_unproven", "uses", "may_be_swallowed")}
-                                                for g in h.get("conditions", [])]} for h in cond_hints.values()]
+    R["conditional_hints"] = [{k: h.get(k) for k in ("submodule", "parent_package", "target_package", "estimated_savings_mb", "conditions_total", "confidence")}
+                              | {"conditions": [{k: g.get(k) for k in ("entry", "public_api", "entry_location", "why_unproven", "uses", "may_be_swallowed", "project_uses_count")}
+                                                for g in h.get("conditions", [])]} for h in cond_hint_list]
     save()
     if not (stub_pkgs or nof or hints or cond_pkgs or cond_hints):
         R["notes"].append("no proposals; stub build skipped")
@@ -358,10 +361,35 @@ def run(name, entry2=False):
         rc, o2, e2, _ = sh([str(VPY), str(entry)], env=env)
         return {"freeze_equal": eq, "freeze_diff": d, "expected_reproduced": (rc == 0 and o2.replace("\r\n", "\n").strip() == expected),
                 "bak_dir_exists": (V / "Lib" / "_pystub_bak").exists(),
-                "bak_dir_files": sum(1 for _ in (V / "Lib" / "_pystub_bak").rglob("*") if _.is_file()) if (V / "Lib" / "_pystub_bak").exists() else 0}
+                "bak_dir_files": sum(1 for _ in (V / "Lib" / "_pystub_bak").rglob("*") if _.is_file()) if (V / "Lib" / "_pystub_bak").exists() else 0,
+                "record_bad": record_bad()}
+
+    def record_bad():
+        """全 dist-info の RECORD の sha256 と site-packages の実ファイルを照合し、欠落・不一致の数を返す。"""
+        import base64, hashlib
+        sp = V / "Lib" / "site-packages"
+        bad = []
+        for rec in sp.glob("*.dist-info/RECORD"):
+            for line in rec.read_text(encoding="utf-8").splitlines():
+                if not line.strip():
+                    continue
+                pth, h, _ = line.rsplit(",", 2)
+                if not h.startswith("sha256="):
+                    continue
+                f = sp / pth
+                if not f.exists():
+                    bad.append("MISSING " + pth); continue
+                dg = base64.urlsafe_b64encode(hashlib.sha256(f.read_bytes()).digest()).rstrip(b"=").decode()
+                if "sha256=" + dg != h:
+                    bad.append("DIFF " + pth)
+        return bad[:50] if bad else 0
 
     def repair_if_needed(v, key):
         st = v[key]
+        if st.get("bak_dir_files") or st.get("record_bad"):
+            v[key + "_repair"] = "ABORT: backup files remain or RECORD mismatch after restore"
+            (D / "result_partial.json").write_text(json.dumps(R, ensure_ascii=False, indent=1, default=str), encoding="utf-8")
+            raise SystemExit(f"{name}: restore incomplete: bak_files={st.get('bak_dir_files')} record_bad={st.get('record_bad')}")
         if not st["freeze_equal"] or not st["expected_reproduced"]:
             miss = (st["freeze_diff"] or {}).get("missing", [])
             if miss:

@@ -307,12 +307,26 @@ def verify(
     rejected: list[dict] = list(errors)
     rounds = 0
     last_res: dict[str, dict] = {}
+    def visible(keys: list[str]) -> list[str]:
+        """差し替えた範囲の内側でスタブに無いモジュール・外したモジュールは、直接 import の対象にしない。
+
+        それらは置き換え（除外）によって無くなるのが前提なので、直接 import すれば必ず失敗する（誤った却下）。
+        本当に必要なら、それを import する外側のモジュールやエントリーの実行が失敗して分かる。
+        """
+        hidden_pref: list[str] = []
+        provided: set[str] = set()
+        for k in keys:
+            hidden_pref += items[k]["prefixes"] + items[k]["block"]
+            provided |= set(stub_map[k])
+        return [m for m in ok_targets if m in provided or not any(under(m, x) for x in hidden_pref)]
+
     while active and rounds < max_rounds:
         rounds += 1
-        res, _h = run_all(active, ok_targets)
+        tg = visible(active)
+        res, _h = run_all(active, tg)
         last_res = res
         fails = [r for m, r in res.items() if m != "<entry>" and not r.get("ok")]
-        missing = [m for m in ok_targets if m not in res]
+        missing = [m for m in tg if m not in res]
         if run_entry and base_entry is not None:
             er = res.get("<entry>")
             if er is None or er.get("rc") != base_entry.get("rc") or er.get("stdout") != base_entry.get("stdout"):
@@ -327,7 +341,7 @@ def verify(
             # 原因を特定できない: 1 つずつ外して確かめる
             for k in list(active):
                 trial = [x for x in active if x != k]
-                res2, _ = run_all(trial, ok_targets)
+                res2, _ = run_all(trial, visible(trial))
                 f2 = [r for m, r in res2.items() if m != "<entry>" and not r.get("ok")]
                 if len(f2) < len(fails):
                     blamed[k] = fails[0]

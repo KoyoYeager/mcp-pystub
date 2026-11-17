@@ -380,6 +380,19 @@ class TestVerifyTool:
         assert r["rejected"] and r["rejected"][0]["item"] == "hv"
         assert "compute" in (r["rejected"][0]["error"] or "") or "stub" in (r["rejected"][0]["error"] or "")
 
+    def test_verify_does_not_import_hidden_internals_directly(self, tmp_path):
+        """スタブに含まれない内部モジュール（hv._native など）や外したモジュールを直接 import して誤って却下しない
+        （第 3 回 e2e: 01_tqdm の pandas が pandas._libs の直接 import で却下された）。"""
+        entry, sp = self._setup(tmp_path, {
+            "hv/__init__.py": "from hv._impl import Frame\nfrom hv import _native\n",
+            "hv/_impl.py": "class Frame:\n    pass\n",
+            "hv/_native.py": "def run():\n    return 1\n",
+            "lib/__init__.py": "import hv\ndef f(x):\n    return isinstance(x, hv.Frame)\n"},
+            "import lib\nprint('ok', lib.f(1))\n")
+        r = verify(entry, sp, packages=["hv"], submodules=[], nofollow=[], run_entry=True)
+        assert r["passed"]["packages"] == ["hv"], r["rejected"]
+        assert r["entry_matched"] is True
+
     def test_verify_does_not_modify_site_packages(self, tmp_path):
         entry, sp = self._setup(tmp_path, {"hv/__init__.py": "X = 1\n", "lib/__init__.py": "import hv\n"}, "import lib\n")
         before = sorted(str(p.relative_to(sp)) for p in Path(sp).rglob("*") if "__pycache__" not in p.parts)

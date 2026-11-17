@@ -606,6 +606,7 @@ def _analyze_single_package(
             conditions=pending["conditions"],
             conditions_total=pending["total"],
             unproven_because=pending["because"],
+            confidence=pending["confidence"],
             **common,
         )
 
@@ -718,6 +719,8 @@ def find_submodule_hints(
         group = ", ".join(chosen)
         ci = cond_info.get(cand)
         hints.append(SubmoduleStubHint(
+            confidence=(("high" if all(x.get("confidence") == "high" for x in cond_info.values()) else "low")
+                        if cond_info else ""),
             conditional=bool(cond_info),
             conditions=(ci or {}).get("conditions", []),
             conditions_total=(ci or {}).get("total", 0),
@@ -861,6 +864,22 @@ def build_conditions(sem: Semantics, uses: list, prefix: str) -> dict | None:
         if ev.broad or getattr(eev, "broad", False):
             g["may_be_swallowed"] = True
     conds = sorted(groups.values(), key=lambda g: (-len(g["uses"]), g["entry"]))
+    tags_of: dict[int, str] = {}
+    for (ekey, tag), g in groups.items():
+        tags_of[id(g)] = tag
+    all_project_zero = True
+    for g in conds:
+        name = g["entry"].rstrip("()").split(".")[-1] if not g["entry"].startswith("import ") else ""
+        hits = project_name_uses(sem, name) if name else []
+        g["project_uses_count"] = len(hits)
+        g["project_uses"] = hits[:10]
+        if hits:
+            all_project_zero = False
+            g["project_note"] = f"プロジェクトのコードに `{name}` の呼び出し・参照が {len(hits)} 件あります（照らしてください）"
+        else:
+            g["project_note"] = (f"プロジェクトのコードは `{name}` を直接使っていません"
+                                 + ("（到達は依存ライブラリ内の名前の一致による推定だけ）" if tags_of[id(g)] == "name" else ""))
+    confidence = "high" if (all_project_zero and "branch" not in because) else "low"
     total = len(conds)
     shown = conds[:MAX_CONDITIONS]
     for g in shown:
@@ -868,4 +887,24 @@ def build_conditions(sem: Semantics, uses: list, prefix: str) -> dict | None:
             g["note"] = "呼び出し元が except Exception（または except:）で囲まれており、スタブの例外が握りつぶされることがあります"
     summary = ", ".join(g["entry"] for g in shown[:3]) + (f" ほか {total - 3} 件" if total > 3 else "")
     return {"conditions": shown, "total": total, "because": sorted(_TAG_TEXT.get(t, t) for t in because),
-            "summary": summary}
+            "summary": summary, "confidence": confidence}
+
+
+def project_name_uses(sem: Semantics, name: str) -> list[str]:
+    """プロジェクト自身のコード（local 分類のファイル）での、その名前の呼び出し・属性参照（ファイル:行）。"""
+    cache = sem.__dict__.setdefault("_name_hits", {})
+    if name in cache:
+        return cache[name]
+    import ast as _ast
+    hits: list[str] = []
+    for m in sorted(sem.program.local_modules):
+        info = sem.program.modules.get(m)
+        if info is None or info.tree is None:
+            continue
+        for n in _ast.walk(info.tree):
+            if (isinstance(n, _ast.Attribute) and n.attr == name) or (
+                isinstance(n, _ast.Name) and n.id == name and isinstance(n.ctx, _ast.Load)
+            ):
+                hits.append(f"{info.path}:{getattr(n, 'lineno', 0)}")
+    cache[name] = hits
+    return hits

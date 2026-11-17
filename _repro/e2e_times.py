@@ -30,4 +30,7 @@ for name in names:
     o = old_ms.get(name)
     rows.append((name, o, prev, r["analysis_time_ms"]))
     print(f"{name}: old={o} prev={prev} now={r['analysis_time_ms']} ratio={(r['analysis_time_ms']/o if o else 0):.2f} "
-          f"stubbable={st} nofollow={[p['package_name'] for p in r['nofollow']]} hints={hints}", flush=True)
+          f"stubbable={st} nofollow={[p['package_name'] for p in r['nofollow']]} hints={hints} "
+          f"conditional={[(c['package_name'], c['estimated_savings_mb'], c.get('confidence'), [g.get('project_uses_count') for g in c['conditions']]) for c in r.get('conditional', [])]} "
+          f"cond_hints={[(h['submodule'], h['target_package'], h['estimated_savings_mb'], h.get('confidence'), [g.get('project_uses_count') for g in h['conditions']]) for h in r.get('conditional_submodule_hints', [])]} "
+          f"omitted_small={r.get('conditional_omitted_small')} summary={r.get('summary', {}).get('proven_savings_mb')}/{r.get('summary', {}).get('conditional_high_savings_mb')}", flush=True)

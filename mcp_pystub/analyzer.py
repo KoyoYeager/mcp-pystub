@@ -123,11 +123,14 @@ def analyze(
             d["how_to_check"] = (f"verify({str(entry)!r}{py_arg}, packages=[], "
                                  f"submodules=[{(h.submodule + '=>' + h.target_package)!r}], nofollow=[], run_entry=True)")
             chints.append(d)
-    chints.sort(key=lambda d: -d["estimated_savings_mb"])
+    rank = {"high": 0, "low": 1, "": 2}
+    conditional.sort(key=lambda d: (rank.get(d.get("confidence", ""), 2), -d["estimated_savings_mb"]))
+    chints.sort(key=lambda d: (rank.get(d.get("confidence", ""), 2), -d["estimated_savings_mb"]))
     result_dict["conditional"] = conditional
     result_dict["conditional_submodule_hints"] = chints
     result_dict["conditional_omitted_small"] = omitted
     result_dict["verify_status"] = "未実施"
+    result_dict = {"summary": _summary(result_dict, str(entry), python_path, required), **result_dict}
     result_dict["next_steps"] = [
         "この結果は静的解析による候補です（実行の保証ではありません）。",
         "適用前に verify ツールで、スタブ（とサブモジュールのヒント・nofollow）に差し替えた状態の import を"
@@ -329,3 +332,63 @@ def _build_import_chains(
             path.append(parent[path[-1]])  # type: ignore[arg-type]
         chains.append(list(reversed(path)))
     return chains
+
+
+def _cond_text(conds: list[dict], total: int) -> tuple[str, int]:
+    ents = [c.get("entry", "") for c in conds[:3]]
+    uses = sum(int(c.get("project_uses_count", 0)) for c in conds)
+    more = f" ほか {total - 3} 件" if total > 3 else ""
+    return "、".join(ents) + more, uses
+
+
+def _summary(rd: dict, entry: str, python_path: str, required: list) -> dict:
+    """結果の先頭に置く要約: 証明済み・条件付き（high）の削減見込みと、次の手順。"""
+    proven_mb = sum(p.get("estimated_size_mb", 0.0) for p in rd["stubbable"]) + \
+        sum(p.get("estimated_size_mb", 0.0) for p in rd["nofollow"])
+    size_of = {a.package_name: a.estimated_size_mb for a in required}
+    proven_targets = {h["target_package"] for h in rd.get("submodule_stub_hints", [])}
+    proven_mb += sum(size_of.get(t, 0.0) for t in proven_targets)
+    recs: list[str] = []
+    for p in rd["stubbable"]:
+        recs.append(f"{p['package_name']} をスタブ化できます（証明済み、約 {p['estimated_size_mb']:.1f} MB）")
+    for h in rd.get("submodule_stub_hints", []):
+        recs.append(f"{h['submodule']} をスタブ化すると {h['target_package']} を排除できます（証明済み）")
+    high_mb = 0.0
+    high_n = 0
+    seen_targets: set[str] = set()
+    cond_recs: list[str] = []
+    for h in rd.get("conditional_submodule_hints", []):
+        text, uses = _cond_text(h.get("conditions", []), h.get("conditions_total", 0))
+        if h.get("confidence") == "high":
+            if h["target_package"] not in seen_targets:
+                high_mb += h.get("estimated_savings_mb", 0.0)
+                seen_targets.add(h["target_package"])
+            high_n += 1
+        cond_recs.append((h.get("confidence"), -h.get("estimated_savings_mb", 0.0),
+                          f"[{h.get('confidence')}] {h['submodule']} をスタブ化すると {h['target_package']} を排除できます"
+                          f"（約 {h.get('estimated_savings_mb', 0.0):.1f} MB。条件: {text or '—'} を使わない。プロジェクト内の使用 {uses} 件）"))
+    for p in rd.get("conditional", []):
+        text, uses = _cond_text(p.get("conditions", []), p.get("conditions_total", 0))
+        if p.get("confidence") == "high":
+            high_mb += p.get("estimated_savings_mb", 0.0)
+            high_n += 1
+        cond_recs.append((p.get("confidence"), -p.get("estimated_savings_mb", 0.0),
+                          f"[{p.get('confidence')}] {p['package_name']} をスタブ化できます"
+                          f"（約 {p.get('estimated_savings_mb', 0.0):.1f} MB。条件: {text or '—'} を使わない。プロジェクト内の使用 {uses} 件）"))
+    cond_recs.sort(key=lambda x: (0 if x[0] == "high" else 1, x[1]))
+    py = f", python_path={python_path!r}" if python_path else ""
+    steps = [
+        "1. 推奨の上から選ぶ（[high] = 障害は依存ライブラリ内の過大近似だけで、プロジェクトのコードに条件の入口の使用が無い）",
+        f"2. サブモジュールなら generate_submodule({entry!r}, <親>, <サブモジュール>{py})、パッケージなら generate(...) でスタブを作る",
+        f"3. verify({entry!r}{py}, packages=[...], submodules=['<サブモジュール>=><排除する C 拡張>'], run_entry=True) で確かめる",
+        "4. build_instructions の手順で適用 → ビルド → 実行結果を元と比べる → 手順どおり復元",
+    ]
+    return {
+        "proven_savings_mb": round(proven_mb, 1),
+        "conditional_high_savings_mb": round(high_mb, 1),
+        "conditional_high_count": high_n,
+        "recommendations": [r for _, _, r in cond_recs if r.startswith("[high]")] + recs + [
+            r for _, _, r in cond_recs if not r.startswith("[high]")],
+        "next_steps": steps,
+        "note": "[high] / [low] は条件付き候補（安全の証明ではありません）。stubbable / submodule_stub_hints だけが証明済みです。",
+    }
