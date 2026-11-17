@@ -123,7 +123,7 @@ class PackageAnalysis:
     conditions_total: int = 0
     conditions_complete: bool = True  # False: プロジェクトに解決できない同名の呼び出しがある
     confidence_reason: str = ""  # low の理由（1 行）
-    unproven_because: list[str] = field(default_factory=list)
+    conditional_because: list[str] = field(default_factory=list)
     confidence: str = ""
     conditional_submodule_stubs: list[SubmoduleStubHint] = field(default_factory=list)
 

@@ -567,10 +567,10 @@ class _StubBuilder:
             bases = self._exc_bases(info, ci)
             known = self._class_known(info, ci)
             if not self.p.class_is_plain(r.module, r.target) and not self.loud_note:
-                known = None  # Enum 等: 属性の有無を静的に決めない（証明済みのスタブ。条件付きは元の名前の一覧を持つ）
+                known = None  # Enum 等: 属性の有無を静的に決めない（止まらないスタブの場合。仕上げの回から全てのスタブが止まるスタブで、元の名前の一覧を持つ）
         body: list[str] = [f"    _pystub_known = {repr(frozenset(sorted(known))) if known is not None else 'None'}"]
         if self.loud_note and ci is not None and ci.doc is not None:
-            body.append(f"    __doc__ = {ci.doc!r}")  # 条件付き: 元の docstring を写す（証明済みのスタブは変えない）
+            body.append(f"    __doc__ = {ci.doc!r}")  # 条件付き: 元の docstring を写す（全てのスタブ）
         if self.loud_note:
             # 条件付き: 属性の種類（c: クラス / f: 関数・メソッド / v: 値）と、普通のクラスでない印
             kinds = {}
@@ -951,7 +951,10 @@ def _conditional_note(graph, sem: Semantics, prefix: str, is_package: bool) -> t
         if uses and not any(is_certain_use(sem, u, ev) for u, ev, _ in uses):
             info = build_conditions(sem, uses, prefix)
     if not info:
-        return "", None
+        # 静的解析で使用が見つからなかった候補（stubbable・サブモジュールのヒント）も、条件付きと同じ止まり方にする
+        # （仕上げの回: 静的解析は保証しないので、使われたら原因を出して終了コード 70 で止まるのが最後の安全網）
+        return (f"{prefix} は、静的解析で使用が見つからなかった候補として外されています"
+                "（verify・実行の記録で確かめた入力の外で使われました）"), None
     ents = []
     for g in info["conditions"][:3]:
         api = g.get("public_api") or ""

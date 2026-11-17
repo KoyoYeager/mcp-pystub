@@ -11,7 +11,7 @@ from mcp_pystub.analyzer import analyze  # noqa: E402
 from mcp_pystub.stub_generator import generate_stubs, generate_submodule_stubs  # noqa: E402
 
 D = Path(r"C:\tmp\pystub-e2e\designed")
-OUT = Path(r"C:\tmp\pystub-e2e\after_round7\designed")
+OUT = Path(r"C:\tmp\pystub-e2e\after_final\designed")
 OUT.mkdir(parents=True, exist_ok=True)
 SP = D / "venv/Lib/site-packages"
 PY = D / "venv/Scripts/python.exe"

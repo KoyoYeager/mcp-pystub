@@ -658,7 +658,7 @@ def _analyze_single_package(
             conditions_total=pending["total"],
             conditions_complete=pending.get("complete", True),
             confidence_reason=pending.get("confidence_reason", ""),
-            unproven_because=pending["because"],
+            conditional_because=pending["because"],
             confidence=pending["confidence"],
             **common,
         )
@@ -781,7 +781,7 @@ def find_submodule_hints(
                 return []
             cond_info[c] = info_c  # type: ignore[assignment]
     if allow_conditional and not cond_info:
-        return []  # 証明済みのヒントとして出せる（こちらには出さない）
+        return []  # 使用が見つからなかったヒントとして出せる（こちらには出さない）
     # 静的な import グラフ（PyInstaller が同梱する範囲 ⊇ 実行時に読み込まれる範囲）から T が消えること。
     # T のフック（ビルド時の起点）は、T がグラフから消えれば実行されない
     after = graph_closure(graph, entry, excludes=tuple(chosen))

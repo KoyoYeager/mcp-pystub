@@ -41,6 +41,11 @@ build-backend = "hatchling.build"
 packages = ["mcp_pystub"]
 
 [tool.hatch.build.targets.sdist]
+# テスト用の空の拡張モジュール（.pyd / .so）は既定で落ちるので明示する（test_submodule_stubs が使う）
+artifacts = [
+    "/tests/fixtures/**/*.pyd",
+    "/tests/fixtures/**/*.so",
+]
 include = [
     "/mcp_pystub",
     "/tests",

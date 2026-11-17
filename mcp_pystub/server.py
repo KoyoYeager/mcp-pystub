@@ -11,6 +11,11 @@ from mcp_pystub.analyzer import analyze, check_usage, inspect_graph
 from mcp_pystub.stub_generator import generate_stubs, generate_submodule_stubs
 
 mcp = FastMCP("pystub")
+try:  # serverInfo.version を mcp SDK の版でなく mcp-pystub の版にする（FastMCP に版の引数が無いため、内部のサーバーに設定）
+    from mcp_pystub import __version__ as _pystub_version
+    mcp._mcp_server.version = _pystub_version
+except Exception:  # noqa: BLE001
+    pass
 
 
 @mcp.tool()
@@ -25,9 +30,9 @@ def analyze(
     スタブ置換可能なパッケージを自動検出します。
 
     各パッケージは以下のいずれかに判定されます:
-    - stubbable: スタブ化可能（プロジェクトの実行パスで未使用）
-    - nofollow: try/except 保護あり（--nofollow-import-to で除外推奨）
-    - required: スタブ化不可（実際に使用されている）
+    - stubbable: 静的解析で使用が見つからなかった候補（保証ではありません）
+    - nofollow: try/except で保護された import だけで、参照が見つからなかった除外の候補（--nofollow-import-to）
+    - required: 使用が見つかった、または判断できない（実行の記録で未使用と分かれば候補になりうる: trace_candidates）
 
     stubbable / nofollow / submodule_stub_hints は、静的解析で使用が見つからなかった候補です（保証ではありません）。
     別のキー conditional / conditional_submodule_hints は「安全は示せないが、列挙した機能を使わないなら
@@ -137,7 +142,7 @@ def generate_submodule(
     このツールを使用してください。
 
     復元失敗を防ぐため、バックアップ・バージョン固定・検証ステップを
-    含むビルド手順を生成します。
+    含むビルド手順を生成します（バージョン固定は配布物の情報（dist-info の版）がある時だけで、無い時は版なしになります）。
 
     Args:
         entry_point: プロジェクトのエントリーポイントファイルパス
@@ -173,7 +178,7 @@ def verify(
 
     警告: run_entry=True と実行の記録（record=True）は対象のプログラムを実際に実行します。ファイルの書き込み・削除、通信、機器の操作などの副作用が
     起きえます。AI エージェントは、利用者が明示的に求めた時だけ run_entry=True / record=True を指定してください。GUI や常駐型の
-    プログラムは終了しないので timeout で打ち切られます。既定（run_entry=False）は import だけで、別の子プロセスでグラフ上のモジュールを import します（各モジュールの直下のコードは動きますが、エントリーのスクリプトは動かしません。エントリーを import するローカルのモジュールは対象から外し、import の途中でエントリーのファイルを開く操作は止めます。Python の `open` を通る読み込みは、別名（短いパス名・拡張パス形式・UNC・ハードリンク）でも、ファイルの同一性で見分けて止めます。OS のコピー API（`shutil.copy2` の CopyFile2 など）、ctypes、外部コマンド（`cmd /c type` 等）での読み込みと、それでコピーしたファイル経由の import（zipimport 等）は止められません）。run_entry=True のエントリーは、標準出力をファイルにつないだ普段の起動と同じ条件（主な違いは PYTHONPATH の先頭の起動用フォルダと環境変数 MCP_PYSTUB_BOOT の 2 つ。ほかの違いは README の表を参照: 標準入力は空、標準出力はファイル、import sitecustomize が成功する、元のパッケージのファイルがディスクに残る、など。子プロセスは監査イベントで分かる起動を親子の対応で確かめ、ctypes・COM / WMI 経由の起動は検出できません。MPLBACKEND などは付けないので、窓を開くエントリーは呼ぶ側の環境変数で指定してください）で動かします。timeout は子プロセス 1 回あたりで、打ち切った時と終わった後は孫を含むプロセスの木を止めます。結果の verified_sets（確かめた組）をそのまま適用してください。一部だけを適用するなら、その組で確かめ直してください。確認済み（実行）は、下の表の違いの範囲で、動かした入力について確かめた結果です。配布前に、ビルドした exe を普段のやり方で試してください。
+    プログラムは終了しないので timeout で打ち切られます。既定（run_entry=False）は import だけで、別の子プロセスでグラフ上のモジュールを import します（各モジュールの直下のコードは動きますが、エントリーのスクリプトは動かしません。エントリーを import するローカルのモジュールは対象から外し、import の途中でエントリーのファイルを開く操作は止めます。Python の `open` を通る読み込みは、別名（短いパス名・拡張パス形式・UNC・ハードリンク）でも、ファイルの同一性で見分けて止めます。OS のコピー API（`shutil.copy2` の CopyFile2 など）、ctypes、外部コマンド（`cmd /c type` 等）での読み込みと、それでコピーしたファイル経由の import（zipimport 等）は止められません）。run_entry=True のエントリーは、標準出力をファイルにつないだ普段の起動と同じ条件（主な違いは PYTHONPATH の先頭の起動用フォルダと環境変数 MCP_PYSTUB_BOOT の 2 つ。ほかの違いは README の表を参照: 標準入力は空、標準出力はファイル、import sitecustomize が成功する、元のパッケージのファイルがディスクに残る、など。子プロセスは監査イベントで分かる起動を親子の対応で確かめ、ctypes・COM / WMI 経由の起動は検出できません。MPLBACKEND などは付けないので、窓を開くエントリーは呼ぶ側の環境変数で指定してください）で動かします。timeout は子プロセス 1 回あたりで、打ち切った時と終わった後は孫を含むプロセスの木を止めます。結果の verified_sets（確かめた組）をそのまま適用してください。一部だけを適用するなら、その組で確かめ直してください。確認済み（実行）は、README の「普段の実行との違い」の表の範囲で、動かした入力について確かめた結果です。配布前に、ビルドした exe を普段のやり方で試してください。
 
     静的解析（analyze）は候補を出すだけです。verify は生成したスタブを一時フォルダに置き、対象環境の
     python を子プロセスで起動して、import グラフ上の全モジュールを import します。site-packages は

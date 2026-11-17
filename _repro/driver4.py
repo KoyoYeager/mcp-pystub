@@ -245,7 +245,7 @@ def run(name, entry2=False):
     cond_pkgs += [p for p in extra if p not in cond_pkgs]
     R["only"], R["extra"] = only, extra
     R["summary"] = A.get("summary")
-    R["conditional"] = [{k: x.get(k) for k in ("package_name", "estimated_savings_mb", "conditions_total", "unproven_because", "confidence")}
+    R["conditional"] = [{k: x.get(k) for k in ("package_name", "estimated_savings_mb", "conditions_total", "conditional_because", "confidence")}
                         | {"conditions": [{k: g.get(k) for k in ("entry", "public_api", "entry_location", "why_unproven", "uses", "may_be_swallowed", "project_uses_count")}
                                           for g in x.get("conditions", [])]} for x in A.get("conditional", [])]
     R["conditional_hints"] = [{k: h.get(k) for k in ("submodule", "parent_package", "target_package", "estimated_savings_mb", "conditions_total", "confidence")}

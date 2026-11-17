@@ -126,7 +126,7 @@ def _analyze(entry_point: str, python_path: str, max_depth: int, include_small_c
         d = asdict(a)
         d["estimated_savings_mb"] = round(a.estimated_size_mb, 1)
         d["how_to_check"] = (f"verify({str(entry)!r}{py_arg}, packages=[{a.package_name!r}], submodules=[], "
-                             f"nofollow=[], run_entry=True)")
+                             f"nofollow=[], run_entry=True, record=True)")
         conditional.append(d)
     chints = []
     for a in required:
@@ -137,7 +137,7 @@ def _analyze(entry_point: str, python_path: str, max_depth: int, include_small_c
                 continue
             d = asdict(h)
             d["how_to_check"] = (f"verify({str(entry)!r}{py_arg}, packages=[], "
-                                 f"submodules=[{(h.submodule + '=>' + h.target_package)!r}], nofollow=[], run_entry=True)")
+                                 f"submodules=[{(h.submodule + '=>' + h.target_package)!r}], nofollow=[], run_entry=True, record=True)")
             chints.append(d)
     # 同じパッケージに全体とサブモジュールの両方を提案しない（全体が出るならサブは出さない: 仕様 7 節）
     whole = {a["package_name"] for a in result_dict["stubbable"]} | {d["package_name"] for d in conditional}
@@ -164,11 +164,11 @@ def _analyze(entry_point: str, python_path: str, max_depth: int, include_small_c
     result_dict["next_steps"] = [
         "手順 1: verify(entry_point, python_path, packages=[...], submodules=[...], nofollow=[...]) で、スタブに差し替えて "
         "import できることを確かめてください（既定は import だけ: 別の子プロセスでグラフ上のモジュールを import する。各モジュールの直下のコード（import 時のコード）は動くが、エントリーのスクリプトは動かさない（エントリーを import するローカルのモジュールは対象から外し、import の途中でエントリーのファイルを開く操作は監査フックで止めて note に出す））。",
-        "手順 2: スタブを適用してビルドし、普段のやり方で exe を試してください（スタブに触れたら原因を出して終了コード 70 で止まります）。",
+        "手順 2: スタブを適用してビルドし、普段のやり方で exe を試してください（全てのスタブ（stubbable・サブモジュールのヒント・条件付き・記録からの候補）は、使われた時点で原因を出して終了コード 70 で止まります（except で握りつぶせません。MCP_PYSTUB_STRICT=0 の時だけ例外）。ただし README の「止まらない操作」（スタブのクラスそのものの ==・hash・真偽・repr、isinstance の判定、元に無い属性の AttributeError など）は止まりません）。",
         "任意: エントリーを動かしても安全な時（副作用が無い・試験用の引数や入力がある）だけ、run_entry=True や実行の記録"
         "（python -m mcp_pystub.trace）でより強く確かめられます。",
         "この結果は静的解析による候補です（実行の保証ではありません）。verify は site-packages を書き換えません。",
-        "確認済み（実行）は、下の表の違いの範囲で、動かした入力について確かめた結果です。配布前に、ビルドした exe を普段のやり方で試してください。",
+        "確認済み（実行）は、README の「普段の実行との違い」の表の範囲で、動かした入力について確かめた結果です。配布前に、ビルドした exe を普段のやり方で試してください。",
     ]
 
     return result_dict
@@ -422,11 +422,11 @@ def _cond_text(conds: list[dict], total: int, complete: bool = True) -> tuple[st
 
 def _summary(rd: dict, entry: str, python_path: str, required: list) -> dict:
     """結果の先頭に置く要約: 使用が見つからなかった候補・条件付き（high）の削減見込みと、次の手順。"""
-    proven_mb = sum(p.get("estimated_size_mb", 0.0) for p in rd["stubbable"]) + \
+    static_mb = sum(p.get("estimated_size_mb", 0.0) for p in rd["stubbable"]) + \
         sum(p.get("estimated_size_mb", 0.0) for p in rd["nofollow"])
     size_of = {a.package_name: a.estimated_size_mb for a in required}
-    proven_targets = {h["target_package"] for h in rd.get("submodule_stub_hints", [])}
-    proven_mb += sum(size_of.get(t, 0.0) for t in proven_targets)
+    static_targets = {h["target_package"] for h in rd.get("submodule_stub_hints", [])}
+    static_mb += sum(size_of.get(t, 0.0) for t in static_targets)
     recs: list[str] = []
     for p in rd["stubbable"]:
         if p.get("trace_conflict"):
@@ -469,12 +469,11 @@ def _summary(rd: dict, entry: str, python_path: str, required: list) -> dict:
     steps = [
         f"1. verify({entry!r}{py}, packages=[...], submodules=['<サブモジュール>=><排除する C 拡張>']) で、スタブに差し替えて"
         "import できることを確かめる（既定は import だけ: 別の子プロセスでグラフ上のモジュールを import する。各モジュールの直下のコード（import 時のコード）は動くが、エントリーのスクリプトは動かさない（エントリーを import するローカルのモジュールは対象から外し、import の途中でエントリーのファイルを開く操作は監査フックで止めて note に出す））",
-        "2. スタブを適用してビルドし、普段のやり方で exe を試す（スタブに触れる経路を通ったら原因を出して終了コード 70 で止まる）",
+        "2. スタブを適用してビルドし、普段のやり方で exe を試す（全てのスタブ（stubbable・サブモジュールのヒント・条件付き・記録からの候補）は、使われた時点で原因を出して終了コード 70 で止まります（except で握りつぶせません。MCP_PYSTUB_STRICT=0 の時だけ例外）。ただし README の「止まらない操作」（スタブのクラスそのものの ==・hash・真偽・repr、isinstance の判定、元に無い属性の AttributeError など）は止まりません）",
         "（任意）エントリーを動かしても安全な時（副作用が無い・試験用の引数や入力がある）だけ、verify(..., run_entry=True) や"
         "実行の記録（python -m mcp_pystub.trace）でより強く確かめられる",
-        "推奨の読み方: 上から選ぶ。[high] = プロジェクトが、入口に届く公開関数を 1 つも呼んでいない（入口の列挙が完了し、入口へ"
-        "入る辺が登録・間接呼び出しの仕組みでない）。[low] = プロジェクトが入口に届く公開関数を呼んでいる・経路が間接的"
-        "（条件を破る入力では終了コード 70 で止まる。理由は confidence_reason）",
+        "推奨の読み方: 上から選ぶ。[high] / [low] は静的解析の規則による参考の表示です（経路が無いことの保証ではありません）。"
+        "[low] の理由は confidence_reason。条件を破る入力では終了コード 70 で止まる",
         f"スタブの作り方: サブモジュールなら generate_submodule({entry!r}, <親>, <サブモジュール>{py})、パッケージなら generate(...)。"
         "適用・復元は build_instructions の手順で",
     ]
@@ -487,14 +486,14 @@ def _summary(rd: dict, entry: str, python_path: str, required: list) -> dict:
         **obs,
         "checks_done": ("静的解析" + ("、実行の記録（読み込み）" if "trace" in rd else "")
                         + "。verify は未実施（確認の状態は verify の status_summary に出ます）"),
-        "proven_savings_mb": round(proven_mb, 1),
+        "static_candidate_size_mb": round(static_mb, 1),
         "conditional_high_savings_mb": round(high_mb, 1),
         "conditional_high_count": high_n,
         "recommendations": [r for _, _, r in cond_recs if r.startswith("[high]")] + recs + [
             r for _, _, r in cond_recs if not r.startswith("[high]")],
         "next_steps": steps,
         "note": "stubbable / submodule_stub_hints は静的解析で使用が見つからなかった候補、[high] / [low] は条件付きの候補です。どちらも保証ではありません。実際に外せるかは verify（既定は import だけ）とビルド後の実行で確かめます。エントリーを動かして安全なら run_entry=True と実行の記録でより強く確かめられます。",
-        "closing_note": "確認済み（実行）は、下の表の違いの範囲で、動かした入力について確かめた結果です。配布前に、ビルドした exe を普段のやり方で試してください。",
+        "closing_note": "確認済み（実行）は、README の「普段の実行との違い」の表の範囲で、動かした入力について確かめた結果です。配布前に、ビルドした exe を普段のやり方で試してください。",
         "size_note": "MB はインストール済みのファイルの大きさ（__pycache__ を除く）で、exe の削減量ではありません"
                      "（PyInstaller が同梱する範囲・圧縮で変わります）。",
     }

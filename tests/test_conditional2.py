@@ -66,7 +66,7 @@ def test_summary_is_first_and_lists_high_first(tmp_path):
     res = analyze(str(tmp_path / "proj" / "main.py"), python_path=str(tmp_path / "sp"), include_small_conditional=True)
     assert list(res)[0] == "summary"
     s = res["summary"]
-    assert "proven_savings_mb" in s and "conditional_high_savings_mb" in s and s["next_steps"]
+    assert "static_candidate_size_mb" in s and "conditional_high_savings_mb" in s and s["next_steps"]
     cond = {p["package_name"]: p for p in res["conditional"]}
     assert cond["gx"]["confidence"] == "high"
     assert cond["gx"]["conditions"][0]["project_uses_count"] == 0

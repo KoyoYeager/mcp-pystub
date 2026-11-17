@@ -65,8 +65,8 @@ stubbable には混ざりません。各候補に、推定の削減量・条件�
 と原因を書いて **終了コード 70 で即終了**します（`except` で握りつぶせません）。標準エラーが無い窓のない exe では、
 原因を exe のあるフォルダ（書けなければ一時フォルダ）の `pystub_stop.log` に書きます。`MCP_PYSTUB_STRICT=0` を付けた時だけ
 `PystubConditionalStubError` を投げる動作になります（呼び出し元の `except Exception` 等で握りつぶされうる箇所は条件の
-`may_be_swallowed` に出ます）。スタブのクラスそのものの `==`・hash・真偽・repr は元のクラスと同じ動作で、元に無い属性は
-`AttributeError` になります。
+`may_be_swallowed` に出ます）。**止まらない操作**: スタブのクラスそのものの `==`・hash・真偽・repr は元のクラスと同じ動作で、元に無い属性は
+`AttributeError` になります（isinstance の判定も止まりません）。この止まり方は、stubbable・サブモジュールのヒントを含む全てのスタブで同じです（仕上げの回で統一。nofollow はビルドから外すだけ）。
 
 **制限**: 子プロセス（multiprocessing・concurrent.futures・subprocess）の中で止まった場合、親が終了コードや例外として
 受け取って処理を続けることがあります。即終了なので、書き込み途中のファイルが残り、`atexit` / `finally` は実行されません。
@@ -127,13 +127,13 @@ exe の削減量ではありません（実際の削減は PyInstaller の同梱
 | 層 | 役割 | 保証 |
 |---|---|---|
 | 静的解析（`analyze`） | 候補を出し、サイズ順に並べ、理由（使われ方・条件・confidence）を説明する | 保証しない（提案） |
-| 動的解析（`verify(run_entry=True)` と実行の記録） | エントリーを実際に動かし、候補が実行されたか（記録）と、スタブに差し替えても動作が変わらないか（verify）を確かめる | **標準出力をファイルにつないだ普段の実行（`python entry.py 引数… > out.txt`）と、下の表の違いの範囲で同じ条件で動かした入力では、標準出力と終了コードが変わらない**。比べるのは標準出力のバイト列の全体と終了コードだけ（標準エラー・ファイル・通信は比べない）。確かめた組（`verified_sets`）をそのまま適用した場合だけ。親子の対応が合わない子プロセス（下の「記録と差し込みの制限」）、`.pth` で起動時に読み込まれるパッケージは確認済み（実行）にしない。確認済み（実行）は、下の表の違いの範囲で、動かした入力について確かめた結果です。配布前に、ビルドした exe を普段のやり方で試してください。 |
-| 実行時（止まるスタブ） | 動かしていない経路でスタブに触れたら、原因を出して終了コード 70 で止まる（条件付きのスタブ） | 黙って結果が変わらない（下の制限を除く） |
+| 動的解析（`verify(run_entry=True)` と実行の記録） | エントリーを実際に動かし、候補が実行されたか（記録）と、スタブに差し替えても動作が変わらないか（verify）を確かめる | **標準出力をファイルにつないだ普段の実行（`python entry.py 引数… > out.txt`）と、「普段の実行との違い」の表の範囲で同じ条件で動かした入力では、標準出力と終了コードが変わらない**。比べるのは標準出力のバイト列の全体と終了コードだけ（標準エラー・ファイル・通信は比べない）。確かめた組（`verified_sets`）をそのまま適用した場合だけ。親子の対応が合わない子プロセス（下の「記録と差し込みの制限」）、`.pth` で起動時に読み込まれるパッケージは確認済み（実行）にしない。確認済み（実行）は、README の「普段の実行との違い」の表の範囲で、動かした入力について確かめた結果です。配布前に、ビルドした exe を普段のやり方で試してください。 |
+| 実行時（止まるスタブ） | 動かしていない経路でスタブに触れたら、原因を出して終了コード 70 で止まる（全てのスタブ。nofollow はビルドから外すだけ） | 黙って結果が変わらない（「止まらない操作」と下の制限を除く） |
 
-**保証の締め**: 確認済み（実行）は、下の表の違いの範囲で、動かした入力について確かめた結果です。配布前に、ビルドした exe を普段のやり方で試してください。
+**保証の締め**: 確認済み（実行）は、README の「普段の実行との違い」の表の範囲で、動かした入力について確かめた結果です。配布前に、ビルドした exe を普段のやり方で試してください。
 
 **確認の手順**: (1) `verify`（既定は import だけ: 別の子プロセスでグラフ上のモジュールを import する。各モジュールの直下のコード（import 時のコード）は動くが、エントリーのスクリプトは動かさない（エントリーを import するローカルのモジュールは対象から外し、import の途中でエントリーのファイルを開く操作は監査フックで止めて note に出す。Python の `open` を通る読み込みは、別名（短いパス名・`\\?\`・UNC・ハードリンク）でも、ファイルの同一性で見分けて止めます。OS のコピー API（`shutil.copy2` の CopyFile2 など）、ctypes、外部コマンド（`cmd /c type` 等）での読み込みと、それでコピーしたファイル経由の import（zipimport 等）は止められません））→ (2) スタブを適用してビルドし、普段のやり方で exe を
-試す（スタブに触れたら原因を出して終了コード 70 で止まる）→（任意）エントリーを動かしても安全な時だけ `run_entry=True` や
+試す（全てのスタブ（stubbable・サブモジュールのヒント・条件付き・記録からの候補）は、使われた時点で原因を出して終了コード 70 で止まります（except で握りつぶせません。MCP_PYSTUB_STRICT=0 の時だけ例外）。ただし README の「止まらない操作」（スタブのクラスそのものの ==・hash・真偽・repr、isinstance の判定、元に無い属性の AttributeError など）は止まりません）→（任意）エントリーを動かしても安全な時だけ `run_entry=True` や
 実行の記録でより強く確かめる。
 
 > **警告**: `run_entry=True` と実行の記録は、対象のプログラムを実際に実行します。ファイルの書き込み・削除、通信、機器の操作などの
@@ -153,7 +153,7 @@ exe の削減量ではありません（実際の削減は PyInstaller の同梱
 | PYTHONPATH | 利用者の値 | 先頭に起動用フォルダ + 利用者の値（起動後、`sys.path` からは起動用フォルダを外す） | 残る違い（起動用） |
 | 起動用の環境変数 | なし | `MCP_PYSTUB_BOOT`（子孫では値の末尾に `#d`） | 残る違い（起動用） |
 | PYTHONIOENCODING / MPLBACKEND / QT_QPA_PLATFORM / PYTHONNOUSERSITE / PYTHONDONTWRITEBYTECODE | 利用者の値 | verify を呼ぶ側（MCP サーバーのプロセス）の値のまま（付けない・消さない） | 無くした（ただし MCP サーバーを普段と違う環境変数で起動していると、その違いはそのまま入る。文書） |
-| 標準出力 | パイプ・ファイル・コンソール | ファイル（`sys.stdout` は差し替えない。`fileno()`・`encoding`・`reconfigure()` はファイルにつないだ普段の実行と同じ） | 文書: 普段がパイプやコンソールの場合とは種類が違う（`isatty` や FIFO かどうかで分岐するプログラムは結果が変わりうる） |
+| 標準出力 | パイプ / ファイル / コンソール | ファイル（`sys.stdout` は差し替えない。`fileno()`・`encoding`・`reconfigure()` はファイルにつないだ普段の実行と同じ） | 文書: 普段がパイプやコンソールの場合とは種類が違う（`isatty` や FIFO かどうかで分岐するプログラムは結果が変わりうる） |
 | 標準エラー | 端末・ファイル | ファイル（比べない。表示用） | 文書（比べない） |
 | 標準入力 | 端末 | 空（DEVNULL） | 文書 |
 | `sys.argv` / `__main__` / `__file__` / `sys.path[0]` | `python entry.py` のとおり | 同じ（エントリーを直接起動） | 無くした |
@@ -179,8 +179,8 @@ exe の削減量ではありません（実際の削減は PyInstaller の同梱
 サブインタープリターは子孫として数えず、その中の起動の数を親のプロセスに足します）。検出は既知の経路に対するもので、完全ではありません。
 3.12 より前は `threading.setprofile` を使うので、
 `_thread.start_new_thread` で直接起動したスレッドの中は記録されません。ファイルの無いコードのうち、所属のモジュールを
-決められないもの（実在しない `__name__` のグローバルで exec し、最初の引数も所属を示さない関数: N12。実在しないファイル名で
-compile した関数: N13）は記録から所属のパッケージに数えられません（verify の差し替え実行では却下されます）。
+決められないもの（実在しない `__name__` のグローバルで exec し、最初の引数も所属を示さない関数や、実在しないファイル名で
+compile した関数）は記録から所属のパッケージに数えられません（verify の差し替え実行では却下されます）。
 **記録は普段と同じ環境（環境変数・設定ファイル・入力）で取ってください**（試験で `MPLBACKEND=Agg` を付けると、普段使う GUI の
 バックエンドが未実行に見えます）。
 
@@ -193,7 +193,18 @@ python -m mcp_pystub.trace --out trace.json -m pytest tests/             # -m �
 python -m mcp_pystub.trace --out trace.json --append entry.py 別の引数   # 複数回の実行を合算
 ```
 
-対象環境の python で動かします（`mcp_pystub` が import できるように `PYTHONPATH` を通す）。Python 3.12 以降は
+対象環境の python で動かします。サーバーの環境の site-packages を `PYTHONPATH` に通すと、対象環境に別の版の
+パッケージ（mcp など）が見えて壊れるので、**mcp_pystub だけを置いたフォルダ**を使ってください（trace は mcp を使いません）:
+
+```bash
+# 1 回だけ: mcp_pystub だけを置いたフォルダを作る（依存は入れない。wheel か、このリポジトリのフォルダを指定）
+python -m pip install --no-deps --target C:\tools\pystub_trace mcp_pystub-0.3.0-py3-none-any.whl
+# 記録を取る（対象の venv の python で）
+set PYTHONPATH=C:\tools\pystub_trace
+C:\project\.venv\Scripts\python.exe -m mcp_pystub.trace --out trace.json entry.py 引数...
+```
+
+Python 3.12 以降は
 `sys.monitoring`（関数の開始イベント）、それより前は `sys.setprofile` + `threading.setprofile` で記録します。
 
 - `analyze(..., trace_files=[...])`: 記録を読むだけで実行はしません。各候補に `observed`（`not_imported` / `import_only` /
@@ -273,44 +284,43 @@ mcp-pystub
 
 #### analyze
 
+12_asammdf（`C:\tmp\pystub-e2e\12_asammdf`）の実際の出力の抜粋:
+
 ```
 入力 / Input:
-  entry_point: "C:/project/converter.py"
-  python_path: "C:/project/.venv/Lib/site-packages"
+  entry_point: "C:/tmp/pystub-e2e/12_asammdf/proj/entry.py"
+  python_path: "C:/tmp/pystub-e2e/12_asammdf/venv/Lib/site-packages"
 
-出力 / Output:
+出力 / Output（抜粋）:
   {
-    "stubbable": [
-      {"package_name": "pandas", "estimated_size_mb": 59.7, "reason": "依存ライブラリ経由でのみ import..."}
-    ],
+    "summary": {"static_candidate_size_mb": 0, "conditional_high_savings_mb": 646.7, "conditional_high_count": 1,
+                "recommendations": [...], "next_steps": [...], "note": "...", "closing_note": "...", "size_note": "..."},
+    "stubbable": [],
     "required": [
-      {"package_name": "numpy", "reason": "プロジェクトコードが直接 import し使用"},
-      {"package_name": "PySide6", "estimated_size_mb": 523.2,
-       "reason": "C 拡張...ただし asammdf.gui をスタブ化することで間接排除が可能",
-       "submodule_stubs": [{"submodule": "asammdf.gui", "target_package": "PySide6"}]}
+      {"package_name": "PySide6", "estimated_size_mb": 646.7, "reason": "...", "submodule_stubs": []},
+      ...
     ],
-    "nofollow": [
-      {"package_name": "mpmath"}
-    ],
+    "nofollow": [],
     "submodule_stub_hints": [],
     "conditional": [
-      {"package_name": "pandas", "verdict": "conditional", "estimated_savings_mb": 44.6,
-       "conditions": [{"entry": "asammdf.Signal.plot()", "why_unproven": "名前だけの振り分け ...",
-                       "path": ["asammdf.Signal.plot()", "..."]}],
-       "how_to_check": "verify('C:/project/converter.py', python_path=..., packages=['pandas'], ..., run_entry=True)"}
+      {"package_name": "pandas", "estimated_savings_mb": 37.0, "confidence": "low", "confidence_reason": "...",
+       "conditions": [...],
+       "how_to_check": "verify(..., packages=['pandas'], submodules=[], nofollow=[], run_entry=True, record=True)"}
     ],
     "conditional_submodule_hints": [
-      {"submodule": "asammdf.gui", "target_package": "PySide6", "estimated_savings_mb": 646.7,
-       "conditional": true,
-       "conditions": [{"entry": "asammdf.Signal.plot()", "public_api": "...", "why_unproven": "名前だけの振り分け ..."}],
-       "how_to_check": "verify(..., submodules=['asammdf.gui=>PySide6'], run_entry=True)"}
+      {"submodule": "asammdf.gui", "target_package": "PySide6", "estimated_savings_mb": 646.7, "confidence": "high",
+       "conditions": [{"entry": "asammdf.gui 以下を import・使用しない", "why_unproven": "スタブにするサブモジュール自身の中の入口"}, ...],
+       "how_to_check": "verify(..., packages=[], submodules=['asammdf.gui=>PySide6'], nofollow=[], run_entry=True, record=True)"},
+      {"submodule": "asammdf.gui", "target_package": "lxml", "estimated_savings_mb": 8.5, "confidence": "low", ...}
     ],
     "verify_status": "未実施",
-    "analysis_time_ms": 6478
+    "analysis_time_ms": 18082
   }
 ```
 
-> 出力例の数値は説明用です（実測は上の「実証データ」）。
+サブモジュールのヒントは、確かめられる候補なら `submodule_stub_hints`、条件付きなら `conditional_submodule_hints` に出ます
+（required の `submodule_stubs` は、この例のように空のことがあります）。同じパッケージが stubbable と conditional の両方に
+載ることはありません。
 
 #### verify
 
@@ -399,7 +409,7 @@ python -m pytest tests/ -v
 
 | テスト種別 | 結果 |
 |-----------|------|
-| ユニットテスト（tests/、攻撃シナリオの回帰を含む） | 件数は下の変更履歴の版の時点の全件で全通過 |
+| ユニットテスト（tests/、攻撃シナリオの回帰を含む） | 全通過（件数は下の変更履歴に書く） |
 | 実ビルド（上の実証データの 6 本） | exe の出力一致・復元一致 |
 
 ## ライセンス / License
@@ -410,6 +420,11 @@ MIT
 
 ### 0.3.0（未公開）
 
+- テスト: tests/ の全件（358 件）が通過（仕上げの回の時点）
+- 全てのスタブ（stubbable・サブモジュールのヒントを含む）を、使われたら原因を出して終了コード 70 で止まる形にそろえた
+  （nofollow はビルドから外すだけ）
+- 出力キーの改名（未公開のため）: summary の `proven_savings_mb` → `static_candidate_size_mb`、
+  conditional の `unproven_because` → `conditional_because`
 - パッケージ名を `src` から `mcp_pystub` に変えた（`python -m mcp_pystub.trace` など）
 - 判定を 3 層に分けた: 静的解析（候補を出すだけ。保証ではない）・動的解析（`verify`、実行の記録）・実行時（止まるスタブ、終了コード 70）
 - 追加: `verify` ツール（import だけの確認が既定。`run_entry=True`・`record=True`・`trace_files`・`entry_args`・`cwd`・`timeout`）、
