@@ -16,15 +16,15 @@ When building Python apps into executables, heavy packages imported at module le
 
 ### 実証データ / Verified Results
 
-測定条件: Windows 11、Python 3.13、PyInstaller（onefile）、各シナリオの `entry.py`（`C:\tmp\pystub-e2e` の合成シナリオ）。
-exe の出力が元と一致することと、site-packages の復元が元と一致することを確かめた値です（第 9〜10 回の独立検証で再現）。
+測定条件: Windows 11、Python 3.13、PyInstaller（onefile）、各ライブラリを使う小さな `entry.py` を 1 本ずつ用意したシナリオ。
+exe の出力が元と一致することと、site-packages の復元が元と一致することを確かめた値です（実装者とは別の検証者が再測定して再現）。
 
 | シナリオ | スタブなし | 適用後 | 適用した候補 |
 |---|---|---|---|
 | 12_asammdf | 240.1 MB | **36.9 MB** | 確認済み（実行）の `asammdf.gui`（PySide6・lxml を排除）だけ |
 | 12_asammdf | 240.1 MB | **25.1 MB** | 静的解析の候補を全部（pandas + asammdf.gui） |
 | 03_networkx | 76.7 MB | **40.8 MB** | scipy（記録からの候補）・fontTools・pandas |
-| 01_tqdm | 47.7 MB | **33.3 MB** | pandas・fontTools・PIL（記録からの候補）。仕上げの回で stubbable の pandas も止まるスタブにしたため、以前の 32.7 MB から +0.6 MB（スタブの各モジュールに止まる仕組みの本体と、クラスの代わりの名前の一覧が入るため） |
+| 01_tqdm | 47.7 MB | **33.3 MB** | pandas・fontTools・PIL（記録からの候補）。0.3.0 で stubbable の pandas も止まるスタブにしたため、以前の 32.7 MB から +0.6 MB（スタブの各モジュールに止まる仕組みの本体と、クラスの代わりの名前の一覧が入るため） |
 | 02_openpyxl | 26.2 MB | **20.3 MB** | openpyxl.drawing.image（PIL を排除） |
 | 15_pillow | 25.7 MB | **14.4 MB** | numpy |
 
@@ -76,7 +76,7 @@ site-packages の `.pth` と `sitecustomize` が起動時に実行するコー�
 
 | 値 | 意味 |
 |---|---|
-| `high` | 規則による参考の表示（8c0a487 の規則で凍結）: 入口の列挙が完了し、プロジェクトからの使用が 0 件、受け手の分からない同名の呼び出しも無く、入口へ入る辺が登録・間接呼び出しの仕組みでない。**確定した経路が無いことの保証ではありません**（例: 12 の asammdf.gui は high だが `asammdf.MDF.__init__()` からの経路が出る）。経路は `route_from_project`（確定）と `estimated_routes`（推定）に分けて出す |
+| `high` | 規則による参考の表示: 入口の列挙が完了し、プロジェクトからの使用が 0 件、受け手の分からない同名の呼び出しも無く、入口へ入る辺が登録・間接呼び出しの仕組みでない。**確定した経路が無いことの保証ではありません**（例: asammdf のシナリオの asammdf.gui は high だが `asammdf.MDF.__init__()` からの経路が出る）。経路は `route_from_project`（確定）と `estimated_routes`（推定）に分けて出す |
 | `low` | 条件を守れば外せるが、プロジェクトが入口に届く公開関数を呼んでいる（直接でも、ほかの関数を経てでも）・経路が間接的。解析したエントリーでは変わらなくても、別の入力で終了コード 70 で止まりうる。理由は `confidence_reason`（例: 「プロジェクトが `asammdf.MDF.append()` を呼んでいます。入力によってはここから … pandas に届きます」） |
 
 「推定」は、名前だけで結び付けた呼び出し（受け手の型が分からない `o.plot()` を同名のメソッド全てに結ぶ）、`__del__` のような
@@ -145,7 +145,7 @@ exe の削減量ではありません（実際の削減は PyInstaller の同梱
 
 ### 実行の記録 / Execution trace（任意）
 
-**普段の実行との違い**（第 9 回。verify のエントリー実行・import の確認・`python -m mcp_pystub.trace` の子プロセス）:
+**普段の実行との違い**（verify のエントリー実行・import の確認・`python -m mcp_pystub.trace` の子プロセス）:
 
 | 項目 | 普段の `python entry.py 引数… > out.txt` | verify / 記録 | 扱い |
 |---|---|---|---|
@@ -284,7 +284,7 @@ mcp-pystub
 
 #### analyze
 
-12_asammdf（`C:\tmp\pystub-e2e\12_asammdf`）の実際の出力の抜粋:
+asammdf のシナリオの実際の出力の抜粋:
 
 ```
 入力 / Input:
@@ -396,8 +396,8 @@ mcp-pystub
 
 ## パフォーマンス / Performance
 
-`C:\tmp\pystub-e2e` の 15 シナリオで、analyze は 1 シナリオ 0.7〜23 秒（第 7 回の測定。独立検証の再現では 2〜21 秒程度。第 1〜3 回の修正前の約 2 倍）、
-ピークメモリは最大 401 MB（11_sklearn。ほかは 400 MB 以下）。実行の記録の負荷は、記録しない実行の 1.3〜3.3 倍（10 シナリオ。実行が 0.1 秒程度の短い例ほど倍率が大きい）。
+検証用の 15 シナリオで、analyze は 1 シナリオ 0.7〜23 秒（0.2.0 の約 2 倍）、
+ピークメモリは最大 401 MB（scikit-learn のシナリオ。ほかは 400 MB 以下）。実行の記録の負荷は、記録しない実行の 1.3〜3.3 倍（10 シナリオ。実行が 0.1 秒程度の短い例ほど倍率が大きい）。
 
 ## テスト / Testing
 
@@ -418,12 +418,12 @@ MIT
 
 ## 変更履歴 / Changelog
 
-### 0.3.0（未公開）
+### 0.3.0
 
-- テスト: tests/ の全件（361 件）が通過（仕上げの回の時点）
+- テスト: tests/ の全件（361 件）が通過
 - 全てのスタブ（stubbable・サブモジュールのヒントを含む）を、使われたら原因を出して終了コード 70 で止まる形にそろえた
   （nofollow はビルドから外すだけ）
-- 出力キーの改名（未公開のため）: summary の `proven_savings_mb` → `static_candidate_size_mb`、
+- 出力キーの改名（開発中の名前から）: summary の `proven_savings_mb` → `static_candidate_size_mb`、
   conditional の `unproven_because` → `conditional_because`、conditions の `why_unproven` → `why_conditional`
 - パッケージ名を `src` から `mcp_pystub` に変えた（`python -m mcp_pystub.trace` など）
 - 判定を 3 層に分けた: 静的解析（候補を出すだけ。保証ではない）・動的解析（`verify`、実行の記録）・実行時（止まるスタブ、終了コード 70）
