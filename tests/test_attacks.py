@@ -262,9 +262,9 @@ def test_round9_import_only_never_runs_entry_90(tmp_path):
     assert json.loads(bad) == {}, bad
 
 
-# 第 10 回: 子プロセスは親子の対応で数える（A3 / A3b / A4 / A8）。直さない形は制限として名前を挙げ、README の該当の文と対応づける
+# 第 10 回: 子プロセスは親子の対応で数える（A3 / A3b / A4 / A8）。直さない形は制限として名前を挙げ、docs/ の該当の文と対応づける
 G9_FIXED = ["A3_I_child_spawns_grandchild", "A3b_E_child_spawns_grandchild", "A4_cmd_two_pythons", "A8_subinterp_plus_I_child"]
-# 制限（直さない）: 名前 -> README に書いてある文（その文が README にあることも確かめる）
+# 制限（直さない）: 名前 -> docs/ に書いてある文（その文が docs/ にあることも確かめる）
 G9_LIMITATIONS = {
     "A2_sitecustomize_branch": "`import sitecustomize` が成功する",
     "A2b_atexit_count_branch": "atexit の登録が 1 つ増える",
@@ -288,7 +288,8 @@ def test_round10_parent_child_matching(tmp_path):
 
 
 def test_round10_limitations_are_documented():
-    readme = (Path(__file__).resolve().parent.parent / "README.md").read_text(encoding="utf-8")
+    docs = Path(__file__).resolve().parent.parent / "docs"  # 制限の文は README から docs/ へ移した（仕組みと判定・安全性と制限）
+    readme = "\n".join((docs / n).read_text(encoding="utf-8") for n in ("how-it-works.md", "safety.md"))
     for name, text in {**G9_LIMITATIONS, **F4C_LIMITATIONS}.items():
         assert text in readme, (name, text)
 

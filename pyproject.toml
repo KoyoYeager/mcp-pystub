@@ -50,6 +50,8 @@ include = [
     "/mcp_pystub",
     "/tests",
     "/README.md",
+    "/README.ja.md",
+    "/CHANGELOG.md",
     "/LICENSE",
     "/pyproject.toml",
     "/server.json",
