@@ -115,7 +115,7 @@ def test_overlap_reverse_order(tmp_path):
     out = _run("d_overlap.py", tmp_path)
     assert "[after apply] lost=[]" in out, out
     assert "[after restore] lost=[] changed=[] bak_exists=False" in out, out
-    vc = [l for l in out.splitlines() if l.startswith("   python -c")]
+    vc = [l for l in out.splitlines() if l.startswith("   ") and "-c \"import" in l]
     assert vc and all(" -> 0 " in l for l in vc), vc
 
 

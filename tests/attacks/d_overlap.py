@@ -45,6 +45,6 @@ for g, n in ((gp, "pkg"), (gs, "sub")):
 state("after restore")
 print("verify_commands:", gp["build_instructions"]["verify_commands"])
 for c in gp["build_instructions"]["verify_commands"] + gs["build_instructions"]["verify_commands"]:
-    c2 = c.replace("python -c", f'"{sys.executable}" -c', 1)
-    r = subprocess.run([bash, "-c", c2], cwd=str(site), capture_output=True, text=True)
+    r = subprocess.run([bash, "-c", c], cwd=str(site), capture_output=True, text=True,
+                       env=dict(_os.environ, PYSTUB_PYTHON=sys.executable))
     print("  ", c[:80], "->", r.returncode, r.stdout.strip(), r.stderr.strip()[-120:])

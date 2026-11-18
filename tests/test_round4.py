@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import shutil
 import subprocess
 import sys
@@ -148,9 +149,9 @@ def test_verify_commands_detect_emptied_package(tmp_path):
     def run_all() -> list[int]:
         out = []
         for c in cmds:
-            c2 = c.replace("python -c", f'"{py}" -c', 1)
-            r = subprocess.run([BASH, "-c", c2], cwd=str(e.site), capture_output=True, text=True,
-                               encoding="utf-8", errors="replace")
+            assert "python -c" not in c.replace("PYSTUB_PYTHON", "")  # 素の python は使わない
+            r = subprocess.run([BASH, "-c", c], cwd=str(e.site), capture_output=True, text=True,
+                               encoding="utf-8", errors="replace", env=dict(os.environ, PYSTUB_PYTHON=py))
             out.append(r.returncode)
         return out
 

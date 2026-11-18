@@ -2,6 +2,13 @@
 
 [README に戻る](README.ja.md) | 各版の変更点。 / Changes in each release.
 
+## 未公開
+
+- 修正: venv がプロジェクトのフォルダの中にある配置（`myapp/main.py` と `myapp/.venv/Lib/site-packages`）で generate / generate_submodule / verify が
+  「python_path がプロジェクトと重なっています」と断られていたのを直した（名前が site-packages / dist-packages で、上に `pyvenv.cfg` がある場所に限る）
+- 修正: 復元の「方法 2」と verify_commands が PATH の素の `python` を使っていたのを、対象環境の python のフルパスに直した。
+  見つからない時は方法 2 を出さず notes に理由を書き、verify_commands は環境変数 `PYSTUB_PYTHON` が無ければ止まる形にした
+
 ## 0.3.0
 
 - テスト: tests/ の全件（361 件）が通過

@@ -431,6 +431,7 @@ class TestOtherFixes:
             "gns_b-2.0.dist-info/RECORD": "gns/b/__init__.py,,\n",
         }
         _write(tmp_path / "sp", sp)
+        _write(tmp_path / "Scripts", {"python.exe": b""})  # 対象環境の python（pip の再インストールの宛先）
         _write(tmp_path / "proj", {"main.py": "import gns.a\nprint('ok')\n", "pyproject.toml": ""})
         g = generate_stubs(str(tmp_path / "proj" / "main.py"), "gns", python_path=str(tmp_path / "sp"))
         cmd = [c for c in g["build_instructions"]["uninstall_commands"] if "pip install" in c][0]

@@ -681,6 +681,8 @@ class TestMisc:
             "requests-0.0.1.dist-info/top_level.txt": "requests\n",
             "libR/__init__.py": "import requests\ndef unused():\n    return requests.get()\n",
         }, {"main.py": "import libR\n"})
+        (s.sp.parent / "Scripts").mkdir(exist_ok=True)
+        (s.sp.parent / "Scripts" / "python.exe").write_bytes(b"")  # 対象環境の python（pip の宛先）
         g = generate_stubs(s.entry, "requests", python_path=str(s.sp))
         assert "__version__ = '0.0.1'" in g["files"]["requests/__init__.py"]
         assert any("requests==0.0.1" in c for c in g["build_instructions"]["uninstall_commands"])

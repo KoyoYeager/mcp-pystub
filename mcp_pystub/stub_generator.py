@@ -775,6 +775,14 @@ def _true_site_root(path: Path, given: Path) -> Path | None:
     return given.resolve()
 
 
+def _is_venv_site_packages(site_root: Path) -> bool:
+    """名前が site-packages / dist-packages で、上のどこかに pyvenv.cfg がある（= venv の中の）場所か。"""
+    sr = site_root.resolve()
+    if sr.name.lower() not in ("site-packages", "dist-packages"):
+        return False
+    return any((d / "pyvenv.cfg").is_file() for d in sr.parents)
+
+
 def _validate_target(name: str, main: Path, site_root: Path, entry: Path, resolver: ModuleResolver) -> str | None:
     """手順を出してよい対象か（仕様 7 節: site-packages の外・site-packages 自体は扱わない）。"""
     top = name.split(".")[0]
@@ -782,7 +790,10 @@ def _validate_target(name: str, main: Path, site_root: Path, entry: Path, resolv
         return f"'{top}' は標準ライブラリです"
     if not _is_within(main, site_root) or main.resolve() == site_root.resolve():
         return f"'{name}' の位置が site-packages の外です: {main}"
-    if _is_within(entry, site_root) or _is_within(site_root, entry.parent):
+    # venv（pyvenv.cfg つきの site-packages）がプロジェクトの下にあるのは普通の配置なので許す。
+    # entry が site-packages の中にある場合と、venv でない場所（親フォルダ等）がプロジェクトを含む場合は拒否のまま。
+    venv_in_project = _is_venv_site_packages(site_root) and not _is_within(entry, site_root)
+    if _is_within(entry, site_root) or (_is_within(site_root, entry.parent) and not venv_in_project):
         return f"python_path（{site_root}）がプロジェクトと重なっています"
     for d in resolver._stdlib_dirs:
         if (_is_within(d, site_root) or _is_within(site_root, d)) and site_root.name.lower() not in (
@@ -790,7 +801,7 @@ def _validate_target(name: str, main: Path, site_root: Path, entry: Path, resolv
         ):
             return f"python_path（{site_root}）が標準ライブラリの場所と重なっています"
     for root in resolver._local_roots:
-        if _is_within(main, root) and not _is_within(root, site_root):
+        if _is_within(main, root) and not _is_within(root, site_root) and not venv_in_project:
             return f"'{name}' はプロジェクト内のモジュールです: {main}"
     return None
 
@@ -1065,15 +1076,24 @@ def _get_pip_name(package_name: str) -> str:  # 互換
     return package_name
 
 
-def _verify_import_cmd(m: str, import_root: Path) -> str:
+_PY_VAR = '"${PYSTUB_PYTHON:?対象環境の python のフルパスを PYSTUB_PYTHON に設定してください}"'
+
+
+def _py_expr(py: str | None) -> str:
+    """出すコマンドが使う python。対象環境の python のフルパス。見つからない時は PATH の python に
+    頼らず、環境変数 PYSTUB_PYTHON が無ければ止まる形にする。"""
+    return _q(py) if py else _PY_VAR
+
+
+def _verify_import_cmd(m: str, import_root: Path, py: str | None = None) -> str:
     """復元後の import 確認。中身の消えたパッケージは名前空間パッケージとして import できてしまう
     （__file__ が None）ので、元がファイルを持つモジュールなら __file__ も確かめる。"""
     mrel = Path(*m.split("."))
     has_file = (import_root / mrel / "__init__.py").exists() or (import_root / mrel).with_suffix(".py").exists()
     if not has_file:
-        return f'python -c "import {m}; print(\'{m} OK\')"'
+        return f'{_py_expr(py)} -c "import {m}; print(\'{m} OK\')"'
     msg = f"{m} は中身の無い名前空間パッケージとして読み込まれました（元ファイルが失われています）"
-    return (f'python -c "import {m}; f = getattr({m}, \'__file__\', None); '
+    return (f'{_py_expr(py)} -c "import {m}; f = getattr({m}, \'__file__\', None); '
             f'assert f, \'{msg}\'; print(\'{m} OK\', f)"')
 
 
@@ -1090,9 +1110,9 @@ _RECORD_CHECK = (
 )
 
 
-def _verify_record_cmd(dist: str) -> str:
+def _verify_record_cmd(dist: str, py: str | None = None) -> str:
     """配布物の RECORD の sha256 と実ファイルを照合する（復元で元ファイルが揃ったことの確認）。"""
-    return "python -c " + shlex.quote(_RECORD_CHECK) + " " + shlex.quote(dist)
+    return _py_expr(py) + " -c " + shlex.quote(_RECORD_CHECK) + " " + shlex.quote(dist)
 
 
 def _generate_build_instructions(
@@ -1113,6 +1133,8 @@ def _generate_build_instructions(
     - 元ファイルは site-packages の外のバックアップ領域へ移動（ビルドに混入しない）
     - 繰り返し適用しても同じ結果（バックアップが既にあれば移動しない、スタブは置き直す）
     """
+    from mcp_pystub.verifier import _target_python  # 循環 import を避ける
+    py = _target_python(str(site_root))
     site_root = site_root.resolve()
     import_root = (import_root or site_root).resolve()
     backup_root = (site_root.parent / "_pystub_bak").resolve()
@@ -1190,23 +1212,31 @@ def _generate_build_instructions(
         specs = [f"{n}=={v}" for n, v in pip_name] or [name.split(".")[0]]
     else:
         specs = [f"{pip_name}=={version}" if version else pip_name]
-    uninstall_cmds.append("python -m pip install --force-reinstall --no-deps " + " ".join(_q(s) for s in specs))
+    pip_notes: list[str] = []
+    if py:
+        uninstall_cmds.append(f"{_q(py)} -m pip install --force-reinstall --no-deps " + " ".join(_q(s) for s in specs))
+    else:
+        uninstall_cmds.append(
+            "# （出しません）対象環境の python が python_path から見つからないため、PATH の python で pip を実行する"
+            "と別の環境（グローバルの Python 等）を書き換えるおそれがあります。")
+        pip_notes.append("方法 2（pip での再インストール）は、対象環境の python が見つからないため出していません。"
+                         "対象の python のフルパスで `-m pip install --force-reinstall --no-deps` を手で実行してください")
 
     imports = verify_imports or [name]
-    verify_cmds = [_verify_import_cmd(m, import_root) for m in imports]
+    verify_cmds = [_verify_import_cmd(m, import_root, py) for m in imports]
     # 配布物の RECORD にある全ファイルが元のハッシュで揃っているか（欠落・スタブの置き忘れを検出）
     dist_names = [n for n, _v in pip_name] if isinstance(pip_name, list) else ([pip_name] if version else [])
     for n in dist_names:
-        verify_cmds.append(_verify_record_cmd(n))
+        verify_cmds.append(_verify_record_cmd(n, py))
     if isinstance(pip_name, list):
         for n, v in pip_name:
             verify_cmds.append(
-                f'python -c "import importlib.metadata as m; v = m.version(\'{n}\'); '
+                f'{_py_expr(py)} -c "import importlib.metadata as m; v = m.version(\'{n}\'); '
                 f'assert v == \'{v}\', v; print(\'version OK\', v)"'
             )
     elif version and "." not in name:
         verify_cmds.append(
-            f'python -c "import importlib.metadata as m; v = m.version(\'{pip_name}\'); '
+            f'{_py_expr(py)} -c "import importlib.metadata as m; v = m.version(\'{pip_name}\'); '
             f'assert v == \'{version}\', v; print(\'version OK\', v)"'
         )
 
@@ -1232,7 +1262,9 @@ def _generate_build_instructions(
         "コマンドは POSIX シェル（Git Bash 等）向け。パスは解析で見つけた実際の場所",
         "PyInstaller フックがスタブと衝突する場合は hook_disable でフック無効化",
         "適用前に verify ツールで、スタブに差し替えた状態の import を確かめることを推奨",
-    ]
+        ("コマンド中の python は対象環境のもの: " + py) if py else
+        "対象環境の python が見つからないため、verify_commands は環境変数 PYSTUB_PYTHON（対象の python のフルパス）が必要です",
+    ] + pip_notes
     return {
         "site_packages": str(site_root),
         "backup_dir": str(backup_root),
