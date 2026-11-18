@@ -8,7 +8,7 @@ English | [日本語](https://github.com/KoyoYeager/mcp-pystub/blob/master/READM
 
 For example, an app that only reads and writes MDF files with asammdf still ends up as a 240 MB PyInstaller exe, because asammdf's GUI code imports PySide6 (Qt). mcp-pystub follows usage function by function, even inside your dependencies, replaces the removable parts with minimal stubs, and runs the program to check that the output does not change. The replacement can be undone.
 
-![Demo recorded from a real Claude Code session on the asammdf scenario: add mcp-pystub once, ask Claude, Claude runs analyze and verify and generates the stubs, then pyinstaller --onefile main.py gives a 38.9 MB exe instead of 252.0 MB with the same output; touching a removed part makes the stub print the reason and exit with code 70](https://raw.githubusercontent.com/KoyoYeager/mcp-pystub/master/docs/images/demo.gif)
+![Demo recorded from real Claude Code sessions on the asammdf scenario: add mcp-pystub once, ask Claude, and Claude runs analyze and verify, applies the stubs, builds the exe (252.0 MB down to 38.9 MB with the same output) and restores the venv; touching a removed part makes the stub print the reason and exit with code 70](https://raw.githubusercontent.com/KoyoYeager/mcp-pystub/master/docs/images/demo.gif)
 
 | Library (example use) | exe (as is) | exe (after) | Removed |
 |---|---|---|---|
@@ -33,7 +33,7 @@ Then ask in your project folder:
 
 > Use mcp-pystub to make the exe of main.py smaller. The venv is .venv. You can run it to check.
 
-Build as usual (`pyinstaller --onefile main.py`). Afterwards, ask Claude to restore the venv. No uv, or using another client (Claude Desktop etc.)? See [Tools and setup](https://github.com/KoyoYeager/mcp-pystub/blob/master/docs/tools.md).
+Claude goes on from there: analyze, verify, applying the stubs, building, and putting your venv back (as in the GIF). No uv, or using another client (Claude Desktop etc.)? See [Tools and setup](https://github.com/KoyoYeager/mcp-pystub/blob/master/docs/tools.md).
 
 ## What is different
 

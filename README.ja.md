@@ -6,7 +6,7 @@
 
 例えば asammdf で MDF ファイルを読み書きするだけのアプリでも、asammdf の GUI 部分が PySide6（Qt）を読み込むため、PyInstaller の exe は 240 MB になります。mcp-pystub は依存ライブラリの中まで関数単位で使い方を追い、外せる部分を最小のスタブに差し替え、実際に動かして出力が変わらないことを確かめます。差し替えは元に戻せます。
 
-![本物の Claude Code の会話を記録した、asammdf のシナリオのデモ: mcp-pystub を一度登録して Claude に頼むと、Claude が analyze と verify を動かしてスタブを作り、pyinstaller --onefile main.py で exe が 252.0 MB から 26.5 MB になり出力は同じ。外した部分に触れるとスタブが理由を出して終了コード 70 で止まる](https://raw.githubusercontent.com/KoyoYeager/mcp-pystub/master/docs/images/demo.ja.gif)
+![本物の Claude Code の会話を記録した、asammdf のシナリオのデモ: mcp-pystub を一度登録して Claude に頼むと、Claude が analyze と verify を動かし、スタブを適用して exe をビルドし(252.0 MB から 26.5 MB、出力は同じ)、venv を元に戻す。外した部分に触れるとスタブが理由を出して終了コード 70 で止まる](https://raw.githubusercontent.com/KoyoYeager/mcp-pystub/master/docs/images/demo.ja.gif)
 
 | ライブラリ（使い方の例） | exe（そのまま） | exe（適用後） | 外したもの |
 |---|---|---|---|
@@ -31,7 +31,7 @@ claude mcp add pystub -- uvx mcp-pystub
 
 > mcp-pystub で main.py の exe を小さくして。venv は .venv。動かして確かめていいよ。
 
-ビルドはいつもどおり（`pyinstaller --onefile main.py`）。終わったら、Claude に「venv を元に戻して」と頼みます。uv が無い場合や他のクライアント（Claude Desktop など）は、[ツールと設定](https://github.com/KoyoYeager/mcp-pystub/blob/master/docs/tools.md)を見てください。
+あとは Claude が、analyze、verify、スタブの適用、ビルド、venv を元に戻すところまで進めます(GIF のとおり)。uv が無い場合や他のクライアント(Claude Desktop など)は、[ツールと設定](https://github.com/KoyoYeager/mcp-pystub/blob/master/docs/tools.md)を見てください。
 
 ## 何が違うのか
 

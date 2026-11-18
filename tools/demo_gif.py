@@ -1,6 +1,6 @@
 # ruff: noqa: E501  (HTML と CSS の文字列は 1 行が長い)
 
-"""README の冒頭の GIF(使い方の流れ: 登録 → 頼む → Claude の作業 → ビルド → 止まるスタブ)を作る(英語版 demo.gif と日本語版 demo.ja.gif)。
+"""README の冒頭の GIF(使い方の流れ: 登録 → 頼む → Claude の作業(候補探し・確認・適用・ビルド・元に戻す)→ 結果 → 止まるスタブ)を作る(英語版 demo.gif と日本語版 demo.ja.gif)。
 
 GIF は、本物の Claude Code の会話の記録から描く。作り話の画面は使わない。
 
@@ -13,8 +13,8 @@ GIF は、本物の Claude Code の会話の記録から描く。作り話の画
 
 DIR に置くもの:
   record_<lang>.json  extract が作る。ツールの呼び出しと結果の要点・Claude の返事・所要時間・費用。
-  builds_<lang>.json  同じ作業場所で `pyinstaller --onefile main.py` を実行して測った値
-                      {"base": {"bytes", "stdout"}, "after": {"bytes", "stdout", "log_tail"}}。
+  builds_<lang>.json  Claude 自身がビルドした exe の大きさと、その exe を Claude が動かして出た出力(記録の Bash の出力から)
+                      {"base": {"bytes", "stdout"}, "after": {"bytes", "stdout"}}。
   safety/plot.json・safety/plot_entry.py  外した部分に触れると理由を出して止まる場面の、以前に記録した出力
                       (スタブを当てた venv で Signal.plot() を呼ぶエントリーを動かし、必ず復元して確かめた結果)。
 
@@ -76,12 +76,12 @@ TEXT = {
         "prompt": "Use mcp-pystub to make the exe of main.py smaller. The venv is .venv. You can run it to check.",
         "cap_register": "1. Add it to Claude Code (once)",
         "cap_ask": "2. Ask Claude",
-        "cap_claude": "Claude finds candidates, runs your program to check, and builds the stubs",
-        "cap_build": "3. Build as usual: <em>{base} MB -> {after} MB</em>, same output",
+        "cap_claude": "Claude finds candidates, checks by running, applies the stubs, builds, and restores the venv",
+        "cap_build": "Claude builds it: <em>{base} MB -> {after} MB</em>, same output",
         "cap_stop": "If you do use a removed part, it does not break silently: it <em>stops and says why</em>",
         "header": "# Claude Code, in the project folder",
         "reply_note": "(Claude's reply, first sentence)",
-        "elided": "... (builds the exe with and without the stubs, puts the venv back)",
+        "build_head": "# exe built by Claude (PyInstaller onefile), as recorded",
         "files": "{n} stub files",
         "excluded": "excludes {first} and {more} more",
         "of": "(was {a} -> {b})",
@@ -109,12 +109,12 @@ TEXT = {
         "prompt": "mcp-pystub で main.py の exe を小さくして。venv は .venv。動かして確かめていいよ。",
         "cap_register": "1. 登録する(最初の 1 回)",
         "cap_ask": "2. 頼む",
-        "cap_claude": "Claude が候補を探し、動かして確かめ、スタブを作る",
-        "cap_build": "3. いつもどおりビルド: <em>{base} MB → {after} MB</em>、出力は同じ",
+        "cap_claude": "Claude が候補探し・確認・適用・ビルド・元に戻すまでやる",
+        "cap_build": "Claude がビルド: <em>{base} MB → {after} MB</em>、出力は同じ",
         "cap_stop": "使っていた場合は、黙って壊れず<em>理由を出して止まる</em>",
         "header": "# Claude Code(プロジェクトのフォルダで)",
         "reply_note": "",
-        "elided": "...(スタブ有りと無しで exe をビルドし、venv を元に戻す)",
+        "build_head": "# Claude がビルドした exe(PyInstaller onefile)の記録",
         "files": "スタブ {n} ファイル",
         "excluded": "外れるもの: {first} ほか {more} 件",
         "of": "(元 {a} → {b})",
@@ -459,7 +459,7 @@ def events_of(D: Data, t: dict) -> list[Event]:
     verifies = [i for i, s in enumerate(steps) if s["kind"] == "use" and s["name"].endswith("verify")]
     ok_verify = next((i for i in verifies if steps[i]["summary"]["entry_matched"]), None)
     # 返事は、最初の verify の直前・通った verify の直後・最後の 3 か所だけ見せる(ほかは省く)
-    show_at = {text_ix[-1]}
+    show_at = {text_ix[-1]} | {i for i in text_ix if re.search(r"\d\s*MB", first_sentence(steps[i]["text"]))}
     for j in (verifies[0] - 1 if verifies else None, ok_verify + 1 if ok_verify is not None else None):
         if j in text_ix:
             show_at.add(j)
@@ -468,13 +468,11 @@ def events_of(D: Data, t: dict) -> list[Event]:
         if st["kind"] == "text":
             if i in show_at:
                 sentence = D.clean(first_sentence(st["text"]))
-                if i == last_text:
-                    ev.append(([Line((t["elided"], "dim"))], None))
                 ev.append(([Line(("● ", "ok"), ln) if k == 0 else Line("  ", ln) for k, ln in enumerate(wrap(sentence, LOGWRAP - 2)[:3])], None))
             continue
         if st["name"] == "Bash":
             desc = st["input"]["description"]
-            if re.search(r"copy|写", desc, re.I):  # .venv がプロジェクトの中にあるとき、main.py を別の場所へ写す
+            if re.search(r"build|apply|restore|copy|ビルド|適用|復元|写", desc, re.I):  # 適用・ビルド・元に戻す(と回り道)だけ見せる
                 ev.append(([Line(("● ", "ok"), ("Bash", "tool"), (f"({desc})", "dim"))], None))
             continue
         if not st["name"].startswith("mcp__pystub__"):
@@ -582,14 +580,11 @@ def build(lang: str, D: Data) -> list[tuple[State, int, str]]:
             seq.append((page_log(lines, cap, bx), 16 if box else 9, f"3_claude_{k}" if box else ""))
         lines.append(Line())
 
-    # 4. ビルド: 打ち込み → exe の大きさの比較 → 出力
-    bcmd = "pyinstaller --onefile main.py"
-    log_tail = b["after"].get("log_tail", "")
-
+    # 4. 結果: Claude 自身がビルドした exe の大きさ(基準 → 適用後)と、動かして出た出力
     def bars(frac: float, caption: str = "") -> State:
         n1 = max(1, round(BAR_COLS * b["after"]["bytes"] / b["base"]["bytes"] * frac)) if frac > 0 else 0
         rows = [
-            shell(bcmd, cursor=False), Line((log_tail, "dim")), Line(), Line((t["exe_label"], "key")),
+            Line((t["build_head"], "dim")), Line(), Line((t["exe_label"], "key")),
             Line("  ", (t["before"], "dim"), "  ", ("█" * BAR_COLS, "bar0"), "  ", (f"{base_mb} MB", "bad")),
             Line("  ", (t["after"], "dim"), "  ", ("█" * n1, "bar1"), "  ", (f"{after_mb} MB" if frac >= 1 else "", "ok")),
             Line(), Line((t["output"], "key")),
@@ -598,10 +593,7 @@ def build(lang: str, D: Data) -> list[tuple[State, int, str]]:
         ]  # fmt: skip
         return State(rows, fit_cols=BAR_COLS + 28, zoom=1.0, caption=caption)
 
-    for n in range(0, len(bcmd), 3):
-        seq.append((State([shell(bcmd, n)], fit_cols=BAR_COLS + 28), 1, ""))
-    seq.append((replace(bars(0.0), lines=bars(0.0).lines[:2]), 6, ""))
-    seq.append((bars(0.0), 4, ""))
+    seq.append((bars(0.0), 8, ""))
     for k in range(1, 9):
         seq.append((bars(k / 8), 1, ""))
     seq.append((bars(1.0, t["cap_build"].format(base=base_mb, after=after_mb)), 40, "4_build"))
