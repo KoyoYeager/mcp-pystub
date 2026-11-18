@@ -9,6 +9,7 @@ exe の出力が元と一致することと、site-packages の復元が元と�
 
 | シナリオ | スタブなし | 適用後 | 適用した候補 |
 |---|---|---|---|
+| 12_asammdf（Claude Code に頼んだ記録。README の表とデモ GIF の値） | 252.0 MB | **38.9 MB** | Claude が選んだ `asammdf.gui` だけ。出力 `10 18.0 V` は元と同じ |
 | 12_asammdf | 240.1 MB | **36.9 MB** | 確認済み（実行）の `asammdf.gui`（PySide6・lxml を排除）だけ |
 | 12_asammdf | 240.1 MB | **25.1 MB** | 静的解析の候補を全部（pandas + asammdf.gui） |
 | 03_networkx | 76.7 MB | **40.8 MB** | scipy（記録からの候補）・fontTools・pandas |

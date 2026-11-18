@@ -2,8 +2,11 @@
 
 [README に戻る](README.ja.md) | 各版の変更点。 / Changes in each release.
 
-## 未公開
+## 0.3.1
 
+- テスト: tests/ の全件（373 件）が通過
+- README: 先頭を、結果（exe が 252.0 MB → 38.9 MB）と使い方の GIF に作り直した。英語版（README.md）と日本語版（README.ja.md）に分け、
+  詳しい説明は docs/ に移した。表の asammdf の行は、Claude Code に頼んで記録した値（252.0 → 38.9 MB）にした
 - 修正: venv がプロジェクトのフォルダの中にある配置（`myapp/main.py` と `myapp/.venv/Lib/site-packages`）で generate / generate_submodule / verify が
   「python_path がプロジェクトと重なっています」と断られていたのを直した（名前が site-packages / dist-packages で、上に `pyvenv.cfg` がある場所に限る）
 - 修正: 復元の「方法 2」と verify_commands が PATH の素の `python` を使っていたのを、対象環境の python のフルパスに直した。
