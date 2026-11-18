@@ -882,7 +882,7 @@ def generate_stubs(
         if note and conditional_info is not None:
             # 条件付き・記録からの候補のスタブ: 元にある全てのサブモジュールと公開名を import できるようにし、使った時点で
             # 止める（第 4 回 条件付きの段 5: `from fontTools import subset` の ImportError を無くす）。stubbable のスタブは
-            # 静的解析で参照が見つかったモジュールだけを持つ（それ以外の import は ModuleNotFoundError: README の制限）
+            # 静的解析で参照が見つかったモジュールだけを持つ（それ以外の import は ModuleNotFoundError: docs/how-it-works.md の制限）
             pkg_dir = main if main.is_dir() else main.parent
             if (pkg_dir / "__init__.py").exists():
                 files.update(_all_submodule_stubs(pkg_dir, package_name, files, note))

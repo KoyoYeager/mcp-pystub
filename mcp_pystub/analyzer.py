@@ -164,11 +164,11 @@ def _analyze(entry_point: str, python_path: str, max_depth: int, include_small_c
     result_dict["next_steps"] = [
         "手順 1: verify(entry_point, python_path, packages=[...], submodules=[...], nofollow=[...]) で、スタブに差し替えて "
         "import できることを確かめてください（既定は import だけ: 別の子プロセスでグラフ上のモジュールを import する。各モジュールの直下のコード（import 時のコード）は動くが、エントリーのスクリプトは動かさない（エントリーを import するローカルのモジュールは対象から外し、import の途中でエントリーのファイルを開く操作は監査フックで止めて note に出す））。",
-        "手順 2: スタブを適用してビルドし、普段のやり方で exe を試してください（全てのスタブ（stubbable・サブモジュールのヒント・条件付き・記録からの候補）は、使われた時点で原因を出して終了コード 70 で止まります（except で握りつぶせません。MCP_PYSTUB_STRICT=0 の時だけ例外）。ただし README の「止まらない操作」（スタブのクラスそのものの ==・hash・真偽・repr、isinstance の判定、元に無い属性の AttributeError など）は止まりません）。",
+        "手順 2: スタブを適用してビルドし、普段のやり方で exe を試してください（全てのスタブ（stubbable・サブモジュールのヒント・条件付き・記録からの候補）は、使われた時点で原因を出して終了コード 70 で止まります（except で握りつぶせません。MCP_PYSTUB_STRICT=0 の時だけ例外）。ただし docs/how-it-works.md の「止まらない操作」（スタブのクラスそのものの ==・hash・真偽・repr、isinstance の判定、元に無い属性の AttributeError など）は止まりません）。",
         "任意: エントリーを動かしても安全な時（副作用が無い・試験用の引数や入力がある）だけ、run_entry=True や実行の記録"
         "（python -m mcp_pystub.trace）でより強く確かめられます。",
         "この結果は静的解析による候補です（実行の保証ではありません）。verify は site-packages を書き換えません。",
-        "確認済み（実行）は、README の「普段の実行との違い」の表の範囲で、動かした入力について確かめた結果です。配布前に、ビルドした exe を普段のやり方で試してください。",
+        "確認済み（実行）は、docs/safety.md の「普段の実行との違い」の表の範囲で、動かした入力について確かめた結果です。配布前に、ビルドした exe を普段のやり方で試してください。",
     ]
 
     return result_dict
@@ -469,7 +469,7 @@ def _summary(rd: dict, entry: str, python_path: str, required: list) -> dict:
     steps = [
         f"1. verify({entry!r}{py}, packages=[...], submodules=['<サブモジュール>=><排除する C 拡張>']) で、スタブに差し替えて"
         "import できることを確かめる（既定は import だけ: 別の子プロセスでグラフ上のモジュールを import する。各モジュールの直下のコード（import 時のコード）は動くが、エントリーのスクリプトは動かさない（エントリーを import するローカルのモジュールは対象から外し、import の途中でエントリーのファイルを開く操作は監査フックで止めて note に出す））",
-        "2. スタブを適用してビルドし、普段のやり方で exe を試す（全てのスタブ（stubbable・サブモジュールのヒント・条件付き・記録からの候補）は、使われた時点で原因を出して終了コード 70 で止まります（except で握りつぶせません。MCP_PYSTUB_STRICT=0 の時だけ例外）。ただし README の「止まらない操作」（スタブのクラスそのものの ==・hash・真偽・repr、isinstance の判定、元に無い属性の AttributeError など）は止まりません）",
+        "2. スタブを適用してビルドし、普段のやり方で exe を試す（全てのスタブ（stubbable・サブモジュールのヒント・条件付き・記録からの候補）は、使われた時点で原因を出して終了コード 70 で止まります（except で握りつぶせません。MCP_PYSTUB_STRICT=0 の時だけ例外）。ただし docs/how-it-works.md の「止まらない操作」（スタブのクラスそのものの ==・hash・真偽・repr、isinstance の判定、元に無い属性の AttributeError など）は止まりません）",
         "（任意）エントリーを動かしても安全な時（副作用が無い・試験用の引数や入力がある）だけ、verify(..., run_entry=True) や"
         "実行の記録（python -m mcp_pystub.trace）でより強く確かめられる",
         "推奨の読み方: 上から選ぶ。[high] / [low] は静的解析の規則による参考の表示です（経路が無いことの保証ではありません）。"
@@ -493,7 +493,7 @@ def _summary(rd: dict, entry: str, python_path: str, required: list) -> dict:
             r for _, _, r in cond_recs if not r.startswith("[high]")],
         "next_steps": steps,
         "note": "stubbable / submodule_stub_hints は静的解析で使用が見つからなかった候補、[high] / [low] は条件付きの候補です。どちらも保証ではありません。実際に外せるかは verify（既定は import だけ）とビルド後の実行で確かめます。エントリーを動かして安全なら run_entry=True と実行の記録でより強く確かめられます。",
-        "closing_note": "確認済み（実行）は、README の「普段の実行との違い」の表の範囲で、動かした入力について確かめた結果です。配布前に、ビルドした exe を普段のやり方で試してください。",
+        "closing_note": "確認済み（実行）は、docs/safety.md の「普段の実行との違い」の表の範囲で、動かした入力について確かめた結果です。配布前に、ビルドした exe を普段のやり方で試してください。",
         "size_note": "MB はインストール済みのファイルの大きさ（__pycache__ を除く）で、exe の削減量ではありません"
                      "（PyInstaller が同梱する範囲・圧縮で変わります）。",
     }

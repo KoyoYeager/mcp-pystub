@@ -50,12 +50,12 @@ uvx で起動する場合（pip install 不要。uv が必要）:
 
 #### analyze
 
-asammdf のシナリオの実際の出力の抜粋:
+asammdf のシナリオの実際の出力の抜粋（入力のパスは例に置き換えています）:
 
 ```
 入力 / Input:
-  entry_point: "C:/tmp/pystub-e2e/12_asammdf/proj/entry.py"
-  python_path: "C:/tmp/pystub-e2e/12_asammdf/venv/Lib/site-packages"
+  entry_point: "C:/work/myapp/main.py"
+  python_path: "C:/work/myapp/venv/Lib/site-packages"
 
 出力 / Output（抜粋）:
   {
