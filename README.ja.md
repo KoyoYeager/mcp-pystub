@@ -6,7 +6,7 @@
 
 例えば asammdf で MDF ファイルを読み書きするだけのアプリでも、asammdf の GUI 部分が PySide6（Qt）を読み込むため、PyInstaller の exe は 240 MB になります。mcp-pystub は依存ライブラリの中まで関数単位で使い方を追い、外せる部分を最小のスタブに差し替え、実際に動かして出力が変わらないことを確かめます。差し替えは元に戻せます。
 
-![asammdf のシナリオ: analyze で使っていない GUI 部分が PySide6 を引き込むと分かり、verify で動かして出力が同じと確かめ、exe が 240.1 MB から 36.9 MB になり、外した部分に触れるとスタブが理由を出して終了コード 70 で止まるまでのデモ](https://raw.githubusercontent.com/KoyoYeager/mcp-pystub/master/docs/images/demo.ja.gif)
+![本物の Claude Code の会話を記録した、asammdf のシナリオのデモ: mcp-pystub を一度登録して Claude に頼むと、Claude が analyze と verify を動かしてスタブを作り、pyinstaller --onefile main.py で exe が 252.0 MB から 26.5 MB になり出力は同じ。外した部分に触れるとスタブが理由を出して終了コード 70 で止まる](https://raw.githubusercontent.com/KoyoYeager/mcp-pystub/master/docs/images/demo.ja.gif)
 
 | ライブラリ（使い方の例） | exe（そのまま） | exe（適用後） | 外したもの |
 |---|---|---|---|
@@ -21,31 +21,17 @@ PyInstaller（onefile）、Windows 11、Python 3.13。どれも exe の出力が
 
 ## 使い方
 
-**1. Claude Code に登録する**（最初の 1 回だけ）
+Claude Code に一度登録して、Claude に頼むだけです。流れ全体は、上の GIF のとおりです。
 
 ```bash
 claude mcp add pystub -- uvx mcp-pystub
 ```
 
-uv が無い場合は `pip install mcp-pystub` のあと `claude mcp add pystub -- mcp-pystub`。Claude Desktop など他のクライアントは[ツールと設定](https://github.com/KoyoYeager/mcp-pystub/blob/master/docs/tools.md)を見てください。プロジェクトの venv に入れる必要はありません。
+プロジェクトのフォルダで、こう頼みます。
 
-**2. プロジェクトのフォルダで Claude に頼む**
+> mcp-pystub で main.py の exe を小さくして。venv は .venv。動かして確かめていいよ。
 
-> mcp-pystub で main.py の exe を小さくして。venv は .venv。
-
-Claude は次の順に進めます。
-
-1. 外せるパッケージを挙げる（`analyze`）
-2. スタブを差し込んで実際に動かし、結果が変わらないか確かめる（`verify`。main.py を動かすのは、あなたが許可した時だけ）
-3. スタブを作り（`generate`）、出したコマンドで元のファイルをバックアップしてからスタブを venv に入れる
-
-**3. いつもどおりビルドして試す**
-
-```bash
-pyinstaller --onefile main.py
-```
-
-exe はいつものやり方で試してください。終わったら、Claude に「venv を元に戻して」と頼みます（手順 2 で出した復元のコマンドを実行します）。
+ビルドはいつもどおり（`pyinstaller --onefile main.py`）。終わったら、Claude に「venv を元に戻して」と頼みます。uv が無い場合や他のクライアント（Claude Desktop など）は、[ツールと設定](https://github.com/KoyoYeager/mcp-pystub/blob/master/docs/tools.md)を見てください。
 
 ## 何が違うのか
 

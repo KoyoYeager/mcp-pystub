@@ -8,7 +8,7 @@ English | [日本語](https://github.com/KoyoYeager/mcp-pystub/blob/master/READM
 
 For example, an app that only reads and writes MDF files with asammdf still ends up as a 240 MB PyInstaller exe, because asammdf's GUI code imports PySide6 (Qt). mcp-pystub follows usage function by function, even inside your dependencies, replaces the removable parts with minimal stubs, and runs the program to check that the output does not change. The replacement can be undone.
 
-![Demo on the asammdf scenario: analyze finds that the unused GUI part pulls in PySide6, verify runs the program and confirms the output is identical, the exe shrinks from 240.1 MB to 36.9 MB, and touching a removed part makes the stub print the reason and exit with code 70](https://raw.githubusercontent.com/KoyoYeager/mcp-pystub/master/docs/images/demo.gif)
+![Demo recorded from a real Claude Code session on the asammdf scenario: add mcp-pystub once, ask Claude, Claude runs analyze and verify and generates the stubs, then pyinstaller --onefile main.py gives a 38.9 MB exe instead of 252.0 MB with the same output; touching a removed part makes the stub print the reason and exit with code 70](https://raw.githubusercontent.com/KoyoYeager/mcp-pystub/master/docs/images/demo.gif)
 
 | Library (example use) | exe (as is) | exe (after) | Removed |
 |---|---|---|---|
@@ -23,31 +23,17 @@ PyInstaller (onefile), Windows 11, Python 3.13. In every case the exe's output w
 
 ## Usage
 
-**1. Add it to Claude Code** (once)
+Add it to Claude Code once, then ask Claude. The GIF above shows the whole flow.
 
 ```bash
 claude mcp add pystub -- uvx mcp-pystub
 ```
 
-No uv? Run `pip install mcp-pystub`, then `claude mcp add pystub -- mcp-pystub`. For Claude Desktop and other clients, see [Tools and setup](https://github.com/KoyoYeager/mcp-pystub/blob/master/docs/tools.md). You do not need to install it in your project's venv.
+Then ask in your project folder:
 
-**2. Ask Claude** in your project folder
+> Use mcp-pystub to make the exe of main.py smaller. The venv is .venv. You can run it to check.
 
-> Use mcp-pystub to make the exe of main.py smaller. The venv is .venv.
-
-Claude then:
-
-1. lists packages that can be removed (`analyze`)
-2. checks them by running your program with the stubs (`verify`; it runs main.py only if you allow it)
-3. creates the stubs (`generate`) and runs the printed commands that back up the originals and put the stubs into the venv
-
-**3. Build and test as usual**
-
-```bash
-pyinstaller --onefile main.py
-```
-
-Try the exe the way you normally would. Afterwards, ask Claude to restore the venv (it runs the restore commands printed in step 2).
+Build as usual (`pyinstaller --onefile main.py`). Afterwards, ask Claude to restore the venv. No uv, or using another client (Claude Desktop etc.)? See [Tools and setup](https://github.com/KoyoYeager/mcp-pystub/blob/master/docs/tools.md).
 
 ## What is different
 

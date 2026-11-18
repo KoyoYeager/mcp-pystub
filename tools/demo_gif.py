@@ -1,25 +1,28 @@
 # ruff: noqa: E501  (HTML と CSS の文字列は 1 行が長い)
 
-"""README の冒頭の GIF(analyze → verify → 結果 → 止まるスタブ)を作る(英語版 demo.gif と日本語版 demo.ja.gif)。
+"""README の冒頭の GIF(使い方の流れ: 登録 → 頼む → Claude の作業 → ビルド → 止まるスタブ)を作る(英語版 demo.gif と日本語版 demo.ja.gif)。
+
+GIF は、本物の Claude Code の会話の記録から描く。作り話の画面は使わない。
 
 使い方(リポジトリの一番上で。ffmpeg が PATH に要る。--ffmpeg でも渡せる):
-    # 1. 本物の出力を取って保存する(重い。analyze・verify・スタブを当てた実行。1 回だけ)
-    uv run --with pillow python tools/demo_gif.py collect --scenario C:/tmp/pystub-e2e/12_asammdf \
-        --builds C:/tmp/pystub-e2e/check_final2/build12_conf/12_asammdf/result.json --data C:/tmp/pystub-e2e/demo_gif
-    # 2. 保存した出力から GIF を作る(撮り直しても解析は回さない)
-    uv run --with pillow python tools/demo_gif.py build --data C:/tmp/pystub-e2e/demo_gif
-    uv run --with pillow python tools/demo_gif.py build --data DIR --out DIR --keep-frames DIR --lang ja
+    # 1. 記録した会話(claude -p --output-format stream-json --verbose)から、画面に出す値を取り出す(言語ごと)
+    uv run python tools/demo_gif.py extract --conv DIR/ja/conv.jsonl --project C:/work/demo/ja --out DIR/record_ja.json
+    # 2. 保存した記録から GIF を作る(DIR に record_ja.json・record_en.json・builds_ja.json・builds_en.json・safety/ がある)
+    uv run --with pillow python tools/demo_gif.py build --data DIR
+    uv run --with pillow python tools/demo_gif.py build --data DIR --out DIR --keep-frames DIR --keep-html DIR --lang ja
 
-collect が保存するもの(--data の下): analyze.json・verify.json・plot.json(generate_submodule でスタブを作って venv に当て、
-Signal.plot() を呼ぶ別のエントリー plot_entry.py を動かし、必ず復元して RECORD 照合とバックアップ領域の残りを確かめた結果)・
-builds.json(実ビルドの result.json から exe の大きさと出力だけ抜いたもの)。
-Signal.plot() は元の環境では絶対に動かさない(Qt の窓が開く)。スタブを当てた間だけ動かし、QT_QPA_PLATFORM=offscreen も付ける。
+DIR に置くもの:
+  record_<lang>.json  extract が作る。ツールの呼び出しと結果の要点・Claude の返事・所要時間・費用。
+  builds_<lang>.json  同じ作業場所で `pyinstaller --onefile main.py` を実行して測った値
+                      {"base": {"bytes", "stdout"}, "after": {"bytes", "stdout", "log_tail"}}。
+  safety/plot.json・safety/plot_entry.py  外した部分に触れると理由を出して止まる場面の、以前に記録した出力
+                      (スタブを当てた venv で Signal.plot() を呼ぶエントリーを動かし、必ず復元して確かめた結果)。
 
-build は、保存した出力から場面(前提・analyze・verify・結果・安全網)ごとにコマの状態(打ち込み・字幕・強調・拡大)を作り、
+build は、場面(登録・頼む・Claude の作業・ビルド・安全網)ごとにコマの状態(打ち込み・字幕・強調・拡大)を作り、
 HTML にして Edge か Chrome の headless で撮り、下に進み具合のバーを足して、ffmpeg の palettegen / paletteuse で GIF にする
-(880x496、10 fps、3 MB 以下を確かめる)。字幕の数字(サイズ・件数)は保存した出力から読む(手で書かない)。
-画面のパスは、プロジェクトからの相対(proj/entry.py、venv/Lib/site-packages)に置き換えて表示する。
-値(サイズ・状態・メッセージ)そのものは変えない。個人の情報(ドライブ付きのパス・ユーザー名)が HTML に残っていたら止まる。
+(880x496、10 fps、3 MB 以下を確かめる)。字幕の数字(サイズ)は記録から読む(手で書かない)。
+画面のパスは、作業場所からの相対(main.py、.venv/Lib/site-packages)に置き換えて表示する。値そのものは変えない。
+個人の情報(ドライブ付きのパス・ユーザー名)が HTML に残っていたら止まる。
 Pillow・ffmpeg は作るときだけ使う(mcp-pystub の依存には入れない)。
 """
 
@@ -67,50 +70,73 @@ CSS_CLASSES = {
     "bar1": "#23d18b",
 }
 
+
 TEXT = {
     "en": {
-        "cap_prereq": "Only reads and writes an MDF file, yet the exe is <em>{base} MB</em>",
-        "cap_analyze": "The unused GUI part drags in all of <em>PySide6 (Qt)</em>",
-        "cap_verify": "Plugs in the stub, <em>actually runs it</em>, and checks the output is the same",
-        "cap_result": "exe <em>{base} MB → {after} MB</em>, same output",
-        "cap_stop": "Touch what was removed and it does not break silently: it <em>stops and says why</em>",
-        "exe_label": "PyInstaller exe (onefile): ",
-        "size_note": "(installed size, not exe savings)",
-        "g_cond": "(do not import or use anything under asammdf.gui)",
-        "g_more": "{n} more",
-        "g_confirmed": "(confirmed by running)",
-        "g_match": "(stdout bytes and exit code are the same as without the stub)",
-        "g_stop": "(English gloss: stub of asammdf.gui; Signal.plot() was called, so it stopped with exit code {rc})",
+        "prompt": "Use mcp-pystub to make the exe of main.py smaller. The venv is .venv. You can run it to check.",
+        "cap_register": "1. Add it to Claude Code (once)",
+        "cap_ask": "2. Ask Claude",
+        "cap_claude": "Claude finds candidates, runs your program to check, and builds the stubs",
+        "cap_build": "3. Build as usual: <em>{base} MB -> {after} MB</em>, same output",
+        "cap_stop": "If you do use a removed part, it does not break silently: it <em>stops and says why</em>",
+        "header": "# Claude Code, in the project folder",
+        "reply_note": "(Claude's reply, first sentence)",
+        "elided": "... (builds the exe with and without the stubs, puts the venv back)",
+        "files": "{n} stub files",
+        "excluded": "excludes {first} and {more} more",
+        "of": "(was {a} -> {b})",
+        "more_recs": "(+{n} more candidates)",
+        "installed": "installed size, not exe savings",
+        "unconfirmed": "unconfirmed",
+        "gloss": {
+            "confirmed_run": "confirmed by running",
+            "confirmed_import": "confirmed by import (and one run of the entry)",
+            "unconfirmed": "unconfirmed",
+        },
+        "overlap": "(English gloss: python_path overlaps the project)",
+        "entry_matched": "entry_matched: ",
+        "matched_note": "(stdout `{out}` is the same as without the stubs)",
+        "exe_label": "exe",
         "before": "before",
         "after": "after ",
         "output": "output",
-        "build_head": "# build with PyInstaller, then run the exe",
-        "plot_head": "# run an entry that calls Signal.plot() in the venv with the stub applied",
-        "exit_code": "exit code: ",
-        "applied": "applied: asammdf.gui (confirmed by running)",
         "match": "match: ",
+        "plot_head": "# run an entry that calls Signal.plot() in a venv with the stub applied (recorded earlier)",
+        "exit_code": "exit code: ",
+        "g_stop": "(English gloss: stub of asammdf.gui; Signal.plot() was called, so it stopped with exit code {rc})",
     },
     "ja": {
-        "cap_prereq": "MDF を読み書きするだけなのに <em>{base} MB</em>",
-        "cap_analyze": "使っていない GUI の部分が <em>PySide6(Qt)</em>を丸ごと引き込んでいる",
-        "cap_verify": "スタブを差し込んで<em>実際に動かし</em>、出力が同じことを確かめる",
-        "cap_result": "exe <em>{base} MB → {after} MB</em>、出力は同じ",
-        "cap_stop": "外した部分に触れたら、黙って壊れず、<em>理由を出して止まる</em>",
-        "exe_label": "PyInstaller の exe(onefile): ",
-        "size_note": "(インストール済みの大きさ)",
-        "g_cond": "",
-        "g_more": "ほか {n} 件",
-        "g_confirmed": "",
-        "g_match": "(標準出力のバイト列と終了コードがスタブ無しと同じ)",
-        "g_stop": "",
+        "prompt": "mcp-pystub で main.py の exe を小さくして。venv は .venv。動かして確かめていいよ。",
+        "cap_register": "1. 登録する(最初の 1 回)",
+        "cap_ask": "2. 頼む",
+        "cap_claude": "Claude が候補を探し、動かして確かめ、スタブを作る",
+        "cap_build": "3. いつもどおりビルド: <em>{base} MB → {after} MB</em>、出力は同じ",
+        "cap_stop": "使っていた場合は、黙って壊れず<em>理由を出して止まる</em>",
+        "header": "# Claude Code(プロジェクトのフォルダで)",
+        "reply_note": "",
+        "elided": "...(スタブ有りと無しで exe をビルドし、venv を元に戻す)",
+        "files": "スタブ {n} ファイル",
+        "excluded": "外れるもの: {first} ほか {more} 件",
+        "of": "(元 {a} → {b})",
+        "more_recs": "(ほか {n} 件)",
+        "installed": "インストール済みの大きさ",
+        "unconfirmed": "未確認",
+        "gloss": {
+            "confirmed_run": "確認済み(実行)",
+            "confirmed_import": "import 確認済み",
+            "unconfirmed": "未確認",
+        },
+        "overlap": "",
+        "entry_matched": "entry_matched: ",
+        "matched_note": "(標準出力 `{out}` がスタブ無しと同じ)",
+        "exe_label": "exe",
         "before": "適用前",
         "after": "適用後",
         "output": "出力",
-        "build_head": "# PyInstaller でビルドして exe を動かす",
-        "plot_head": "# スタブを当てた venv で、Signal.plot() を呼ぶエントリーを動かす",
-        "exit_code": "終了コード: ",
-        "applied": "適用: asammdf.gui(確認済み(実行))",
         "match": "一致: ",
+        "plot_head": "# スタブを当てた venv で、Signal.plot() を呼ぶエントリーを動かす(以前に記録した出力)",
+        "exit_code": "終了コード: ",
+        "g_stop": "",
     },
 }
 
@@ -267,187 +293,327 @@ def page(s: State) -> str:
     )
 
 
-# ---------------------------------------------------------------- 本物の出力
-PERSONAL = re.compile(r"[A-Za-z]:[\\/]|[\\/]Users[\\/]|hunte|AppData", re.I)
 
 
-class Data:
-    """collect が保存した出力を読み、画面に出す値を取り出す(置き換えは表示だけ)。"""
-
-    def __init__(self, d: Path):
-        def load(name: str):
-            return json.loads((d / name).read_text(encoding="utf-8"))
-
-        self.analyze = load("analyze.json")["result"]
-        self.verify = load("verify.json")["result"]
-        self.plot = load("plot.json")
-        self.builds = load("builds.json")
-        self.entry = (d / "entry.py").read_text(encoding="utf-8").splitlines()
-        self.plot_entry = (d / "plot_entry.py").read_text(encoding="utf-8").splitlines()
-        self.scenario = str(Path(self.analyze["project_root"]).parent)
-
-    def clean(self, s: str) -> str:
-        """シナリオのフォルダを取り除く(プロジェクトからの相対にする)。"""
-        for r in {self.scenario, self.scenario.replace("\\", "/")}:
-            s = s.replace(r + "\\", "").replace(r + "/", "")
-        return s
-
-
+# ---------------------------------------------------------------- 記録(Claude Code の stream-json)から値を取り出す
 def need(cond: bool, msg: str) -> None:
     if not cond:
         raise SystemExit(f"保存した出力が想定と違う: {msg}")
 
 
-def facts(D: Data) -> dict:
-    """画面に出す値。すべて保存した出力から読む。"""
-    a, v, p, b = D.analyze, D.verify, D.plot["result"], D.builds
-    hint = next(h for h in a["conditional_submodule_hints"] if h["target_package"] == "PySide6")
-    rec = a["summary"]["recommendations"][0]
-    m = re.search(r"ほか (\d+) 件", rec)
-    need(bool(m), "推奨の先頭に「ほか N 件」が無い")
-    need(
-        rec.startswith("[high]") and hint["submodule"] in rec and f"{hint['estimated_savings_mb']}" in rec, "推奨の先頭と hint が合わない"
-    )
-    conds = [c["entry"] for c in hint["conditions"][:3]]
-    need(len(conds) == 3, "条件が 3 件未満")
-    st = v["statuses"][hint["submodule"]]
-    base, conf = b["base"], b["proven_plus_conditional"]
-    out = v["entry_conditions"]["stdout_head"].strip()
-    need(conf["match"] is True and conf["stdout"] == base["stdout"] == out, "出力が一致していない")
-    need(v["entry_matched"] is True and st["status"] == "confirmed_run", "verify が確認済み(実行)でない")
-    run = p["run"]
-    need(run["rc"] == 70 and run["stdout"] == "", "止まるスタブの実行が想定と違う")
-    need(
-        p["verify"]["rc"] == 0 and p["restore"]["rc"] == 0 and p["bak_exists"] is False and p["pristine"] is True, "復元が確認できていない"
-    )
-    return dict(
-        sub=hint["submodule"], target=hint["target_package"], conf=hint["confidence"], mb=hint["estimated_savings_mb"],
-        conds=conds, more=int(m.group(1)), uses=hint["conditions"][0]["project_uses_count"],
-        status_key=next(k for k, items in v["status_summary"].items() if hint["submodule"] in items),
-        targets=st["observed"]["targets"], matched=v["entry_matched"], out=out,
-        base_mb=f"{base['exe_mb']:.1f}", after_mb=f"{conf['exe_mb']:.1f}", base_f=base["exe_mb"], after_f=conf["exe_mb"],
-        stderr=run["stderr"].strip(), rc=run["rc"],
-    )  # fmt: skip
+def _result_text(content) -> str:
+    return content if isinstance(content, str) else " ".join(i.get("text", "") for i in content)
+
+
+def _load_mcp_result(x: str, src: Path):
+    """MCP ツールの結果。長いと Claude Code が別ファイルに保存するので、同じフォルダに写したものを読む。"""
+    if x.startswith("Error: result (") and "tool-results" in x:
+        m = re.search(r"tool-results[\\/]([\w.\-]+\.txt)", x)
+        need(bool(m) and (src / m.group(1)).exists(), f"長い結果のファイルが {src} に無い: {m.group(1) if m else x[:80]}")
+        x = (src / m.group(1)).read_text(encoding="utf-8")
+    d = json.loads(x)
+    if isinstance(d, list):  # [{"type": "text", "text": "..."}]
+        d = json.loads(d[0]["text"])
+    return d
+
+
+def _summarize(name: str, d: dict) -> dict:
+    if name == "analyze":
+        return {
+            "recs": d["summary"]["recommendations"],
+            "hints": [
+                {k: h[k] for k in ("submodule", "target_package", "confidence", "estimated_savings_mb")}
+                for h in d["conditional_submodule_hints"]
+            ],
+        }
+    if name == "verify":
+        return {
+            "checked": d["checked"], "passed": d["passed"],
+            "statuses": {k: v["status"] for k, v in d["statuses"].items()},
+            "entry_matched": d["entry_matched"], "run_entry": d["run_entry"], "elapsed_s": d["elapsed_s"],
+            "rejected": [{"item": r["item"], "error": r.get("error", "")} for r in d["rejected"]],
+            "stdout_head": d.get("entry_conditions", {}).get("stdout_head", ""),
+        }  # fmt: skip
+    if name == "generate_submodule":
+        keys = ("submodule", "original_size_bytes", "stub_size_bytes", "eliminated_packages")
+        return {k: d[k] for k in keys} | {"stub_files": len(d["files"])}
+    if name == "generate":
+        return {k: d[k] for k in ("package", "original_file_count", "stub_file_count", "stub_total_bytes")}
+    return {}
+
+
+def cmd_extract(a: argparse.Namespace) -> int:
+    conv = Path(a.conv)
+    src = conv.parent
+    steps: list[dict] = []
+    by_id: dict[str, dict] = {}
+    meta: dict = {}
+    for raw in conv.read_text(encoding="utf-8").splitlines():
+        d = json.loads(raw)
+        if d.get("type") == "assistant":
+            for c in d["message"]["content"]:
+                if c["type"] == "tool_use":
+                    st = {"kind": "use", "name": c["name"], "input": c["input"]}
+                    if c["name"] == "Bash":
+                        st["input"] = {"description": c["input"].get("description", "")}  # コマンドは残さない(パスが入る)
+                    steps.append(st)
+                    by_id[c["id"]] = st
+                elif c["type"] == "text":
+                    steps.append({"kind": "text", "text": c["text"]})
+        elif d.get("type") == "user":
+            for c in d["message"]["content"]:
+                if c.get("type") == "tool_result" and c["tool_use_id"] in by_id:
+                    st = by_id[c["tool_use_id"]]
+                    if st["name"].startswith("mcp__pystub__"):
+                        short = st["name"].split("__")[-1]
+                        st["summary"] = _summarize(short, _load_mcp_result(_result_text(c["content"]), src))
+        elif d.get("type") == "result":
+            # バックグラウンドの処理が終わるたびに会話が続き、result が複数出ることがある(費用は積算。最後のものを使う)
+            keys = ("subtype", "num_turns", "total_cost_usd", "duration_ms", "is_error", "session_id", "result")
+            meta = {k: d.get(k) for k in keys} | {"results": meta.get("results", 0) + 1}
+    need(meta.get("subtype") == "success", "会話が success で終わっていない")
+    out = {"project": a.project, "conv": conv.name, "meta": meta, "steps": steps}
+    Path(a.out).write_text(json.dumps(out, ensure_ascii=False, indent=1), encoding="utf-8")
+    names = [s["name"] for s in steps if s["kind"] == "use"]
+    print(f"{a.out}: ステップ {len(steps)} 件、ツール {len(names)} 回 ({', '.join(names)})")
+    return 0
+
+
+# ---------------------------------------------------------------- 画面に出す値
+PERSONAL = re.compile(r"[A-Za-z]:[\\/]|[\\/]Users[\\/]|hunte|AppData|@", re.I)
+
+
+class Data:
+    def __init__(self, d: Path, lang: str):
+        def load(name: str):
+            return json.loads((d / name).read_text(encoding="utf-8"))
+
+        self.rec = load(f"record_{lang}.json")
+        self.builds = load(f"builds_{lang}.json")
+        self.safety = load("safety/plot.json")
+        self.plot_entry = (d / "safety" / "plot_entry.py").read_text(encoding="utf-8").splitlines()
+        self.project = self.rec["project"].replace("\\", "/").rstrip("/")
+        self.old_scenario = str(Path(self.safety["call"]["entry_point"]).parent.parent)
+
+    def rel(self, p: str) -> str:
+        """作業場所の中なら相対に、外なら末尾の 2 つだけにする(ドライブやユーザー名を出さない)。"""
+        q = p.replace("\\", "/")
+        if q.lower().startswith(self.project.lower() + "/"):
+            return q[len(self.project) + 1 :]
+        return ".../" + "/".join(q.split("/")[-2:])
+
+    def clean(self, s: str) -> str:
+        """文の中のパスを相対にする(安全網の記録は、以前のシナリオのフォルダを取り除く)。"""
+        for r in {self.old_scenario, self.old_scenario.replace("\\", "/")}:
+            s = s.replace(r + "\\", "").replace(r + "/", "")
+        return re.sub(r"[A-Za-z]:[\\/][^\s）)\"'`]*", lambda m: self.rel(m.group()), s)
+
+    @property
+    def steps(self) -> list[dict]:
+        return self.rec["steps"]
+
+
+def first_sentence(text: str) -> str:
+    t = re.sub(r"[*`]", "", text.strip()).replace("\n", " ")
+    m = re.search(r"[。.!?](?=\s|$)", t)
+    return t[: m.end()] if m else t
+
+
+def mb(n: float) -> str:
+    return f"{n / 1_000_000:.1f}"
 
 
 # ---------------------------------------------------------------- 場面
+ROWS = 21  # ログとして見せる行数(下に字幕が重なる)
+LOGWRAP = 94
+Event = tuple[list[Line], "tuple[int, str] | None"]  # (足す行, 強調する(足す行の中の番号, 文字列))
+
+
+def tool_lines(D: Data, st: dict) -> list[Line]:
+    """● ツール名(主な引数)。長ければ引数ごとに折る。"""
+    name = st["name"].split("__")[-1]
+    inp = st["input"]
+    args: list[str] = []
+    for k in ("entry_point", "python_path", "package_name", "parent_package", "submodule", "packages", "submodules", "run_entry", "record"):
+        if k in inp:
+            v = D.rel(inp[k]) if k in ("entry_point", "python_path") else inp[k]
+            args.append(f"{k}={str(v) if isinstance(v, bool) else json.dumps(v, ensure_ascii=False)}")
+    one = f"{name}({', '.join(args)})"
+    texts = [one] if cell_len(one) <= LOGWRAP else [f"{name}({args[0]},", *[f"  {x}," for x in args[1:-1]], f"  {args[-1]})"]
+    out = []
+    for i, tx in enumerate(texts):
+        segs = [(name, "tool"), *colorize(tx[len(name) :], TOKEN)] if i == 0 else colorize(tx, TOKEN)
+        out.append(Line(("● " if i == 0 else "  ", "ok"), *segs))
+    return out
+
+
+def res(*segs: str | Seg) -> Line:
+    return Line(("  └ ", "dim"), *segs)
+
+
+def events_of(D: Data, t: dict) -> list[Event]:
+    """記録の時間順から、画面に足す出来事を作る。ビルドの Bash は見せない(場面 4 で見せる)。"""
+    steps = D.steps
+    ev: list[Event] = []
+    text_ix = [i for i, s in enumerate(steps) if s["kind"] == "text"]
+    verifies = [i for i, s in enumerate(steps) if s["kind"] == "use" and s["name"].endswith("verify")]
+    ok_verify = next((i for i in verifies if steps[i]["summary"]["entry_matched"]), None)
+    # 返事は、最初の verify の直前・通った verify の直後・最後の 3 か所だけ見せる(ほかは省く)
+    show_at = {text_ix[-1]}
+    for j in (verifies[0] - 1 if verifies else None, ok_verify + 1 if ok_verify is not None else None):
+        if j in text_ix:
+            show_at.add(j)
+    last_text = text_ix[-1]
+    for i, st in enumerate(steps):
+        if st["kind"] == "text":
+            if i in show_at:
+                sentence = D.clean(first_sentence(st["text"]))
+                if i == last_text:
+                    ev.append(([Line((t["elided"], "dim"))], None))
+                ev.append(([Line(("● ", "ok"), ln) if k == 0 else Line("  ", ln) for k, ln in enumerate(wrap(sentence, LOGWRAP - 2)[:3])], None))
+            continue
+        if st["name"] == "Bash":
+            desc = st["input"]["description"]
+            if re.search(r"copy|写", desc, re.I):  # .venv がプロジェクトの中にあるとき、main.py を別の場所へ写す
+                ev.append(([Line(("● ", "ok"), ("Bash", "tool"), (f"({desc})", "dim"))], None))
+            continue
+        if not st["name"].startswith("mcp__pystub__"):
+            continue
+        name, s = st["name"].split("__")[-1], st["summary"]
+        head = tool_lines(D, st)
+        if name == "analyze":
+            m = re.match(r"\[(\w+)\] (\S+) を.*?(\S+) を排除できます（約 ([\d.]+) MB", s["recs"][0])
+            need(bool(m), "analyze の推奨の先頭が想定の形でない")
+            conf, sub, target, size = m.groups()
+            need(any(h["submodule"] == sub and h["target_package"] == target for h in s["hints"]), "推奨の先頭が hint に無い")
+            key, more = f"{sub}=>{target}", len(s["recs"]) - 1
+            tail = res(
+                (f"[{conf}] ", "ok"), (key, "str"), f"  {size} MB", (f"  ({t['installed']})", "dim"),
+                (f"  {t['more_recs'].format(n=more)}", "dim") if more else "",
+            )  # fmt: skip
+            ev.append(([*head, tail], (len(head), key)))
+        elif name == "verify" and not (s["passed"]["packages"] or s["passed"]["submodules"]):
+            err = D.clean(s["rejected"][0]["error"]) if s["rejected"] else ""
+            lines = [res((f"{t['gloss']['unconfirmed']} x{len(s['statuses'])}: ", "bad"), ", ".join(s["statuses"]))]
+            if err:
+                lines.append(Line("    ", (err, "bad")))
+            if t["overlap"]:
+                lines.append(Line("    ", (t["overlap"], "dim")))
+            ev.append(([*head, *lines], None))
+        elif name == "verify":
+            groups: dict[str, list[str]] = {}
+            for item, code in s["statuses"].items():
+                groups.setdefault(code, []).append(item)
+            lines = [res((f"{t['gloss'][code]}: ", "ok"), ", ".join(items)) for code, items in groups.items()]
+            em = f"{t['entry_matched']}{str(s['entry_matched']).lower()}"
+            lines.append(Line("    ", (em, "ok"), "  ", (t["matched_note"].format(out=s["stdout_head"].strip()), "dim")))
+            ev.append(([*head, *lines], (len(head) + len(lines) - 1, em)))
+        elif name == "generate_submodule":
+            el = s["eliminated_packages"]
+            a_, b_ = f"{s['original_size_bytes'] / 1e6:.1f} MB", f"{s['stub_size_bytes'] / 1e6:.1f} MB"
+            line = res(
+                (t["files"].format(n=s["stub_files"]), "num"), "  ", (t["of"].format(a=a_, b=b_), "dim"), "  ",
+                (t["excluded"].format(first=", ".join(el[:2]), more=len(el) - 2), "dim"),
+            )  # fmt: skip
+            ev.append(([*head, line], None))
+        elif name == "generate":
+            a_, b_ = f"{s['original_file_count']} files", f"{s['stub_total_bytes'] / 1e6:.1f} MB"
+            ev.append(([*head, res((t["files"].format(n=s["stub_file_count"]), "num"), "  ", (t["of"].format(a=a_, b=b_), "dim"))], None))
+    return ev
+
+
+def page_log(lines: list[Line], caption: str, box: tuple[int, str] | None = None) -> State:
+    vis = lines[-ROWS:]
+    off = len(lines) - len(vis)
+    boxes = []
+    if box and box[0] >= off:
+        boxes = [(box[0] - off, *col_of(vis[box[0] - off], box[1]))]
+    return State(vis, caption=caption, boxes=boxes, fit_cols=100)
+
+
+def shell(text: str, n: int | None = None, cursor: bool = True) -> Line:
+    shown = text if n is None else text[:n]
+    first, _, rest = shown.partition(" ")
+    segs: list[Seg] = [("$ ", "dim"), (first, "cmd"), (" " + rest if rest else "", "")]
+    if cursor:
+        segs.append((" ", "cur"))
+    return Line(*segs)
+
+
 def build(lang: str, D: Data) -> list[tuple[State, int, str]]:
     """(コマの状態, 何コマ続けるか, 代表のコマの名前) の並び。"""
-    t, f = TEXT[lang], facts(D)
-    gloss = lang == "en"
+    t = TEXT[lang]
     seq: list[tuple[State, int, str]] = []
-    entry_rel = "proj/entry.py"
-    sp_rel = "venv/Lib/site-packages"
+    b = D.builds
+    need(b["base"]["stdout"] == b["after"]["stdout"], "ビルド後の exe の出力が基準と違う")
+    base_mb, after_mb = mb(b["base"]["bytes"]), mb(b["after"]["bytes"])
+    out = b["after"]["stdout"].strip()
 
-    def typing(parts: list[str]) -> None:
-        total = len("\n".join(parts))
-        for n in range(0, total, 5):
-            seq.append((State(call_lines(parts, n, True)), 1, ""))
-        seq.append((State(call_lines(parts, None, True)), 3, ""))
+    # 1. 登録(このコマンドは実行していないので、出力の行は出さない)
+    cmd = "claude mcp add pystub -- uvx mcp-pystub"
+    for n in range(0, len(cmd), 2):
+        seq.append((State([shell(cmd, n)]), 1, ""))
+    seq.append((State([shell(cmd, cursor=False)], caption=t["cap_register"]), 25, "1_register"))
 
-    def zoom_in(em: State, key: str, hold: int) -> None:
-        for k in range(1, 5):
-            seq.append((replace(em, zoom=k / 4, dim_except=None, boxes=[], caption=""), 1, ""))
-        seq.append((replace(em, zoom=1.0), hold, key))
+    # 2. 頼む
+    head = Line((t["header"], "dim"))
+    prompt = t["prompt"]
+    step = 3 if lang == "ja" else 4
+    for n in range(0, len(prompt), step):
+        seq.append((State([head, Line(), Line(("> ", "dim"), prompt[:n], (" ", "cur"))], caption=t["cap_ask"]), 1, ""))
+    ask = [head, Line(), Line(("> ", "dim"), prompt)]
+    seq.append((State(ask, caption=t["cap_ask"]), 20, "2_ask"))
 
-    # 1. 前提: entry.py と exe の大きさ
-    code = [Line(("# " + entry_rel, "dim"))] + [Line(*colorize(ln, PYTOKEN)) for ln in D.entry]
-    exe = Line(t["exe_label"], (f"{f['base_mb']} MB", "bad"))
-    s1 = State([*code, Line(), exe], zoom=1.0, fit_cols=66, max_zoom=1.2)
-    seq.append((replace(s1, lines=[*code]), 16, ""))
-    row = len(code) + 1
-    box1 = (row, *col_of(exe, f"{f['base_mb']} MB"))
-    seq.append((replace(s1, caption=t["cap_prereq"].format(base=f["base_mb"]), dim_except=(row,), boxes=[box1]), 30, "1_prereq"))
+    # 3. Claude の作業(記録の時間順)
+    lines = [*ask, Line()]
+    cap = t["cap_claude"]
+    events = events_of(D, t)
+    need(len(events) >= 5, "場面 3 に出せる出来事が少なすぎる")
+    for k, (new, box) in enumerate(events):
+        split = next((i for i, ln in enumerate(new) if ln.plain.startswith("  └")), None)
+        if split is None:
+            lines += new
+            seq.append((page_log(lines, cap), 12 if len(new) > 1 else 8, "3_claude_last" if k == len(events) - 1 else ""))
+        else:
+            lines += new[:split]
+            seq.append((page_log(lines, cap), 5, ""))
+            lines += new[split:]
+            bx = (len(lines) - len(new) + box[0], box[1]) if box else None
+            seq.append((page_log(lines, cap, bx), 16 if box else 9, f"3_claude_{k}" if box else ""))
+        lines.append(Line())
 
-    # 2. analyze
-    args = [f'analyze(entry_point="{entry_rel}", python_path="{sp_rel}")']
-    typing(args)
-    rows2 = [
-        Line(("conditional_submodule_hints[0]", "dim")),
-        Line(("  submodule: ", "key"), (f["sub"], "str")),
-        Line(("  target_package: ", "key"), (f["target"], "str")),
-        Line(("  confidence: ", "key"), (f["conf"], "ok")),
-        Line(("  estimated_savings_mb: ", "key"), (str(f["mb"]), "num"), ("  " + t["size_note"], "dim")),
-        Line(("  conditions:", "key")),
-        Line("    - ", (D.clean(f["conds"][0]), "str")),
-        Line("    - ", (D.clean(f["conds"][1]), "str")),
-        Line("    - ", (D.clean(f["conds"][2]), "str")),
-        Line("    - ", (t["g_more"].format(n=f["more"]), "dim")),
-        Line(("  project_uses_count: ", "key"), (str(f["uses"]), "num")),
-    ]
-    if gloss:
-        rows2.insert(7, Line(("      " + t["g_cond"], "dim")))
-    r0 = 2
-    base2 = [*call_lines(args), Line(), *rows2]
-    seq.append((State(base2), 6, ""))
-    i_sub, i_tgt, i_conf, i_mb = r0 + 1, r0 + 2, r0 + 3, r0 + 4
-    i_c0, i_c1 = r0 + 6, r0 + 6 + (2 if gloss else 1)
-    boxes2 = [
-        (i_sub, *col_of(base2[i_sub], f["sub"])),
-        (i_tgt, *col_of(base2[i_tgt], f["target"])),
-        (i_conf, *col_of(base2[i_conf], f["conf"])),
-        (i_mb, *col_of(base2[i_mb], str(f["mb"]))),
-        (i_c0, *col_of(base2[i_c0], D.clean(f["conds"][0]))),
-        (i_c1, *col_of(base2[i_c1], D.clean(f["conds"][1]))),
-    ]
-    em2 = State(base2, caption=t["cap_analyze"], dim_except=(r0, i_sub, i_tgt, i_conf, i_mb, i_c0 - 1, *range(i_c0, i_c1 + 1)), boxes=boxes2)
-    zoom_in(em2, "2_analyze", 34)
+    # 4. ビルド: 打ち込み → exe の大きさの比較 → 出力
+    bcmd = "pyinstaller --onefile main.py"
+    log_tail = b["after"].get("log_tail", "")
 
-    # 3. verify
-    args = [
-        f'verify(entry_point="{entry_rel}", python_path="{sp_rel}",',
-        f'       submodules=["{f["sub"]}=>{f["target"]}"], run_entry=True, record=True)',
-    ]
-    typing(args)
-    rows3 = [
-        Line(("status_summary", "dim")),
-        Line("  ", (f["status_key"], "ok"), ": ", (f'["{f["sub"]}"]', "str"), ("  " + t["g_confirmed"], "dim") if gloss else ""),
-        Line(("statuses[", "dim"), (f'"{f["sub"]}"', "str"), ("].observed.targets", "dim")),
-        Line("  ", (f["target"], "str"), ": ", (f["targets"][f["target"]], "ok")),
-        Line(("entry_matched: ", "key"), (str(f["matched"]).lower(), "ok")),
-        Line(("entry_conditions.stdout_head: ", "key"), (f'"{f["out"]}"', "str")),
-        Line("  ", (t["g_match"], "dim")),
-    ]
-    base3 = [*call_lines(args), Line(), *rows3]
-    r0 = len(base3) - len(rows3)
-    seq.append((State(base3), 6, ""))
-    boxes3 = [
-        (r0 + 1, *col_of(base3[r0 + 1], f["status_key"])),
-        (r0 + 3, *col_of(base3[r0 + 3], f"{f['target']}: {f['targets'][f['target']]}")),
-        (r0 + 4, *col_of(base3[r0 + 4], f"entry_matched: {str(f['matched']).lower()}")),
-    ]
-    em3 = State(base3, caption=t["cap_verify"], dim_except=(r0, r0 + 1, r0 + 2, r0 + 3, r0 + 4), boxes=boxes3)
-    zoom_in(em3, "3_verify", 34)
-
-    # 4. 結果
-    def bars(frac: float) -> State:
-        n0 = BAR_COLS
-        n1 = round(BAR_COLS * f["after_f"] / f["base_f"] * frac)
-        ok = D.builds["proven_plus_conditional"]["match"]
+    def bars(frac: float, caption: str = "") -> State:
+        n1 = max(1, round(BAR_COLS * b["after"]["bytes"] / b["base"]["bytes"] * frac)) if frac > 0 else 0
         rows = [
-            Line((t["build_head"], "dim")),
-            Line(),
-            Line(("exe", "key")),
-            Line("  ", (t["before"], "dim"), "  ", ("█" * n0, "bar0"), "  ", (f"{f['base_mb']} MB", "bad")),
-            Line("  ", (t["after"], "dim"), "  ", ("█" * n1, "bar1"), "  ", (f"{f['after_mb']} MB" if frac >= 1 else "", "ok")),
-            Line(),
-            Line((t["output"], "key")),
-            Line("  ", (t["before"], "dim"), "  ", (f["out"], "str")),
-            Line("  ", (t["after"], "dim"), "  ", (f["out"], "str"), "   ", (t["match"], "dim"), (str(ok).lower(), "ok")),
-            Line(),
-            Line((t["applied"], "dim")),
-        ]
-        return State(rows, fit_cols=BAR_COLS + 28, zoom=1.0)
+            shell(bcmd, cursor=False), Line((log_tail, "dim")), Line(), Line((t["exe_label"], "key")),
+            Line("  ", (t["before"], "dim"), "  ", ("█" * BAR_COLS, "bar0"), "  ", (f"{base_mb} MB", "bad")),
+            Line("  ", (t["after"], "dim"), "  ", ("█" * n1, "bar1"), "  ", (f"{after_mb} MB" if frac >= 1 else "", "ok")),
+            Line(), Line((t["output"], "key")),
+            Line("  ", (t["before"], "dim"), "  ", (out, "str")),
+            Line("  ", (t["after"], "dim"), "  ", (out, "str"), "   ", (t["match"], "dim"), ("true", "ok")),
+        ]  # fmt: skip
+        return State(rows, fit_cols=BAR_COLS + 28, zoom=1.0, caption=caption)
 
-    seq.append((bars(0.0), 6, ""))
+    for n in range(0, len(bcmd), 3):
+        seq.append((State([shell(bcmd, n)], fit_cols=BAR_COLS + 28), 1, ""))
+    seq.append((replace(bars(0.0), lines=bars(0.0).lines[:2]), 6, ""))
+    seq.append((bars(0.0), 4, ""))
     for k in range(1, 9):
         seq.append((bars(k / 8), 1, ""))
-    seq.append((replace(bars(1.0), caption=t["cap_result"].format(base=f["base_mb"], after=f["after_mb"])), 30, "4_result"))
+    seq.append((bars(1.0, t["cap_build"].format(base=base_mb, after=after_mb)), 40, "4_build"))
 
-    # 5. 安全網: スタブを当てた状態で Signal.plot()
+    # 5. 安全網: 以前に記録した、スタブを当てた状態で Signal.plot()
+    p = D.safety["result"]
+    run = p["run"]
+    need(run["rc"] == 70 and run["stdout"] == "", "止まるスタブの実行が想定と違う")
+    need(p["verify"]["rc"] == 0 and p["restore"]["rc"] == 0 and p["bak_exists"] is False and p["pristine"] is True, "復元が確認できていない")
     pe = [ln for ln in D.plot_entry if "Signal(" in ln or ln.strip().startswith("s.plot")]
     need(len(pe) == 2, "plot_entry.py の想定の行が無い")
-    msg = wrap(D.clean(f["stderr"]), WRAP_COLS)
+    msg = wrap(D.clean(run["stderr"].strip()), WRAP_COLS)
     rows5 = [
         Line((t["plot_head"], "dim")),
         Line(("# plot_entry.py", "dim")),
@@ -456,14 +622,15 @@ def build(lang: str, D: Data) -> list[tuple[State, int, str]]:
     ]
     m0 = len(rows5)
     rows5 += [Line((ln, "bad")) for ln in msg]
-    rows5 += [Line((t["exit_code"], "key"), (str(f["rc"]), "bad"))]
-    if gloss:
-        rows5 += [Line((t["g_stop"].format(rc=f["rc"]), "dim"))]
-    seq.append((State(rows5[:m0]), 8, ""))
+    rows5 += [Line((t["exit_code"], "key"), (str(run["rc"]), "bad"))]
+    if lang == "en":
+        rows5 += [Line((t["g_stop"].format(rc=run["rc"]), "dim"))]
+    seq.append((State(rows5[:m0]), 6, ""))
     ex = m0 + len(msg)
-    em5 = State(rows5, caption=t["cap_stop"], dim_except=tuple(range(m0, len(rows5))), boxes=[(ex, *col_of(rows5[ex], f"{t['exit_code']}{f['rc']}"))])
-    seq.append((replace(em5, dim_except=None, boxes=[], caption=""), 8, ""))
-    seq.append((replace(em5, zoom=1.0), 40, "5_stop"))
+    box = [(ex, *col_of(rows5[ex], f"{t['exit_code']}{run['rc']}"))]
+    em5 = State(rows5, caption=t["cap_stop"], dim_except=tuple(range(m0, len(rows5))), boxes=box)
+    seq.append((replace(em5, dim_except=None, boxes=[], caption=""), 6, ""))
+    seq.append((replace(em5, zoom=1.0), 36, "5_stop"))
     return seq
 
 
@@ -573,7 +740,6 @@ def make_gif(lang: str, D: Data, out: Path, ffmpeg: str, work: Path, key_dir: Pa
 def cmd_build(a: argparse.Namespace) -> int:
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     ffmpeg = find_ffmpeg(a.ffmpeg)
-    D = Data(Path(a.data))
     out = Path(a.out)
     out.mkdir(parents=True, exist_ok=True)
     too_big = []
@@ -581,137 +747,31 @@ def cmd_build(a: argparse.Namespace) -> int:
         with tempfile.TemporaryDirectory() as t:
             kd = Path(a.keep_frames) if a.keep_frames else None
             hd = Path(a.keep_html) if a.keep_html else None
-            if make_gif(lang, D, out, ffmpeg, Path(t), kd, hd) > MAX_BYTES:
+            if make_gif(lang, Data(Path(a.data), lang), out, ffmpeg, Path(t), kd, hd) > MAX_BYTES:
                 too_big.append(lang)
     if too_big:
         print("3 MB を超えた:", ", ".join(too_big))
     return 1 if too_big else 0
 
 
-# ---------------------------------------------------------------- 本物の出力を取る
-def free_mb() -> float:
-    if os.name != "nt":
-        return 1e9
-    r = subprocess.run(
-        ["powershell", "-NoProfile", "-Command", "(Get-CimInstance Win32_OperatingSystem).FreePhysicalMemory"],
-        capture_output=True, encoding="utf-8", check=False,
-    )  # fmt: skip
-    return float(r.stdout.strip()) / 1024
-
-
-def wait_memory(min_gb: float = 4.0) -> None:
-    while free_mb() < min_gb * 1024:
-        print(f"空きメモリが {min_gb} GB 未満。60 秒待つ")
-        time.sleep(60)
-
-
-def tree_hash(root: Path) -> dict[str, str]:
-    import hashlib
-
-    return {
-        str(p.relative_to(root)): hashlib.sha256(p.read_bytes()).hexdigest()
-        for p in root.rglob("*")
-        if p.is_file() and "__pycache__" not in p.parts
-    }
-
-
-def cmd_collect(a: argparse.Namespace) -> int:
-    sys.path.insert(0, str(ROOT))
-    from mcp_pystub.server import analyze, generate_submodule, verify
-
-    S, data = Path(a.scenario), Path(a.data)
-    data.mkdir(parents=True, exist_ok=True)
-    sp = S / "venv" / "Lib" / "site-packages"
-    bak = S / "venv" / "Lib" / "_pystub_bak"
-    py = S / "venv" / "Scripts" / "python.exe"
-    entry = S / "proj" / "entry.py"
-    need(not bak.exists(), "_pystub_bak が残っている(先に復元する)")
-
-    def save(name: str, call: dict, result: dict) -> None:
-        (data / name).write_text(json.dumps({"call": call, "result": result}, ensure_ascii=False, indent=1), encoding="utf-8")
-
-    shutil.copy(entry, data / "entry.py")
-    wait_memory()
-    ca = dict(entry_point=str(entry), python_path=str(sp))
-    save("analyze.json", ca, analyze(**ca))
-    wait_memory()
-    cv = dict(**ca, packages=[], submodules=["asammdf.gui=>PySide6"], nofollow=[], run_entry=True, record=True)
-    save("verify.json", cv, verify(**cv))
-
-    # builds.json: 実ビルドの result.json から、exe の大きさと出力だけ
-    rj = json.loads(Path(a.builds).read_text(encoding="utf-8"))["variants"]
-    keep = ("exe_bytes", "exe_mb", "match", "stdout", "run_rc")
-    names = ("base", "proven_plus_conditional")
-    (data / "builds.json").write_text(
-        json.dumps({k: {x: rj[k][x] for x in keep} for k in names}, ensure_ascii=False, indent=1), encoding="utf-8"
-    )
-
-    # 止まるスタブ: 元の環境では Signal.plot() を動かさない。スタブを当てた間だけ動かし、必ず復元する
-    plot_entry = data / "plot_entry.py"
-    plot_entry.write_text(
-        "import numpy as np\nfrom asammdf import Signal\nt = np.arange(0, 10, 1.0)\n"
-        's = Signal(samples=t*2, timestamps=t, name="sig1", unit="V")\ns.plot()\nprint("plotted")\n',
-        encoding="utf-8",
-    )
-    bash = shutil.which("bash")
-    need(bool(bash), "bash が無い(build_instructions の手順は bash)")
-    pre = tree_hash(sp / "asammdf")
-    cg = dict(entry_point=str(entry), parent_package="asammdf", submodule="asammdf.gui", python_path=str(sp))
-    g = generate_submodule(**cg)
-    for rel, txt in g["files"].items():
-        p = data / "_stubs" / rel
-        p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(txt, encoding="utf-8")
-    bi = g["build_instructions"]
-    env = dict(os.environ, PATH=str(py.parent) + os.pathsep + os.environ["PATH"], PYTHONUTF8="1")
-
-    def sh(cmds: list[str]) -> dict:
-        r = subprocess.run(
-            [bash, "-c", "\n".join(cmds)], cwd=data, env=env, capture_output=True, encoding="utf-8", errors="replace", check=False
-        )
-        return {"rc": r.returncode, "out": r.stdout + r.stderr}
-
-    res: dict = {"stub_size_bytes": g["stub_size_bytes"], "eliminated_packages": g["eliminated_packages"]}
-    try:
-        res["backup"], res["install"] = sh(bi["backup_commands"]), sh(bi["install_commands"])
-        init = sp / "asammdf" / "gui" / "__init__.py"
-        need(
-            res["backup"]["rc"] == 0 and res["install"]["rc"] == 0 and init.stat().st_size < 10000,
-            "スタブが当たっていない(plot は動かさない)",
-        )
-        run_env = dict(env, QT_QPA_PLATFORM="offscreen", PYTHONIOENCODING="utf-8")
-        p = subprocess.run(
-            [str(py), str(plot_entry)], cwd=data, env=run_env, capture_output=True, encoding="utf-8", errors="replace", timeout=60, check=False
-        )
-        res["run"] = {"rc": p.returncode, "stdout": p.stdout, "stderr": p.stderr}
-    finally:
-        un = bi["uninstall_commands"]
-        res["restore"] = sh(un[: un.index("")])  # 方法 1(バックアップから復元)だけ。方法 2 は pip install なので動かさない
-        res["verify"] = sh(bi["verify_commands"])  # 対象の python で __file__・RECORD のハッシュ・版を確かめる
-    res["bak_exists"] = bak.exists()
-    res["pristine"] = tree_hash(sp / "asammdf") == pre
-    save("plot.json", cg, res)
-    print(json.dumps({k: res[k] for k in ("restore", "verify", "bak_exists", "pristine")}, ensure_ascii=False, indent=1))
-    print(json.dumps(res.get("run"), ensure_ascii=False))
-    return 0 if res["pristine"] and not res["bak_exists"] and res["verify"]["rc"] == 0 else 1
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="README の冒頭の GIF を作る(英語版と日本語版)")
     sub = ap.add_subparsers(dest="cmd", required=True)
-    c = sub.add_parser("collect", help="本物の出力を取って保存する(重い)")
-    c.add_argument("--scenario", required=True, help="シナリオのフォルダ(proj/entry.py と venv がある)")
-    c.add_argument("--builds", required=True, help="実ビルドの result.json(base と proven_plus_conditional が入っているもの)")
-    c.add_argument("--data", required=True, help="保存先")
-    b = sub.add_parser("build", help="保存した出力から GIF を作る")
-    b.add_argument("--data", required=True, help="collect の保存先")
+    c = sub.add_parser("extract", help="記録した会話(stream-json)から画面に出す値を取り出す")
+    c.add_argument("--conv", required=True, help="claude -p --output-format stream-json --verbose の出力(長い結果のファイルも同じフォルダに)")
+    c.add_argument("--project", required=True, help="Claude が動いた作業場所(パスを相対にするため)")
+    c.add_argument("--out", required=True, help="record_<lang>.json の保存先")
+    b = sub.add_parser("build", help="保存した記録から GIF を作る")
+    b.add_argument("--data", required=True, help="record_<lang>.json などがあるフォルダ")
     b.add_argument("--out", default=str(ROOT / "docs" / "images"), help="置く場所(既定 docs/images)")
     b.add_argument("--ffmpeg", help="ffmpeg の場所(既定は PATH から探す)")
     b.add_argument("--lang", choices=["en", "ja"], action="append", help="作る言語(既定は両方)")
     b.add_argument("--keep-frames", metavar="DIR", help="場面ごとの代表のコマの PNG を DIR に残す(確かめる用)")
     b.add_argument("--keep-html", metavar="DIR", help="撮った HTML を DIR に残す(個人情報の検索用)")
     a = ap.parse_args()
-    return cmd_collect(a) if a.cmd == "collect" else cmd_build(a)
+    return cmd_extract(a) if a.cmd == "extract" else cmd_build(a)
 
 
 if __name__ == "__main__":
