@@ -21,19 +21,31 @@ PyInstaller（onefile）、Windows 11、Python 3.13。どれも exe の出力が
 
 ## 使い方
 
-```bash
-claude mcp add pystub -- uvx mcp-pystub     # Claude Code に登録（uv が無ければ pip install mcp-pystub して `-- mcp-pystub`）
-```
-
-```text
-（AI に頼む）main.py を exe にしたい。mcp-pystub で外せるパッケージを調べて、verify で確かめてから適用して
-```
+**1. Claude Code に登録する**（最初の 1 回だけ）
 
 ```bash
-pyinstaller --onefile main.py               # いつもどおりビルドして、exe を試す
+claude mcp add pystub -- uvx mcp-pystub
 ```
 
-AI は `analyze`（候補を出す）→ `verify`（動かして確かめる）→ `generate`（スタブを作り、適用と復元のコマンドを出す）の順に使います。対象のプロジェクトの環境には mcp-pystub を入れる必要はありません（AI が対象の venv の `site-packages` を `python_path` で指します）。Claude Desktop など他のクライアントの設定は[ツールと設定](https://github.com/KoyoYeager/mcp-pystub/blob/master/docs/tools.md)にあります。
+uv が無い場合は `pip install mcp-pystub` のあと `claude mcp add pystub -- mcp-pystub`。Claude Desktop など他のクライアントは[ツールと設定](https://github.com/KoyoYeager/mcp-pystub/blob/master/docs/tools.md)を見てください。プロジェクトの venv に入れる必要はありません。
+
+**2. プロジェクトのフォルダで Claude に頼む**
+
+> mcp-pystub で main.py の exe を小さくして。venv は .venv。
+
+Claude は次の順に進めます。
+
+1. 外せるパッケージを挙げる（`analyze`）
+2. スタブを差し込んで実際に動かし、結果が変わらないか確かめる（`verify`。main.py を動かすのは、あなたが許可した時だけ）
+3. スタブを作り（`generate`）、出したコマンドで元のファイルをバックアップしてからスタブを venv に入れる
+
+**3. いつもどおりビルドして試す**
+
+```bash
+pyinstaller --onefile main.py
+```
+
+exe はいつものやり方で試してください。終わったら、Claude に「venv を元に戻して」と頼みます（手順 2 で出した復元のコマンドを実行します）。
 
 ## 何が違うのか
 

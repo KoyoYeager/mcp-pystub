@@ -23,19 +23,31 @@ PyInstaller (onefile), Windows 11, Python 3.13. In every case the exe's output w
 
 ## Usage
 
-```bash
-claude mcp add pystub -- uvx mcp-pystub     # register with Claude Code (without uv: pip install mcp-pystub, then `-- mcp-pystub`)
-```
-
-```text
-(ask your AI) I want to turn main.py into an exe. Use mcp-pystub to find packages that can be removed, check them with verify, then apply.
-```
+**1. Add it to Claude Code** (once)
 
 ```bash
-pyinstaller --onefile main.py               # build as usual and try the exe
+claude mcp add pystub -- uvx mcp-pystub
 ```
 
-The AI uses `analyze` (list candidates), `verify` (run and check), then `generate` (create stubs, with apply and restore commands). mcp-pystub does not need to be installed in the project being analyzed (the AI points `python_path` at that venv's `site-packages`). Settings for Claude Desktop and other clients are in [Tools and setup](https://github.com/KoyoYeager/mcp-pystub/blob/master/docs/tools.md).
+No uv? Run `pip install mcp-pystub`, then `claude mcp add pystub -- mcp-pystub`. For Claude Desktop and other clients, see [Tools and setup](https://github.com/KoyoYeager/mcp-pystub/blob/master/docs/tools.md). You do not need to install it in your project's venv.
+
+**2. Ask Claude** in your project folder
+
+> Use mcp-pystub to make the exe of main.py smaller. The venv is .venv.
+
+Claude then:
+
+1. lists packages that can be removed (`analyze`)
+2. checks them by running your program with the stubs (`verify`; it runs main.py only if you allow it)
+3. creates the stubs (`generate`) and runs the printed commands that back up the originals and put the stubs into the venv
+
+**3. Build and test as usual**
+
+```bash
+pyinstaller --onefile main.py
+```
+
+Try the exe the way you normally would. Afterwards, ask Claude to restore the venv (it runs the restore commands printed in step 2).
 
 ## What is different
 
