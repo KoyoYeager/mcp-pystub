@@ -4,6 +4,10 @@
 
 Python exe ビルド（PyInstaller / Nuitka / cx_Freeze）時にスタブ置換可能なパッケージを自動検出し、最小スタブコードを生成する MCP サーバー。
 
+![asammdf のシナリオ: analyze で使っていない GUI 部分が PySide6 を引き込むと分かり、verify で動かして出力が同じと確かめ、exe が 240.1 MB から 36.9 MB になり、外した部分に触れるとスタブが理由を出して終了コード 70 で止まるまでのデモ](https://raw.githubusercontent.com/KoyoYeager/mcp-pystub/master/docs/images/demo.ja.gif)
+
+[English version](https://raw.githubusercontent.com/KoyoYeager/mcp-pystub/master/docs/images/demo.gif)
+
 ---
 
 An MCP server that auto-detects stubbable packages for Python exe builds (PyInstaller / Nuitka / cx_Freeze) and generates minimal stub code to reduce executable size.
@@ -411,6 +415,8 @@ python -m pytest tests/ -v
 |-----------|------|
 | ユニットテスト（tests/、攻撃シナリオの回帰を含む） | 全通過（件数は下の変更履歴に書く） |
 | 実ビルド（上の実証データの 6 本） | exe の出力一致・復元一致 |
+
+README の冒頭の GIF は `tools/demo_gif.py` で作ります（本物の出力を保存してから描画します。使い方はファイルの先頭の説明）。
 
 ## ライセンス / License
 
